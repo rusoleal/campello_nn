@@ -40,6 +40,25 @@ namespace
         }
     }
 
+    // Same as throwIfFailed, but on DXGI_ERROR_DEVICE_REMOVED also queries the
+    // device's *actual* removal reason — the outer HRESULT is always just
+    // 0x887A0005 regardless of cause, which isn't actionable on its own.
+    void throwIfFailed(HRESULT hr, const char *what, ID3D12Device *device)
+    {
+        if (FAILED(hr))
+        {
+            if (hr == DXGI_ERROR_DEVICE_REMOVED && device)
+            {
+                HRESULT reason = device->GetDeviceRemovedReason();
+                char hex[16];
+                std::snprintf(hex, sizeof(hex), "%08lX", (unsigned long)reason);
+                throw std::runtime_error(std::string("campello_nn: DirectML backend: ") + what +
+                                          " failed: device removed (reason=0x" + hex + ")");
+            }
+            throwIfFailed(hr, what);
+        }
+    }
+
     size_t elementByteSize(DataType dt)
     {
         switch (dt)
@@ -127,6 +146,17 @@ namespace
         // broadcasting, matching computeBroadcastShape()'s semantics.
         void setBroadcast(const std::vector<int64_t> &shape, const std::vector<int64_t> &outputShape, DataType dt)
         {
+            // No actual broadcasting needed (operand's own shape already matches
+            // the output) — emit a plain packed descriptor (Strides=nullptr)
+            // rather than an explicit-but-trivial strides array. Functionally
+            // identical, matches the encoding used elsewhere (e.g. Gelu's
+            // internal multiply) when no broadcast is required.
+            if (shape == outputShape)
+            {
+                setPacked(outputShape, dt);
+                return;
+            }
+
             size_t rank = outputShape.size();
             std::vector<int64_t> padded(rank, 1);
             for (size_t i = 0; i < shape.size(); i++)
@@ -294,9 +324,21 @@ struct DirectMlBackend::Impl
 
     // One-shot resources (e.g. operator-initializer scratch buffers) that only
     // need to outlive the command list batch currently being recorded — kept
-    // alive here since the command list itself holds no resource references.
-    // Released once executeAndWait() confirms the GPU has finished with them.
+    // alive here since a *resource* referenced by a recorded command isn't
+    // implicitly kept alive by the command list. Released once executeAndWait()
+    // confirms the GPU has finished with them.
     std::vector<ComPtr<ID3D12Resource>> pendingScratch;
+
+    // Same lifetime requirement as pendingScratch, but for descriptor heaps
+    // (e.g. an operator initializer's one-shot heap) — a *heap* bound via
+    // SetDescriptorHeaps is a genuine GPU-visible reference recorded into the
+    // command list, unlike resources. Letting one go out of scope before the
+    // matching executeAndWait() happens to work on real hardware drivers
+    // (which don't reclaim the freed virtual memory immediately) but WARP
+    // correctly detects it and faults the device — confirmed via the D3D12
+    // debug layer ("An ID3D12DescriptorHeap object ... was deleted prior to
+    // closing the command list").
+    std::vector<ComPtr<ID3D12DescriptorHeap>> pendingScratchHeaps;
 
     // Submits whatever has been recorded on `cmdList`, waits synchronously for
     // completion, then resets the allocator/list for the next batch of recording.
@@ -319,6 +361,7 @@ struct DirectMlBackend::Impl
         throwIfFailed(allocator->Reset(), "ID3D12CommandAllocator::Reset");
         throwIfFailed(cmdList->Reset(allocator.Get(), nullptr), "ID3D12GraphicsCommandList::Reset");
         pendingScratch.clear();
+        pendingScratchHeaps.clear();
     }
 };
 
@@ -329,13 +372,24 @@ namespace
         ComPtr<IDXGIFactory6> factory;
         throwIfFailed(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
 
+        // EnumAdapterByGpuPreference can still hand back a software-flagged
+        // adapter (e.g. the "Microsoft Basic Render Driver" some CI runners
+        // expose as a display-only placeholder, which is not the same thing as
+        // — and far less robust for compute than — DirectML's real WARP
+        // fallback below) even when asked for DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE.
+        // Reject anything DXGI_ADAPTER_FLAG_SOFTWARE so we only ever take this
+        // branch for a genuine hardware GPU.
         ComPtr<IDXGIAdapter1> adapter;
         if (SUCCEEDED(factory->EnumAdapterByGpuPreference(
                 0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter))))
-            return adapter;
+        {
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+                return adapter;
+        }
 
-        // No hardware adapter (e.g. a CI runner with no GPU) — fall back to WARP,
-        // which fully supports this op set at our required feature level.
+        // No (real) hardware adapter (e.g. a CI runner with no GPU) — fall back
+        // to WARP, which fully supports this op set at our required feature level.
         throwIfFailed(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "IDXGIFactory4::EnumWarpAdapter");
         return adapter;
     }
@@ -363,7 +417,7 @@ namespace
         ComPtr<ID3D12Resource> resource;
         throwIfFailed(device->CreateCommittedResource(
                           &heapProps, D3D12_HEAP_FLAG_NONE, &desc, initialState, nullptr, IID_PPV_ARGS(&resource)),
-                      "ID3D12Device::CreateCommittedResource");
+                      "ID3D12Device::CreateCommittedResource", device);
         return resource;
     }
 
@@ -536,6 +590,10 @@ namespace
         ComPtr<ID3D12DescriptorHeap> initHeap;
         throwIfFailed(impl->device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&initHeap)),
                       "ID3D12Device::CreateDescriptorHeap");
+        // Bound on the command list below via SetDescriptorHeaps and referenced
+        // by the dispatch recorded against it — must outlive the matching
+        // executeAndWait() at the end of compileGraph(), not just this function.
+        impl->pendingScratchHeaps.push_back(initHeap);
 
         DML_BINDING_TABLE_DESC tableDesc{};
         tableDesc.Dispatchable = initializer.Get();
@@ -556,13 +614,8 @@ namespace
             tempDesc.Type = DML_BINDING_TYPE_BUFFER;
             tempDesc.Desc = &tempBinding;
             initTable->BindTemporaryResource(&tempDesc);
-            // initTemp only needs to be alive for this recorded dispatch, which is
-            // flushed before compileGraph() returns — safe to let it go out of
-            // scope once recorded since executeAndWait() happens synchronously
-            // after every operator's initialization is queued. To keep it alive
-            // until then, stash it on the heap object via private data is
-            // unnecessary: D3D12 command lists keep no implicit resource
-            // references, so this buffer must outlive the recorded dispatch.
+            // Same lifetime requirement as initHeap above: must outlive the
+            // matching executeAndWait() at the end of compileGraph().
             impl->pendingScratch.push_back(initTemp);
         }
 
