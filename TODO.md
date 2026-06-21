@@ -1,0 +1,534 @@
+# campello_nn / campello_llm — TODO
+
+Roadmap derived from [NN_ARCHITECTURE.md](./NN_ARCHITECTURE.md). Phases are ordered so each one
+is buildable and testable before the next depends on it: core API → one working backend (CPU) →
+platform accelerator backends → model import (ONNX/TFLite) and graph caching, both inside
+`campello_nn` → the weight-only-format layers (`campello_llm`, future `campello_vision`) on top.
+
+---
+
+## Phase 0 — Project Scaffolding ✅
+
+- [x] CMake build system, matching `campello_gpu`'s conventions (`systems::leal::` namespace,
+      handle-based `void*` pattern, per-platform `.cmake` includes, GTest via FetchContent)
+- [x] Directory layout: `inc/campello_nn/{constants,descriptors}`, `src/{pi,cpu}`,
+      `tests/{universal,platform}`, `examples/cpu` (`campello_llm/`, future `campello_vision/`,
+      `third_party/` deferred to the phases that need them — no separate `campello_nn_convert/`
+      project; model import and graph caching live inside `campello_nn` itself, see Phase 4)
+- [ ] Set up dependency management for accelerator SDKs (DirectML headers, Metal-cpp/MPSGraph
+      headers, NNAPI headers, XNNPACK, oneDNN, Vulkan SDK) — deferred to Phase 3, no SDK needed yet
+- [ ] Add `.clang-format` / `.clang-tidy`
+- [x] C++20, GoogleTest + `ctest` wired (`tests/CMakeLists.txt`)
+- [x] CI workflow running universal tests on macOS/Linux/Windows (`.github/workflows/ci.yml`) —
+      Android/Web CI deferred to Phase 3d/3e
+- [x] Root `CLAUDE.md` documenting the architecture split and conventions
+
+---
+
+## Phase 1 — `campello_nn` Core API ✅
+
+Goal: get the public API from §3 of the architecture doc compiling, with backend dispatch stubbed
+behind a `Backend` interface.
+
+- [x] `DeviceType`, `DataType` enums
+- [x] `TensorDescriptor` struct
+- [x] `Tensor` class (shape, dataType, `write`/`read`) as a thin handle over a backend-owned buffer
+- [x] `ContextDescriptor` struct
+- [x] `Context` class: `create()`, `createTensor()`, `dispatch()` — owns a `Backend` instance
+      selected by `DeviceType`
+- [x] Internal `Backend` interface (`src/pi/backend.hpp`) that concrete backends implement (tensor
+      allocation, graph compilation, graph dispatch) — what Phase 2/3 backends plug into
+- [x] `Operand` opaque handle + internal graph IR node representation (`src/pi/ir.hpp`: `OpKind`,
+      `Node`, `GraphIR`) — built by `GraphBuilder`, compiled by a `Backend`
+- [x] `GraphBuilder` class with all ops from the doc:
+  - [x] `input`, `constant`
+  - [x] elementwise/activation: `add`, `mul`, `gelu`, `softmax`, `layerNorm`, `relu`, `sigmoid`
+        (`relu`/`sigmoid` added during Phase 4a — see "Float16/Int8/Uint32 Support" pattern; real
+        ONNX models use `Relu`, not `Gelu`)
+  - [x] linear algebra: `matmul`, `gemm`
+  - [x] shape ops: `reshape`, `transpose`, `concat`, `slice`, `gather`
+  - [x] vision (scope added after initial Phase 1 pass — see "Vision/Multimodal Op Set" below):
+        `conv2d`, `maxPool2d`, `avgPool2d`, `resize`, `batchNorm`, `instanceNorm`
+  - [x] quantization (see "Float16/Int8/Uint32 Support" below): `quantizeLinear`,
+        `dequantizeLinear`, `quantizedMatmul`
+  - [x] `build()` → `Graph`
+- [x] Shape/dtype inference and validation at build time (`src/pi/graph_builder.cpp` — mismatched
+      matmul dims, bad axes, out-of-bounds slices, etc. all throw `std::runtime_error` before
+      reaching a backend; covered by `tests/universal/test_graph_builder_validation.cpp`)
+- [x] `Graph` class: opaque compiled/optimized executable handle
+- [x] **Decision:** `Context::dispatch()` returns a `Fence` (matching `campello_gpu`'s
+      submit-plus-fence convention), not `Future<void>` as originally sketched in the doc
+- [ ] Richer error handling/diagnostics (currently plain `std::runtime_error` with a message;
+      no error codes/categories yet)
+- [x] Public headers finalized under `inc/campello_nn/`
+
+---
+
+## Phase 2 — CPU Reference Backend ✅
+
+Goal: first real, runnable backend. Exists so correctness can be validated everywhere before
+chasing platform accelerators, and so Linux has a guaranteed fallback.
+
+- [x] CPU tensor storage (`src/cpu/cpu_tensor.hpp`: `std::vector<uint8_t>` backed, `read`/`write`
+      as raw memcpy)
+- [x] CPU implementations of every `GraphBuilder` op (`src/cpu/ops.cpp`: matmul, gemm, softmax,
+      layerNorm, gelu, add, mul, reshape, transpose, concat, slice, gather, conv2d, maxPool2d,
+      avgPool2d, resize, batchNorm, instanceNorm, quantizeLinear, dequantizeLinear, relu, sigmoid)
+- [x] Graph executor (`src/cpu/cpu_backend.cpp::dispatch`) — IR nodes are already topologically
+      ordered by construction (an op's inputs are always earlier indices), so this is a single
+      linear pass, no separate toposort needed. No dead-code elimination yet (every node in the
+      built IR is evaluated, even ones not reachable from the requested outputs)
+- [x] Float32 for all ops; `gather`'s `indices` operand supports Int32 and Uint32 (needed for
+      embedding lookup with either signed or unsigned token ids)
+- [x] Float16 compute support, all ops (see "Float16/Int8/Uint32 Support" below)
+- [x] Unit tests per op, hand-computed expected values (`tests/universal/test_cpu_ops.cpp`)
+- [x] End-to-end test: matmul → add (bias) → gelu → layerNorm graph, output checked against an
+      independently-computed reference (`tests/universal/test_transformer_block.cpp`)
+- [ ] Basic graph-level optimizations (constant folding, dead-node elimination) — informs what
+      `campello_nn`'s own graph serialization (Phase 4) will later cache
+- [x] Working example: `examples/cpu/main.cpp` (build with `-DBUILD_EXAMPLES=ON`)
+
+---
+
+## Vision/Multimodal Op Set ✅
+
+The project's scope grew beyond text-only transformer LLMs to include vision and multimodal
+models (user decision, see conversation — not in the original `NN_ARCHITECTURE.md`). This added
+three ops, implemented across every layer the original op set touches:
+
+- [x] `Conv2dDescriptor`/`Pool2dDescriptor` (`inc/campello_nn/descriptors/`) — explicit
+      stride/dilation/padding/groups, no auto "same"/"valid" padding styles, matching the rest of
+      the op set's explicit style. Input is NCHW, conv weights are OIHW (PyTorch/ONNX convention).
+      Bias is not fused into `conv2d` — compose with `add()` after broadcasting, same pattern as
+      `gemm`'s bias.
+- [x] `GraphBuilder::conv2d/maxPool2d/avgPool2d` with shape inference + validation
+      (`src/pi/graph_builder.cpp`); `resize` added separately below
+- [x] CPU kernels (`src/cpu/ops.cpp`): naive direct-convolution loop with groups support; pooling
+      shares one `evalPool2d` helper for max/avg, matching MPSGraph's default
+      `includeZeroPadToAverage=NO` behavior (avgPool2d divides by valid-sample count, not the full
+      padded kernel window)
+- [x] MPSGraph mapping (`src/metal/mps_backend.mm`): `MPSGraphConvolution2DOpDescriptor` +
+      `convolution2DWithSourceTensor:`, `MPSGraphPooling2DOpDescriptor` +
+      `maxPooling2DWithSourceTensor:`/`avgPooling2DWithSourceTensor:` — direct 1:1 mapping, no
+      composition needed (unlike `gelu`/`gemm`)
+- [x] Tests on both backends: `tests/universal/test_cpu_ops.cpp` and `tests/platform/test_mps_ops.cpp`
+      each gained `Conv2d`/`MaxPool2d`/`AvgPool2d`, hand-computed expected values
+- [x] `resize` op (nearest/bilinear, NCHW, `ResizeDescriptor` with `centerResult`/`alignCorners`
+      mirroring `MPSGraphResizeOps`'s documented semantics — defaults match OpenCV/TF2 behavior).
+      CPU kernel implements the same coordinate-mapping formula MPSGraph documents; hand-derived
+      expected values for both modes matched real MPSGraph/GPU output exactly, confirming the
+      formulas agree. MPSGraph mapping is a direct 1:1 call to `resizeTensor:size:mode:
+      centerResult:alignCorners:layout:name:`. Tests: `CpuOps`/`MpsOps`
+      `ResizeBilinearAlignCorners`/`ResizeNearestAlignCorners`
+- [x] `batchNorm`/`instanceNorm` ops, NCHW. **Decision:** kept as two distinct ops rather than one
+      generic "normalize over given axes" primitive, matching ONNX/PyTorch's actual
+      `BatchNorm2d`/`InstanceNorm2d` semantics 1:1 (this will matter once `campello_llm` loads
+      weights from real vision models): `batchNorm(x, mean, variance, scale, bias, eps)` takes
+      mean/variance as **given inputs** (inference-mode running stats — it does not compute them
+      from `x`, mirroring how real inference engines treat BatchNorm); `instanceNorm(x, scale,
+      bias, eps)` computes mean/variance itself, per-`(N,C)` over the spatial `(H,W)` axes — same
+      idea as `layerNorm` but over spatial axes with channel-broadcast scale/bias instead of
+      trailing-axis. Both map to the same MPSGraph `normalizationWithTensor:meanTensor:
+      varianceTensor:gammaTensor:betaTensor:epsilon:name:` call `layerNorm` uses; `instanceNorm`
+      additionally calls `meanOfTensor:axes:`/`varianceOfTensor:axes:` with axes `[2,3]` instead of
+      the last axis. `batchNorm`/`instanceNorm`'s per-channel operands are reshaped to
+      `[1,C,1,1]` (new `reshapeChannel` helper, alongside the existing `reshapeTrailing`) so
+      MPSGraph broadcasts them against NCHW correctly. Tests: `CpuOps`/`MpsOps`
+      `BatchNorm`/`InstanceNorm` — 47/47 tests passing across CPU + real MPSGraph/GPU hardware
+- [ ] Cross-modal fusion needs no new ops — vision embeddings feed into the same `matmul`/`softmax`
+      attention machinery already used for text; this is a `campello_llm`-layer wiring concern
+      (Phase 5), not a `campello_nn` op-set gap
+
+---
+
+## Float16/Int8/Uint32 Support ✅
+
+- [x] **Float16, all ops.** `inc/campello_nn/float16.hpp` — public `encodeFloat16`/`decodeFloat16`
+      bit-manipulation functions (no platform deps; C++20 has no built-in half type, so
+      `DataType::Float16` tensors store this 2-byte encoding directly — callers need this to
+      produce/consume `Tensor::write()`/`read()` bytes).
+  - **CPU backend decision:** boundary-conversion design, not per-kernel dtype branching.
+    `cpu_backend.cpp::dispatch()` decodes Float16 Input/Constant bytes to Float32 right when
+    populating a node, and re-encodes only when writing the final result into a
+    Float16-declared output `Tensor`. Every kernel in `ops.cpp` is unmodified and unaware
+    Float16 exists — it only ever sees genuinely-Float32 `CpuValue`s. `requireFloat32()` now
+    accepts Float32 or Float16 (both are Float32 in memory by kernel time; only Int32/Uint32/
+    Int8 are actually rejected).
+  - **MPSGraph backend:** runs Float16 natively (no decode step — GPU/ANE prefer fp16). Found
+    and fixed two latent bugs: `gelu` and `gemm`'s composed constants (`0.5`, `1.0`, `1/√2`,
+    `alpha`, `beta`) were hardcoded to `MPSDataTypeFloat32`, which would have broken/mismatched
+    against an actual Float16 tensor; both now use `mpsDataType(node.dataType)`.
+  - Tests: `tests/universal/test_cpu_float16_ops.cpp` /
+    `tests/platform/test_mps_float16_ops.cpp` — `Add`/`Mul`/`Gelu`/`MatMul`/`LayerNorm` (one
+    representative op per category: elementwise, activation, linalg, normalization), passing on
+    both CPU and real MPSGraph/GPU hardware.
+- [x] **Int8, real quantization** (not storage-only — ONNX/WebNN-shaped). New ops
+      `quantizeLinear(x, scale, zeroPoint)` (float → Int8) and `dequantizeLinear(x, scale,
+      zeroPoint)` (Int8 → Float32), matching ONNX `QuantizeLinear`/`DequantizeLinear`'s formula
+      exactly and mapped 1:1 to MPSGraph's `quantizeTensor:scale:zeroPoint:dataType:name:`/
+      `dequantizeTensor:...` per-tensor scalar overloads.
+  - `quantizedMatmul(activation, weightInt8, weightScale, weightZeroPoint)`: a `GraphBuilder`
+    convenience that composes `dequantizeLinear(weightInt8)` then `matmul(activation,
+    dequantized)` — **decision:** weight-only quantization (int8 storage, float32 compute), not
+    a genuine int8×int8 GEMM kernel, since neither MPSGraph nor the CPU backend exposes one;
+    this is the realistic deployment pattern (same approach GGUF/bitsandbytes int8 use) and
+    needed zero new backend code beyond `quantizeLinear`/`dequantizeLinear`/`matmul` already
+    being in place.
+  - Per-tensor scale/zero-point only for now (MPSGraph also has per-axis `scaleTensor:`
+    overloads for true per-channel weight quantization — not wired up; would matter for
+    production-quality weight compression later).
+  - Tests: `tests/universal/test_cpu_quantization_ops.cpp` /
+    `tests/platform/test_mps_quantization_ops.cpp` — `QuantizeLinear`/`DequantizeLinear`/
+    `QuantizedMatmul`, passing on both backends.
+- [x] **Uint32 for `gather` indices**, alongside the existing Int32 support (some
+      tokenizers/models use unsigned token ids). `CpuValue` gained a `u32()` accessor; CPU
+      `evalGather` branches on `indices.dataType`. No MPSGraph change needed — its
+      `gatherWithUpdatesTensor:` mapping was already dtype-agnostic. Tests:
+      `CpuOps`/`MpsOps::GatherUint32Indices`.
+- [x] All 65 tests passing across CPU + real MPSGraph/GPU hardware after this round (up from 47).
+
+---
+
+## Phase 3 — Platform Accelerator Backends
+
+Each backend implements the same internal `Backend` interface from Phase 1. Suggested order:
+macOS/iOS first (MPSGraph is architecturally closest to WebNN per the doc), then Windows
+(DirectML), then Linux, then Android, then Web. Reorder based on what hardware/SDKs are actually
+available to develop against.
+
+### 3a. macOS / iOS — MPSGraph ✅
+- [x] **Decision:** MPSGraph has no Apple-provided C++ binding (unlike Metal/metal-cpp), so
+      `src/metal/mps_backend.mm` is Objective-C++. `mps_backend.hpp` stays pure C++ (pimpl'd
+      `Impl`) so `context.cpp` can include it without needing Obj-C++ compilation itself.
+- [x] `Context` backend selection wiring: `DeviceType::Cpu` → `CpuBackend`; `Gpu`/`Npu`/`Default`
+      → `MpsBackend` on Apple platforms (`src/pi/context.cpp`, `#ifdef __APPLE__`)
+- [x] IR-node → `MPSGraph` op mapping for every `GraphBuilder` op (`src/metal/mps_backend.mm`):
+      `add`/`mul` direct; `gelu` composed from `erfWithTensor` + arithmetic (no native GELU op
+      in MPSGraph); `softmax` via `softMaxWithTensor:axis:`; `layerNorm` composed from
+      `meanOfTensor`/`varianceOfTensor`/`normalizationWithTensor` (gamma/beta reshaped to
+      broadcast against the last axis); `matmul`/`gemm` via `matrixMultiplicationWithPrimaryTensor`
+      (gemm's `alpha`/`beta`/bias-add composed manually); `reshape`/`transpose`/`concat`/`slice`
+      via the corresponding `MPSGraphTensorShapeOps`; `gather` via `gatherWithUpdatesTensor:axis:`
+- [x] Tensor ↔ `MPSGraphTensorData`/`MTLBuffer` bridging — tensors use
+      `MTLResourceStorageModeShared` so `write`/`read` are plain `memcpy` against
+      `buffer.contents`, same approach `campello_gpu`'s Metal backend uses
+- [x] **Decision:** skipped the separate `MPSGraphExecutable`/`compileWithDevice:` step for v1 —
+      `compileGraph()` builds the `MPSGraph*` once (IR → ops, "build once"), `dispatch()` calls
+      `runWithMTLCommandQueue:feeds:targetTensors:targetOperations:` synchronously each time
+      ("dispatch many times"), with `Fence` always pre-signaled. Revisit `MPSGraphExecutable` if
+      per-dispatch specialization overhead matters later.
+- [x] Dispatch/execution + `Fence` completion wiring (synchronous; see Phase 1's decision)
+- [ ] Optional ANE delegate path reached through MPSGraph — not built explicitly: MPSGraph's own
+      placement pass (`MPSGraphOptimizationLevel1`, the framework default) can already dispatch
+      eligible ops to GPU or ANE on its own, so this may already be partially covered without
+      extra work; revisit if ANE utilization needs to be verified/forced
+- [x] Parity test suite: `tests/platform/test_mps_ops.cpp` mirrors every op test from
+      `tests/universal/test_cpu_ops.cpp`, run against the real MPSGraph backend
+      (`-DBUILD_INTEGRATION_TESTS=ON`) on Apple Silicon GPU hardware — 28/28 passing (12
+      transformer ops + 7 vision ops + 9 Float16/Int8/Uint32 tests, see "Vision/Multimodal Op
+      Set" and "Float16/Int8/Uint32 Support" below)
+- [x] Float16/Int8/Uint32 tensor support — see "Float16/Int8/Uint32 Support" below
+
+### 3b. Windows — DirectML
+- [ ] `Context` backend wiring for DirectML device selection
+- [ ] IR-node → `IDMLOperator` graph mapping for every op
+- [ ] Tensor ↔ `ID3D12Resource` bridging
+- [ ] Graph compile → `IDMLCompiledOperator`
+- [ ] Command-list dispatch + GPU fence wiring (wrap the native D3D12 fence in `campello_nn::Fence`)
+- [ ] Parity tests against CPU reference
+
+### 3c. Linux — oneDNN or Vulkan compute shaders
+- [ ] Decide oneDNN vs. Vulkan-compute as the primary path (doc notes neither is an
+      "official OS API" — pick one as primary, keep the other as a documented option)
+- [ ] IR-node → primitive/shader mapping for every op (this is the most build-it-yourself backend
+      since there's no ready-made graph API to target)
+- [ ] Tensor buffer management (oneDNN memory objects or Vulkan buffers)
+- [ ] Graph compile step (oneDNN primitive cache, or Vulkan pipeline + shader module cache)
+- [ ] Dispatch + sync/fence wiring
+- [ ] Parity tests against CPU reference
+
+### 3d. Android — NNAPI successor / vendor delegate, fallback XNNPACK
+- [ ] `Context` backend wiring, with capability detection (treat as best-effort per the doc —
+      OEM coverage is inconsistent)
+- [ ] IR-node → NNAPI-successor/vendor-delegate op mapping where available
+- [ ] XNNPACK fallback path for ops/devices the vendor delegate doesn't cover
+- [ ] Tensor buffer bridging for both paths
+- [ ] Parity tests against CPU reference (may need per-device tolerance adjustments)
+
+### 3e. Web — passthrough to native browser WebNN
+- [ ] Thin shim mapping `GraphBuilder`/IR directly to the browser's `MLGraphBuilder` API
+      (should be the simplest backend since the shapes already match 1:1)
+- [ ] Tensor ↔ `MLTensor`/`ArrayBuffer` bridging
+- [ ] Build target wiring (Emscripten or equivalent) to compile `campello_nn` for web
+- [ ] Parity tests run in a browser test harness
+
+---
+
+## Phase 4 — `campello_nn` Model Import and Graph Caching
+
+**Decision (see conversation, supersedes an earlier draft of this phase):** no separate
+`campello_nn_convert` project. ONNX/TFLite import and `Graph` serialization are both pure
+graph-level translation jobs needing zero architecture-specific knowledge — unlike weight-only
+formats (safetensors/gguf), which genuinely need `campello_llm`/`campello_vision`'s per-architecture
+wiring to make sense of. So both live directly inside `campello_nn`. Depends on Phase 1–3 being
+far enough along that the op set and `Graph` representation are stable.
+
+### 4a. ONNX import ✅ — validated end-to-end against a real model on real images
+- [x] **Decision:** hand-rolled minimal protobuf reader (`src/onnx/proto_reader.hpp`) — varint/
+      tag/length-delimited primitives only, no `protoc`, no full `protobuf` dependency. Field
+      numbers for every ONNX message used (`ModelProto`, `GraphProto`, `NodeProto`,
+      `AttributeProto`, `TensorProto`, `ValueInfoProto`, `TypeProto`, `TensorShapeProto`) were
+      verified byte-for-byte against a real `.onnx` file generated by Python's official `onnx`
+      package (1.19.1) before writing any parsing logic against them — every assumed field number
+      matched on the first try.
+- [x] `src/onnx/onnx_model.hpp` + `onnx_parser.cpp`: parses `ModelProto.graph` into nodes,
+      initializers (with `TensorProto.raw_data`, falling back to `float_data`/`int32_data`/
+      `int64_data` if `raw_data` is absent), and graph inputs/outputs (with shape inference for
+      dynamic/symbolic dimensions — defaults to 1, the practical choice for single-item
+      inference). Handles both packed and unpacked repeated-scalar encodings for `AttributeProto`
+      (real ONNX files were observed using the unpacked form). `onnx::onnxElemTypeHasDataType()`
+      lets the importer skip initializers that are only ever import-time metadata (e.g. an INT64
+      `Reshape` shape constant) instead of failing to bind them as a `campello_nn::DataType`.
+- [x] **Decision:** added `internal::operandShapeForImport(const Operand&)` (declared in the
+      public `operand.hpp` inside an `internal` namespace, implemented in `graph_builder.cpp`,
+      returns a shape *copy* — a reference would dangle once the IR node vector reallocates on a
+      later `GraphBuilder` call). Needed once real ops required an intermediate tensor's actual
+      shape during import (`Reshape`'s `-1` inference, `Resize`'s scale-relative sizing, and
+      computing `Conv`'s broadcast-bias shape) rather than duplicating `GraphBuilder`'s own shape
+      inference a second time in the importer.
+- [x] `GraphBuilder::relu`/`sigmoid` added (CPU kernels + native MPSGraph `reLUWithTensor:`/
+      `sigmoidWithTensor:` — no composition needed) — the gap flagged before was real; YuNet uses
+      `Relu`, not `Gelu`. Tests on both backends.
+- [x] `ResizeDescriptor` gained `nearestRoundsDown` (ONNX `nearest_mode="floor"` differs from this
+      project's prior default of round-to-nearest). CPU: `std::floor` instead of `std::round`.
+      MPSGraph: switches from the generic `resizeTensor:mode:` call (no rounding-mode parameter)
+      to `resizeNearestWithTensor:sizeTensor:nearestRoundingMode:...` with
+      `MPSGraphResizeNearestRoundingModeFloor` — that overload only accepts a `sizeTensor`, not a
+      static `MPSShape`, so a small Int32 constant tensor is built for it. Verified on real
+      MPSGraph/GPU hardware with a case specifically chosen where floor and round-to-nearest
+      disagree (2×2→3×3, not the 2×2→4×4 case used elsewhere, which coincidentally gives the same
+      answer either way).
+- [x] Op-mapping table (`src/onnx/onnx_importer.cpp`): `Conv`→`conv2d`, `Add`→`add`, `Mul`→`mul`,
+      `Relu`→`relu`, `Sigmoid`→`sigmoid`, `MatMul`→`matmul`, `Gemm`→`gemm` (no transA/transB),
+      `BatchNormalization`→`batchNorm` (mind the input-order mismatch — ONNX is
+      `X,scale,B,mean,var`; ours is `x,mean,variance,scale,bias`), `Transpose`→`transpose`,
+      `MaxPool`/`AveragePool`→`maxPool2d`/`avgPool2d`, `Reshape`→`reshape` (resolves ONNX's `0`/`-1`
+      sentinels via `operandShapeForImport`), `Resize`→`resize` (maps
+      `coordinate_transformation_mode`→`centerResult`/`alignCorners`, `nearest_mode`→
+      `nearestRoundsDown`; supports both `scales` and `sizes` inputs).
+  - **`Conv` with a fused bias — real support, not a thrown error.** Turned out to be the
+    *universal* case once tested against a real model (YuNet: 59/59 `Conv` nodes have a bias
+    input). Initially worked around by replicating the per-channel bias across N/H/W into a
+    full-shape constant (since `add()` had no broadcasting yet); once broadcasting landed (see
+    below) this simplified to reshaping the bias to `[1,C,1,1]` and a plain broadcasting `add()` —
+    re-ran `YuNetFaceDetection` after the simplification to confirm no regression.
+  - **Remaining known gaps** (each throws a clear error rather than silently misbehaving): `Gemm`
+    with transA/transB, multi-output nodes, a non-constant `Reshape`/`Resize` shape/scale input,
+    any other unmapped op type.
+- [x] Public API: `inc/campello_nn/onnx_importer.hpp` — `OnnxImportResult` (`{graph, inputs:
+      name->TensorDescriptor, outputs: name->TensorDescriptor}`, since the caller needs the
+      shapes/dtypes to create matching `Tensor`s). **Decision (caught in review):** split into
+      `importOnnxFromMemory(context, data, size)` (the real implementation) and
+      `importOnnxFromFile(context, path)` (a convenience wrapper around it) rather than a single
+      path-only function — a path-only API breaks on Android, where APK assets aren't accessible
+      via normal filesystem paths (need `AAssetManager`-read bytes instead). Mirrors
+      `campello_image::Image::fromMemory`/`fromFile`'s existing split for the same reason. Output
+      `TensorDescriptor`s now use `operandShapeForImport` on the actual built graph rather than
+      trusting the file's declared output shape (more robust against a declared dynamic dim).
+- [x] Test (synthetic): `tests/universal/test_onnx_importer.cpp` imports a real, valid `.onnx` file
+      (Conv→Add→Relu, generated via `tests/fixtures/generate_conv_add_relu_onnx.py` + Python's
+      `onnx` package, checked into the repo as `tests/fixtures/conv_add_relu.onnx`) and checks
+      output against the same hand-computed values used by `CpuOps.Conv2d`.
+- [x] **Test (real model, real images):** `tests/universal/test_yunet_face_detection.cpp` —
+      imports YuNet (`yunet_n_320_320.onnx`, from
+      [ShiqiYu/libfacedetection.train](https://github.com/ShiqiYu/libfacedetection.train), BSD
+      3-Clause; see `tests/fixtures/NOTICE.md`), decodes two real images via `campello_image`
+      (FetchContent, opt-in via the new `BUILD_MODEL_TESTS` CMake option since it pulls in
+      `basis_universal`+`libwebp`), resizes them to 320×320 using campello_nn's *own* `resize` op
+      (no separate image-resize code), converts to BGR (not RGB!) `[0,255]` NCHW float — matching
+      libfacedetection.train's actual training preprocessing
+      (`yunet_train/tasks/face/transforms.py`: `mean=(0,0,0), std=(1,1,1), to_rgb=False`) — runs
+      the model, and combines `cls`/`obj` outputs into a confidence score exactly as
+      `yunet_train/tasks/face/postprocess.py` does (`scores = max_scores * flatten_objectness`).
+      **Measured result: 0.83 confidence on a real face photo vs. 0.0005 on an abstract image — a
+      ~1800x margin.** Confirmed bit-identical on the real MPSGraph/GPU backend during
+      development (test itself only runs CPU, since it's a "universal" test). Image fixtures
+      (`tests/fixtures/images/`) sourced from Wikimedia Commons (public domain) and a macOS
+      system wallpaper — see `tests/fixtures/images/NOTICE.md` for provenance.
+  - Sourcing note: `opencv_zoo`'s own copy of YuNet and its demo images are Git-LFS-tracked, and
+    that repo's LFS bandwidth quota was exhausted at the time — fetched the model from the
+    upstream training repo instead (not LFS-tracked there), and the face photo from Wikimedia
+    Commons via its real search API (not a guessed URL).
+  - Minor build wrinkle, not a bug: `campello_image`'s own `option(BUILD_TESTS ...)` shares a name
+    with this project's, so `-DBUILD_TESTS=ON -DBUILD_MODEL_TESTS=ON` together also builds
+    `campello_image`'s ~35 own tests as a side effect. Harmless (everything still passes), just
+    extra build time; not worth a CMake-scoping fix for a non-bug.
+
+### 4a-followup. NumPy-style broadcasting for `add`/`mul`
+- [x] `GraphBuilder::add`/`mul` now infer a broadcast output shape (`computeBroadcastShape()` in
+      `src/pi/graph_builder.cpp` — shapes aligned from the right, size-1/missing leading dims
+      broadcast, NumPy/ONNX rules) instead of requiring an exact shape match. Genuinely
+      incompatible shapes still throw `std::runtime_error`.
+- [x] CPU backend: `evalBroadcastBinaryOp<BinOp>()` in `src/cpu/ops.cpp` — fast path when both
+      operand shapes already match the output, strided fallback (`broadcastInputIndex()`) otherwise.
+      `evalAdd`/`evalMul` now share this via lambdas.
+- [x] MPSGraph backend: no code change needed — `additionWithPrimaryTensor:`/
+      `multiplicationWithPrimaryTensor:` broadcast natively. Confirmed empirically, not just
+      from SDK docs (`MpsOps.AddBroadcastRowVector`/`MulBroadcastColumnVector` on real GPU hardware).
+- [x] Tests: `CpuOps.AddBroadcastRowVector`/`MulBroadcastColumnVector` and the MPSGraph mirrors
+      above; `GraphBuilderValidation.AddShapeMismatchThrows` confirms incompatible shapes still
+      throw.
+- [x] **Follow-up simplification:** `onnx_importer.cpp`'s `Conv` bias handling, previously a manual
+      full-shape bias replication (see Phase 4a notes), simplified to reshape `[C]` → `[1,C,1,1]`
+      plus a plain broadcasting `add()`. Re-ran `YuNetFaceDetection` afterward — same thresholds
+      pass, confirming no regression.
+
+### 4b. TFLite import (follow-up, comparable effort to 4a, not free once 4a exists)
+- [ ] Vendor or `FetchContent` FlatBuffers (TFLite's serialization format)
+- [ ] Parse a TFLite `Model` → `SubGraph` (operators, tensors, buffers)
+- [ ] Op-mapping table, TFLite op codes → `GraphBuilder` calls — different naming than ONNX
+- [ ] Handle NHWC-default layout (vs. this codebase's NCHW convention) — either insert
+      transposes at import time or decide some ops should accept a layout hint
+- [ ] Handle TFLite's attribute-fused quantization (vs. our separate `QuantizeLinear`/
+      `DequantizeLinear` nodes)
+- [ ] Test: import a small real TFLite vision model (e.g. a MediaPipe model) end-to-end
+
+### 4c. Graph caching (serialize/load a compiled `Graph`)
+- [x] **Decision:** caches the backend-agnostic `GraphIR` (built by `GraphBuilder`, normally
+      handed straight to `Backend::compileGraph()` and discarded), not a backend-compiled native
+      object. This skips GraphBuilder reconstruction (op-by-op calls, or re-parsing a source model
+      file like ONNX) on load, but `compileGraph()` still runs on every load — there is no
+      backend-specific compiled-graph cache (e.g. no cached `MPSGraph*`). Simpler, and the IR is
+      genuinely backend-agnostic so one cache file works against any backend; revisit only if
+      `compileGraph()` itself becomes the bottleneck for some backend.
+- [x] Serialization format (`src/pi/ir_serialization.{hpp,cpp}`, internal): explicit
+      field-by-field binary writer/reader (magic `"CNNG"` + `uint32` version, not a struct
+      memcpy — portable across compilers/alignment), covering every `Node` field including
+      `Conv2dDescriptor`/`Pool2dDescriptor`/`ResizeDescriptor`. Versioned; `deserializeGraphIR()`
+      throws `std::runtime_error` on a bad magic, unsupported version, or truncated buffer (every
+      read is bounds-checked, never reads past the buffer).
+- [x] `GraphBuilder::serialize(outputs)` (instance method, mirrors `build()`'s signature) —
+      serializes the same IR `build()` would otherwise compile, without compiling it.
+      `GraphBuilder::deserialize(context, data, size)` (static) — compiles a graph directly from
+      those bytes, skipping `GraphBuilder` reconstruction.
+- [x] Public API: `inc/campello_nn/graph_cache.hpp` — `GraphCacheResult` (mirrors
+      `OnnxImportResult`'s shape: `{graph, inputs, outputs}`), `loadGraphFromMemory`/
+      `loadGraphFromFile` (mirrors the ONNX importer's Memory/File split), `saveGraphToFile`.
+      `inputs`/`outputs` descriptors are derived by walking the deserialized IR's `Input` nodes
+      and `outputs` list — deserializes the IR a second time (once for descriptors, once inside
+      `GraphBuilder::deserialize()` for compilation); accepted as a one-time cache-load cost rather
+      than plumbing a `GraphIR` through a public-header-safe API.
+- [x] Round-trip tests (`tests/universal/test_graph_cache.cpp`): `gelu`, `conv2d`+`resize` (with
+      non-default descriptor fields, including `nearestRoundsDown`), a `constant` node's raw
+      bytes, and a real file round trip via `saveGraphToFile`/`loadGraphFromFile` — each compares
+      the cached graph's dispatch output against the same graph built directly (no cache). Plus
+      `CorruptMagicThrows`/`TruncatedBufferThrows`/`LoadGraphFromFileMissingFileThrows`. Mirrored
+      on the real MPSGraph/GPU backend (`tests/platform/test_mps_graph_cache.cpp`,
+      `MpsOps.GraphCacheRoundTrip`) to confirm a cached graph compiles correctly there too, not
+      just on the CPU reference backend.
+- [ ] Not yet done: wiring this into the ONNX importer (e.g. `importOnnxFromFile` transparently
+      checking for a sibling `.campellocache` file) — `onnx_importer.cpp`'s internal `GraphBuilder`
+      instance isn't exposed today, so there's no way for a caller to get at its IR to serialize.
+      Left as future integration work, not required for the generic caching mechanism itself.
+
+---
+
+## Phase 5 — `campello_llm` (and future `campello_vision`)
+
+Goal: implement the layer described in §4 of the architecture doc — everything no graph format
+(ONNX/TFLite) and no WebNN-shaped API models. **Scoped specifically to weight-only formats**
+(safetensors, gguf — files with no embedded graph topology, where the architecture must be
+supplied by code that already knows it). Models distributed as ONNX/TFLite skip this layer
+entirely and go through `campello_nn`'s own importer (Phase 4) instead.
+
+- [ ] `GenerationConfig` struct (maxTokens, temperature, topP, topK)
+- [ ] Tokenizer support (start with one format, e.g. BPE/SentencePiece compatible with common
+      LLaMA/GPT tokenizer files; chat template handling)
+- [ ] Weights-file parsing for safetensors/gguf (architecture-agnostic byte/header format —
+      could in principle be a tiny shared leaf dependency with a future `campello_vision` if it
+      ever needs to read the same container format for raw vision weights; not urgent, nothing
+      on the vision side needs it yet)
+- [ ] Architecture registry: per-architecture (LLaMA-style, GPT-style) graph wiring that calls
+      `GraphBuilder` ops per layer with weights bound as `constant()`s — this is the
+      architecture-specific knowledge that justifies this layer existing separately from
+      `campello_nn`
+- [ ] `Model::load()`: ties tokenizer + weights + architecture wiring + `campello_nn::Context`
+      together; should also support loading a pre-cached graph via `campello_nn`'s own graph
+      caching (Phase 4c) instead of rebuilding one live
+- [ ] Prefill: single graph dispatch over the full prompt
+- [ ] KV-cache: explicit `Tensor`s fed back as inputs each decode step, read back out, growing
+      cache management (pre-allocate vs. dynamic growth)
+- [ ] Decode loop: one graph dispatch per token, feeding KV-cache deltas
+- [ ] Sampling on CPU after reading back logits: temperature scaling, top-k, top-p, (consider
+      greedy/argmax as a baseline mode too)
+- [ ] Streaming: `generate()`'s `onToken` callback invoked per generated token
+- [ ] Stop conditions: max tokens, EOS token, stop sequences
+- [ ] Tests: deterministic generation test (temperature=0/greedy) against a known-good reference
+      output for a small test model
+- [ ] Public headers finalized under `campello_llm/include/`
+
+### Future: `campello_vision`
+Not started, not urgent given Phase 4's ONNX/TFLite import covers most "standard" vision models
+already. Would only be needed for weight-only-format vision models (e.g. a raw PyTorch state
+dict with no ONNX export) — same role as `campello_llm`, same split, no generation loop/KV-cache
+to own. Revisit if/when a concrete weight-only vision model needs it.
+
+---
+
+## Phase 6 — Testing, Benchmarking, Examples
+
+- [ ] Cross-backend conformance suite: same graph, same inputs, run on every available backend on
+      a given platform, assert outputs agree within per-dtype tolerance
+- [ ] Performance benchmarks: prefill throughput, decode tokens/sec, per-op latency, per backend
+- [ ] Example: minimal `campello_nn` program building/running a hand-written graph (no LLM)
+- [ ] Example: import and run a real ONNX vision model end-to-end (the face-detection test from
+      Phase 4a is a natural candidate to promote here)
+- [ ] Example: minimal `campello_llm` CLI chat/completion demo using a small open-weights model
+- [ ] Example: graph caching end-to-end (build/import a graph, serialize it, then load the cached
+      graph in a second run) to demonstrate the startup-cost savings claim from §5
+
+---
+
+## Phase 7 — Documentation & Packaging
+
+- [ ] API reference docs for `campello_nn` (Context/Tensor/GraphBuilder/Graph) and `campello_llm`
+      (Model/GenerationConfig)
+- [ ] Backend support matrix doc (mirrors §2 table, kept current with actual implementation state
+      instead of the aspirational one in the architecture doc)
+- [ ] Build/integration instructions per platform (toolchains, SDK versions required per backend)
+- [ ] Versioning and release process for `campello_nn`'s serialized/cached `Graph` format
+- [ ] CONTRIBUTING notes on adding a new backend (what `Backend` interface methods must be
+      implemented, how to add parity tests)
+
+---
+
+## Open Questions
+
+- [x] **Relationship to `campello_gpu`:** separate repo/build (`~/Documents/GitHub/campello_gpu`),
+      but `campello_nn` mirrors its conventions — `systems::leal::` namespace, the handle-based
+      `void*` pattern, per-platform `.cmake` files, GTest-via-FetchContent test setup. No shared
+      build system or shared types yet. Dispatch uses a `Fence` (matching `campello_gpu`'s
+      submit-plus-fence model), not a new `Future<void>` primitive.
+- [ ] Whether the DirectML backend (Phase 3b) should share a device/command-queue with
+      `campello_gpu` on Windows, or stay fully independent — revisit once Phase 3b starts
+- [ ] Minimum viable platform set for v1 — doc flags Linux/Android as inherently best-effort; decide
+      if v1 ships without them or with CPU-only fallback on those platforms
+- [x] Float16 and quantized (Int8) op support — done, see "Float16/Int8/Uint32 Support" above.
+      Per-tensor scale/zero-point only; per-channel weight quantization deferred.
+- [x] **Where does model-loading capability live?** Resolved (see conversation): `campello_nn`
+      owns importing graph-format files (ONNX/TFLite) and caching its own compiled `Graph`s,
+      since both need zero architecture-specific knowledge. `campello_llm`/future
+      `campello_vision` own weight-only formats (safetensors/gguf) specifically because those
+      need externally-supplied architecture knowledge to wire up. No separate
+      `campello_nn_convert` project. Checked: none of our backends (MPSGraph, DirectML,
+      oneDNN/Vulkan, NNAPI, WebNN) have native ONNX/TFLite loading to rely on instead — by
+      design, they're all WebNN-shaped graph-*building* primitives with zero file-format
+      opinions, same as WebNN itself.
+- [ ] protobuf dependency for ONNX import (Phase 4a) — vendor the full `protobuf` library via
+      FetchContent, or hand-roll a minimal parser scoped to just ONNX's wire format/schema?
+- [ ] FlatBuffers dependency for TFLite import (Phase 4b) — same question, different library
+- [ ] Threading/concurrency model for `Context::dispatch` — single dispatch queue per `Context` or
+      concurrent dispatches allowed? (Currently moot: CPU backend dispatch is synchronous and
+      single-threaded.)
+- [ ] Library type: currently `STATIC` in all platform `.cmake` files, unlike `campello_gpu`'s
+      `SHARED` — revisit when Windows symbol-export conventions matter (Phase 3b)

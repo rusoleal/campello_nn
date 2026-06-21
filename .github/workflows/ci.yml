@@ -1,0 +1,60 @@
+name: CI
+
+# Run on every push and every pull-request, across all branches.
+on:
+  push:
+  pull_request:
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Universal tests — the CPU reference backend has no SDK/hardware dependency,
+  # so it builds and runs identically on every platform's native toolchain.
+  # ---------------------------------------------------------------------------
+  universal-tests:
+    name: Universal tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -B build -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --target campello_nn_universal_tests
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # MPSGraph integration tests — macOS only.
+  # GitHub-hosted macOS runners are real Apple hardware with a GPU, so MPSGraph
+  # is available and the backend's op-mapping can be verified end-to-end.
+  # ---------------------------------------------------------------------------
+  mpsgraph-integration:
+    name: MPSGraph integration tests (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -B build -DBUILD_TESTS=ON -DBUILD_INTEGRATION_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --target campello_nn_integration_tests
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -R MpsOps

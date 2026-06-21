@@ -1,0 +1,3 @@
+add_executable(campello_nn_cpu_example main.cpp)
+target_link_libraries(campello_nn_cpu_example campello_nn)
+set_target_properties(campello_nn_cpu_example PROPERTIES CXX_STANDARD 20)
