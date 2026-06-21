@@ -57,4 +57,27 @@ jobs:
         run: cmake --build build --target campello_nn_integration_tests
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -R MpsOps
+        run: ctest --test-dir build --output-on-failure -R Mps
+
+  # ---------------------------------------------------------------------------
+  # DirectML integration tests — Windows only.
+  # GitHub-hosted windows-latest runners have no GPU, so the backend's adapter
+  # selection falls back to the WARP software adapter (DirectML fully supports
+  # WARP at our required feature level) — this still exercises the real
+  # IR-to-DML-operator mapping end-to-end, just slower than real hardware.
+  # ---------------------------------------------------------------------------
+  directml-integration:
+    name: DirectML integration tests (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -B build -DBUILD_TESTS=ON -DBUILD_INTEGRATION_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --target campello_nn_integration_tests
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -R DirectMl

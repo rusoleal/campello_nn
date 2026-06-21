@@ -5,6 +5,8 @@
 #include "../cpu/cpu_backend.hpp"
 #ifdef __APPLE__
 #include "../metal/mps_backend.hpp"
+#elif defined(_WIN32)
+#include "../directml/directml_backend.hpp"
 #endif
 
 using namespace systems::leal::campello_nn;
@@ -31,6 +33,14 @@ std::shared_ptr<Context> Context::create(const ContextDescriptor &desc)
         backend = std::make_unique<CpuBackend>();
     else
         backend = std::make_unique<MpsBackend>();
+#elif defined(_WIN32)
+    // DirectML picks its own adapter (hardware preferred, WARP fallback) rather
+    // than mapping Gpu/Npu/Default to distinct devices — same one-backend-covers-
+    // every-non-Cpu-DeviceType shape as the MPSGraph branch above.
+    if (desc.deviceType == DeviceType::Cpu)
+        backend = std::make_unique<CpuBackend>();
+    else
+        backend = std::make_unique<DirectMlBackend>();
 #else
     if (desc.deviceType != DeviceType::Cpu && desc.deviceType != DeviceType::Default)
     {

@@ -20,8 +20,11 @@ Platform-specific CMake files are selected based on target: `macos.cmake`, `ios.
 cross-platform core sources (`CAMPELLO_NN_CORE_SOURCES`, set in the top-level
 `CMakeLists.txt`). `macos.cmake`/`ios.cmake` additionally compile `src/metal/mps_backend.mm`
 (Objective-C++, `enable_language(OBJCXX)`, `-fobjc-arc`) and link the Metal/MPSGraph
-frameworks — the only accelerator backend implemented so far (see `TODO.md` Phase 3a).
-Windows/Linux/Android/Web still build CPU-only.
+frameworks (see `TODO.md` Phase 3a). `windows.cmake` additionally compiles
+`src/directml/directml_backend.cpp` (plain C++, no language extension needed — DirectML's
+COM API is consumable via `<wrl/client.h>` ComPtr) and fetches the `Microsoft.AI.DirectML`
+NuGet package via `FetchContent` (see `TODO.md` Phase 3b). Linux/Android/Web still build
+CPU-only.
 
 Tests live under `tests/universal/` (CPU backend, no SDK required, run via GoogleTest/CTest)
 and `tests/platform/` (accelerator-backend integration tests — currently `test_mps_ops.cpp`,
@@ -74,6 +77,41 @@ internal structs — never exposed through public headers. This mirrors `campell
   have no single native MPSGraph op, so they're composed from primitives); `dispatch()` calls
   `runWithMTLCommandQueue:feeds:targetTensors:targetOperations:` synchronously, so its `Fence` is
   always pre-signaled, same as the CPU backend.
+
+### DirectML Backend (Windows)
+
+`src/directml/directml_backend.{hpp,cpp}` — selected for every `DeviceType` other than
+`Cpu` (`src/pi/context.cpp`'s `#elif defined(_WIN32)` branch). Plain C++, no language
+extension needed (DirectML's COM API is consumable via `<wrl/client.h>` ComPtr, unlike
+MPSGraph). **Decision: sequential per-node compiled operators, not a fused
+`IDMLDevice1::CompileGraph(DML_GRAPH_DESC)`** — each non-`Input`/`Constant` IR node gets its
+own `IDMLOperator`→`IDMLCompiledOperator` and a dedicated `DEFAULT`-heap `ID3D12Resource`
+output buffer; `dispatch()` records one `RecordDispatch` + UAV barrier per node, in IR
+order, on one shared command list, then a final GPU-to-GPU copy into each requested output
+`Tensor`. This is a bigger simplicity cut than the MPSGraph backend's "skip
+`MPSGraphExecutable`" decision (MPSGraph still fuses into one logical `MPSGraph*` object
+graph; this skips fusion entirely) — costs perf, not correctness, since nothing in this op
+set requires graph-level edge wiring to be expressible; revisit with the fused-graph API if
+per-dispatch overhead matters later. `Reshape` is a zero-cost alias resolved dynamically at
+dispatch time (not eagerly at compile time, since it may sit directly on a graph `Input`
+whose buffer isn't known until the caller's `inputs` map is available) — same "pure shape
+metadata, no new buffer" treatment as CPU/MPSGraph. Tensors are always `DEFAULT`-heap,
+UAV-capable buffers (unlike MPSGraph's `MTLResourceStorageModeShared` unified memory, D3D12
+`DEFAULT` buffers aren't CPU-mappable) — `write`/`read` stage through a throwaway
+UPLOAD/READBACK buffer and a `CopyBufferRegion`, synchronously waited on one shared
+`ID3D12Fence` used for every GPU submission in the backend. Requires `DML_FEATURE_LEVEL_5_1`
+(driven by `ACTIVATION_SOFTMAX1`/`RESAMPLE2`), checked explicitly at construction rather
+than discovered op-by-op. Adapter selection prefers hardware
+(`IDXGIFactory6::EnumAdapterByGpuPreference`) and falls back to the WARP software adapter if
+none is found, so CI on GPU-less `windows-latest` runners still exercises the real
+op-mapping (`.github/workflows/ci.yml`'s `directml-integration` job) instead of skipping the
+backend the way the macOS-only MPSGraph CI job has to. The DirectML SDK (headers + import
+lib + redistributable DLL) is fetched via NuGet through CMake `FetchContent` in
+`windows.cmake`, mirroring the GoogleTest/campello_image pattern already used in
+`tests/CMakeLists.txt`. **Not yet built/run against real hardware or WARP** — written on a
+machine with no local C++ toolchain available; DirectML enum/struct names were verified
+against the actual fetched `DirectML.h` rather than trusted from memory, but the code is
+otherwise unverified by compilation (see `TODO.md` Phase 3b's last item).
 
 ### Dtype Support
 

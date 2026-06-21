@@ -61,6 +61,32 @@ if(BUILD_INTEGRATION_TESTS)
         )
         include(GoogleTest)
         gtest_discover_tests(campello_nn_integration_tests)
+    elseif(WIN32)
+        add_executable(campello_nn_integration_tests
+            platform/test_directml_ops.cpp
+            platform/test_directml_float16_ops.cpp
+            platform/test_directml_quantization_ops.cpp
+            platform/test_directml_graph_cache.cpp
+        )
+        target_include_directories(campello_nn_integration_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/inc
+        )
+        target_link_libraries(campello_nn_integration_tests
+            campello_nn
+            GTest::gtest_main
+        )
+        set_target_properties(campello_nn_integration_tests PROPERTIES
+            CXX_STANDARD 20
+        )
+        # DirectML.dll (the redistributable NuGet version, see windows.cmake)
+        # must sit next to the test executable at runtime.
+        add_custom_command(TARGET campello_nn_integration_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CAMPELLO_NN_DIRECTML_DLL}"
+                "$<TARGET_FILE_DIR:campello_nn_integration_tests>"
+        )
+        include(GoogleTest)
+        gtest_discover_tests(campello_nn_integration_tests)
     else()
         message(STATUS "campello_nn: BUILD_INTEGRATION_TESTS requested, but no accelerator backend "
                         "is implemented yet for this platform (see TODO.md Phase 3).")

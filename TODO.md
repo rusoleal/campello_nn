@@ -229,13 +229,129 @@ available to develop against.
       Set" and "Float16/Int8/Uint32 Support" below)
 - [x] Float16/Int8/Uint32 tensor support — see "Float16/Int8/Uint32 Support" below
 
-### 3b. Windows — DirectML
-- [ ] `Context` backend wiring for DirectML device selection
-- [ ] IR-node → `IDMLOperator` graph mapping for every op
-- [ ] Tensor ↔ `ID3D12Resource` bridging
-- [ ] Graph compile → `IDMLCompiledOperator`
-- [ ] Command-list dispatch + GPU fence wiring (wrap the native D3D12 fence in `campello_nn::Fence`)
-- [ ] Parity tests against CPU reference
+### 3b. Windows — DirectML ✅
+- [x] **Decision:** sequential per-node compiled operators, not a single fused
+      `IDMLDevice1::CompileGraph(DML_GRAPH_DESC)`. Each non-Input/Constant IR node
+      gets its own `IDMLOperator`→`IDMLCompiledOperator`, with a dedicated
+      DEFAULT-heap `ID3D12Resource` output buffer; `dispatch()` records one
+      `RecordDispatch` per node plus a UAV barrier, in IR order, on one shared
+      command list. Bigger simplicity cut than MPSGraph's "skip
+      `MPSGraphExecutable`" decision (that one still fuses into one `MPSGraph*`
+      object graph; this skips fusion entirely) — costs perf (extra DEFAULT-heap
+      round trips between ops), not correctness, since no op here requires
+      graph-level edge wiring to be expressible. Revisit with `DML_GRAPH_DESC` if
+      per-dispatch overhead matters later, same framing as graph caching/
+      MPSGraphExecutable's "revisit if it becomes the bottleneck" notes.
+- [x] **Decision:** `Reshape` is a zero-cost alias — no `IDMLOperator`, no buffer.
+      Resolved dynamically at `dispatch()` time (`resolveBuffer()` in
+      `directml_backend.cpp`), not eagerly at compile time, since a Reshape may
+      sit directly on top of a graph `Input` whose backing buffer isn't known
+      until the caller's `inputs` map is available.
+- [x] `Context` backend wiring: `DeviceType::Cpu` → `CpuBackend`; everything else
+      → `DirectMlBackend` (`src/pi/context.cpp`, `#elif defined(_WIN32)`,
+      parallel to the `__APPLE__` branch).
+- [x] DirectML SDK fetched via NuGet through CMake `FetchContent` in
+      `windows.cmake` (`Microsoft.AI.DirectML` 1.15.4 — mirrors the
+      GoogleTest/campello_image `FetchContent` pattern already used in
+      `tests/CMakeLists.txt`; the `.nupkg` is a plain zip, `DOWNLOAD_NAME
+      directml.zip` forces CMake to recognize/auto-extract it despite the
+      extensionless URL). `DirectML.dll` copied next to test binaries via a
+      post-build step (`tests/CMakeLists.txt`).
+- [x] **Decision:** require `DML_FEATURE_LEVEL_5_1` at backend construction
+      (`IDMLDevice::CheckFeatureSupport`) — the floor driven by
+      `ACTIVATION_SOFTMAX1`/`RESAMPLE2`, corresponding to DirectML redistributable
+      1.9.0+. Throws a clear error at construction rather than discovering gaps
+      op-by-op at dispatch time.
+- [x] **Decision:** hardware adapter preferred (`IDXGIFactory6::
+      EnumAdapterByGpuPreference`, `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`),
+      falling back to the WARP software adapter
+      (`IDXGIFactory4::EnumWarpAdapter`) if none found — lets CI on
+      `windows-latest` (no GPU) still exercise the real op-mapping, not just
+      skip the backend like the macOS-only MPSGraph CI job has to.
+- [x] IR-node → `DML_OPERATOR_DESC` mapping for every op (`src/directml/
+      directml_backend.cpp`): `Add`/`Mul`→`ELEMENT_WISE_ADD`/`MULTIPLY`
+      (broadcast via stride-0 `DML_BUFFER_TENSOR_DESC.Strides`, computed by
+      `TensorDescBuilder::setBroadcast`); `Relu`/`Sigmoid`→native activation ops;
+      `Gelu`→composed from `ELEMENT_WISE_ERF` (with its `ScaleBias` field fusing
+      the `x/√2` pre-scale) + two `ELEMENT_WISE_IDENTITY` ops (each using
+      `ScaleBias` for `1+erf` and `0.5*x`) + one final `ELEMENT_WISE_MULTIPLY` —
+      same `0.5*x*(1+erf(x/√2))` formula as MPSGraph, deliberately not the native
+      `ACTIVATION_GELU` (feature-level gated, formula-fidelity risk);
+      `Softmax`→`ACTIVATION_SOFTMAX1`; `LayerNorm`/`InstanceNorm`→both via
+      `MEAN_VARIANCE_NORMALIZATION1` (LayerNorm: axis=last, scale/bias
+      right-aligned NumPy-broadcast; InstanceNorm: axes={2,3}, scale/bias via a
+      dedicated `setChannelBroadcast` helper — NCHW channel-axis broadcast is
+      *not* NumPy right-alignment, it needs explicit `[0,1,0,0]`-style strides,
+      unlike LayerNorm's case which right-alignment happens to get right for
+      free); `BatchNorm`→native `BATCH_NORMALIZATION` (`Spatial=TRUE`, given
+      mean/variance, not computed); `MatMul`/`Gemm`→both via `GEMM`
+      (alpha=1/beta=0/no C for MatMul); `Reshape`→no operator, see above;
+      `Transpose`→`ELEMENT_WISE_IDENTITY` with the *input* tensor desc's
+      `Strides` set to the permutation of the original contiguous strides
+      (materializes into a packed output buffer — verified the exact
+      `inIdx[perm[i]] = outIdx[i]` convention against `src/cpu/ops.cpp::
+      evalTranspose` before writing this, rather than assuming a direction);
+      `Concat`→`JOIN`; `Slice`→`SLICE1`; `Gather`→`GATHER` (`IndexDimensions=0`,
+      plain ONNX-style scalar-index gather); `Conv2d`→`CONVOLUTION`
+      (`Mode=CROSS_CORRELATION`, no fused bias, matching the descriptor's
+      "bias not fused" convention); `MaxPool2d`/`AvgPool2d`→native pooling ops
+      (`AvgPool2d`: `IncludePadding=FALSE`, matching CPU's non-padded-count-only
+      averaging); `Resize`→`RESAMPLE2` (not `RESAMPLE3`, which needs feature
+      level 6.4 — too new/risky for a v1 floor). `QuantizeLinear`/
+      `DequantizeLinear`→native quantize ops with scale/zero-point as tiny
+      1-element constant buffers DML wants as tensor inputs (the IR stores them
+      as scalars) — zero-point is cast from the IR's `float` to `int8_t` before
+      upload, since a reinterpret would silently shift every dequantized value.
+      `quantizedMatmul` needs no backend case — `GraphBuilder` already expands it
+      into `DequantizeLinear`+`MatMul` nodes before the backend sees it.
+- [x] **`Resize`/`RESAMPLE2` coordinate-mapping formula — verified against
+      Microsoft's own docs rather than assumed**, after first writing down the
+      wrong direction: `Scale = outSize/inSize` (not `inSize/outSize` — confirmed
+      via the documented `OutputTensorX = (InputTensorX + InputPixelOffset) *
+      Scale + OutputPixelOffset` formula and "scales > 1 scale up the image").
+      `InputPixelOffsets=0.5`/`OutputPixelOffsets=-0.5` reproduces the standard
+      half-pixel/OpenCV/TF2-style resize per Microsoft's own worked example —
+      matches `centerResult=true,alignCorners=false`. `alignCorners=true` uses
+      `Scale=(outSize-1)/(inSize-1)`, offsets 0. `RoundingDirection` (Nearest
+      only): `nearestRoundsDown` → `DECREASING` (floor), else `INCREASING`.
+- [x] Tensor ↔ `ID3D12Resource` bridging (`createTensor`/`writeTensor`/
+      `readTensor` in `directml_backend.cpp`): every tensor is a DEFAULT-heap,
+      UAV-capable buffer (DirectML requires `D3D12_RESOURCE_STATE_UNORDERED_
+      ACCESS` for bound buffers) — unlike MPSGraph's `MTLResourceStorageModeShared`
+      (Apple unified memory), D3D12 DEFAULT-heap resources aren't CPU-mappable,
+      so `write()`/`read()` stage through a throwaway UPLOAD/READBACK-heap buffer
+      and a `CopyBufferRegion`, synchronously waited on the same shared
+      `ID3D12Fence` every other GPU submission uses (one fence/value-counter
+      space for the whole backend, avoiding a copy-queue vs. compute-queue
+      fence-value collision).
+- [x] Graph compile → per-node `IDMLCompiledOperator` (`compileGraph()`) — every
+      compiled operator is initialized once via `IDMLOperatorInitializer` at
+      compile time (required even for stateless ops, not just ones with
+      persistent state), with its persistent/temporary resources and descriptor
+      heap/binding table allocated alongside it; all of compileGraph's constant
+      uploads + operator initializations are batched onto one command list and
+      flushed with a single `executeAndWait()` at the end.
+- [x] Command-list dispatch + GPU fence wiring — `Context::dispatch()`'s
+      `Fence` is always pre-signaled (`DmlFence{true}`), matching the CPU/
+      MPSGraph backends' synchronous-dispatch convention: `dispatch()` records
+      every node's `RecordDispatch` plus the final output-buffer copies, then
+      calls `executeAndWait()` (submit + `ID3D12Fence::SetEventOnCompletion` +
+      `WaitForSingleObject`) before returning — not a separate async fence the
+      caller polls later.
+- [x] Parity tests mirroring `tests/platform/test_mps_*.cpp` op-for-op (same
+      hand-computed expected values/tolerances): `tests/platform/
+      test_directml_ops.cpp` (25 core ops), `test_directml_float16_ops.cpp` (5),
+      `test_directml_quantization_ops.cpp` (3), `test_directml_graph_cache.cpp`
+      (1) — wired into `tests/CMakeLists.txt`'s `BUILD_INTEGRATION_TESTS` block
+      (`elseif(WIN32)`, parallel to the `if(APPLE)` branch) and a new
+      `directml-integration` CI job (`.github/workflows/ci.yml`, `windows-latest`,
+      WARP-backed since that runner has no GPU).
+- [ ] Not yet done: any actual run of these tests against real hardware or even
+      WARP — written without a local C++ toolchain available (no `cmake`/`cl.exe`
+      on the dev machine at the time), so exact DirectML enum/struct names were
+      verified against the real fetched `DirectML.h` (downloaded and inspected
+      directly) rather than trusted from memory, but the code itself is
+      unverified by compilation. First real build/test run is follow-up work.
 
 ### 3c. Linux — oneDNN or Vulkan compute shaders
 - [ ] Decide oneDNN vs. Vulkan-compute as the primary path (doc notes neither is an
@@ -509,8 +625,10 @@ to own. Revisit if/when a concrete weight-only vision model needs it.
       `void*` pattern, per-platform `.cmake` files, GTest-via-FetchContent test setup. No shared
       build system or shared types yet. Dispatch uses a `Fence` (matching `campello_gpu`'s
       submit-plus-fence model), not a new `Future<void>` primitive.
-- [ ] Whether the DirectML backend (Phase 3b) should share a device/command-queue with
-      `campello_gpu` on Windows, or stay fully independent — revisit once Phase 3b starts
+- [x] Whether the DirectML backend (Phase 3b) should share a device/command-queue with
+      `campello_gpu` on Windows, or stay fully independent — **resolved (user decision):**
+      fully independent, owns its own `ID3D12Device`/command queue, same as the MPSGraph
+      backend doesn't share Metal state with `campello_gpu` either.
 - [ ] Minimum viable platform set for v1 — doc flags Linux/Android as inherently best-effort; decide
       if v1 ships without them or with CPU-only fallback on those platforms
 - [x] Float16 and quantized (Int8) op support — done, see "Float16/Int8/Uint32 Support" above.
