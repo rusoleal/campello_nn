@@ -10,19 +10,30 @@ jobs:
   # ---------------------------------------------------------------------------
   # Universal tests — the CPU reference backend has no SDK/hardware dependency,
   # so it builds and runs identically on every platform's native toolchain.
+  # Explicit arm64/x64 runners (rather than just the *-latest default, which
+  # only ever covers one architecture per OS) so the CPU backend is verified
+  # on both natively, not just emulated.
   # ---------------------------------------------------------------------------
   universal-tests:
-    name: Universal tests (${{ matrix.os }})
+    name: Universal tests (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            name: macOS
+            name: macOS arm64
+          - os: macos-13
+            name: macOS x64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
           - os: ubuntu-latest
-            name: Linux
+            name: Linux x64
+          - os: windows-11-arm
+            name: Windows arm64
+            cmake_arch: -A ARM64
           - os: windows-latest
-            name: Windows
+            name: Windows x64
+            cmake_arch: -A x64
 
     runs-on: ${{ matrix.os }}
 
@@ -30,7 +41,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Configure
-        run: cmake -B build -DBUILD_TESTS=ON
+        run: cmake -B build -DBUILD_TESTS=ON ${{ matrix.cmake_arch }}
 
       - name: Build
         run: cmake --build build --target campello_nn_universal_tests
@@ -41,11 +52,21 @@ jobs:
   # ---------------------------------------------------------------------------
   # MPSGraph integration tests — macOS only.
   # GitHub-hosted macOS runners are real Apple hardware with a GPU, so MPSGraph
-  # is available and the backend's op-mapping can be verified end-to-end.
+  # is available and the backend's op-mapping can be verified end-to-end on
+  # both Apple Silicon (arm64) and Intel (x64) Macs.
   # ---------------------------------------------------------------------------
   mpsgraph-integration:
-    name: MPSGraph integration tests (macOS)
-    runs-on: macos-latest
+    name: MPSGraph integration tests (macOS ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-13
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v6
@@ -60,21 +81,35 @@ jobs:
         run: ctest --test-dir build --output-on-failure -R Mps
 
   # ---------------------------------------------------------------------------
-  # DirectML integration tests — Windows only.
-  # GitHub-hosted windows-latest runners have no GPU, so the backend's adapter
+  # DirectML integration tests — Windows only, both arm64 and x64.
+  # GitHub-hosted Windows runners have no GPU, so the backend's adapter
   # selection falls back to the WARP software adapter (DirectML fully supports
   # WARP at our required feature level) — this still exercises the real
   # IR-to-DML-operator mapping end-to-end, just slower than real hardware.
+  # windows.cmake selects the matching arm64-win/x64-win DirectML binaries
+  # from the fetched NuGet package based on CMAKE_VS_PLATFORM_NAME, which
+  # follows the -A flag passed below.
   # ---------------------------------------------------------------------------
   directml-integration:
-    name: DirectML integration tests (Windows)
-    runs-on: windows-latest
+    name: DirectML integration tests (Windows ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            arch: arm64
+            cmake_arch: -A ARM64
+          - os: windows-latest
+            arch: x64
+            cmake_arch: -A x64
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Configure
-        run: cmake -B build -DBUILD_TESTS=ON -DBUILD_INTEGRATION_TESTS=ON
+        run: cmake -B build -DBUILD_TESTS=ON -DBUILD_INTEGRATION_TESTS=ON ${{ matrix.cmake_arch }}
 
       - name: Build
         run: cmake --build build --target campello_nn_integration_tests

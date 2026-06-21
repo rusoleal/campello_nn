@@ -13,6 +13,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(directml)
 
+# The NuGet package ships prebuilt binaries per architecture (bin/x64-win,
+# bin/arm64-win, ...) — CMAKE_VS_PLATFORM_NAME reflects whichever one the
+# Visual Studio generator was pointed at (the -A flag passed to cmake; see
+# ci.yml's windows-11-arm/windows-latest matrix entries), so pick the matching
+# folder instead of hardcoding x64.
+if(CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64")
+    set(CAMPELLO_NN_DIRECTML_PLATFORM "arm64-win")
+else()
+    set(CAMPELLO_NN_DIRECTML_PLATFORM "x64-win")
+endif()
+
 add_library(${PROJECT_NAME} STATIC
     ${CAMPELLO_NN_CORE_SOURCES}
     src/directml/directml_backend.cpp
@@ -28,11 +39,11 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME}
     d3d12.lib
     dxgi.lib
-    "${directml_SOURCE_DIR}/bin/x64-win/DirectML.lib"
+    "${directml_SOURCE_DIR}/bin/${CAMPELLO_NN_DIRECTML_PLATFORM}/DirectML.lib"
 )
 
 # DirectML.dll (the redistributable version from the NuGet package, not
 # whatever in-box version Windows happens to ship) must sit next to any
 # executable that links this library — exposed here so tests/CMakeLists.txt
 # and examples/CMakeLists.txt can add a post-build copy step.
-set(CAMPELLO_NN_DIRECTML_DLL "${directml_SOURCE_DIR}/bin/x64-win/DirectML.dll")
+set(CAMPELLO_NN_DIRECTML_DLL "${directml_SOURCE_DIR}/bin/${CAMPELLO_NN_DIRECTML_PLATFORM}/DirectML.dll")
