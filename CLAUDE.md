@@ -15,12 +15,13 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Platform-specific CMake files are selected based on target: `macos.cmake`, `ios.cmake`,
-`windows.cmake`, `linux.cmake`, `android.cmake`, `wasm.cmake`. All of them build the
-cross-platform core sources (`CAMPELLO_NN_CORE_SOURCES`, set in the top-level
-`CMakeLists.txt`). `macos.cmake`/`ios.cmake` additionally compile `src/metal/mps_backend.mm`
+Platform-specific CMake files live in `cmake/` and are selected based on target:
+`cmake/macos.cmake`, `cmake/ios.cmake`, `cmake/windows.cmake`, `cmake/linux.cmake`,
+`cmake/android.cmake`, `cmake/wasm.cmake`. All of them build the cross-platform core sources
+(`CAMPELLO_NN_CORE_SOURCES`, set in the top-level `CMakeLists.txt`).
+`cmake/macos.cmake`/`cmake/ios.cmake` additionally compile `src/metal/mps_backend.mm`
 (Objective-C++, `enable_language(OBJCXX)`, `-fobjc-arc`) and link the Metal/MPSGraph
-frameworks (see `TODO.md` Phase 3a). `windows.cmake` additionally compiles
+frameworks (see `TODO.md` Phase 3a). `cmake/windows.cmake` additionally compiles
 `src/directml/directml_backend.cpp` (plain C++, no language extension needed — DirectML's
 COM API is consumable via `<wrl/client.h>` ComPtr) and fetches the `Microsoft.AI.DirectML`
 NuGet package via `FetchContent` (see `TODO.md` Phase 3b). Linux/Android/Web still build
@@ -109,7 +110,7 @@ none is found, so CI on GPU-less `windows-latest` runners still exercises the re
 op-mapping (`.github/workflows/ci.yml`'s `directml-integration` job) instead of skipping the
 backend the way the macOS-only MPSGraph CI job has to. The DirectML SDK (headers + import
 lib + redistributable DLL) is fetched via NuGet through CMake `FetchContent` in
-`windows.cmake`, mirroring the GoogleTest/campello_image pattern already used in
+`cmake/windows.cmake`, mirroring the GoogleTest/campello_image pattern already used in
 `tests/CMakeLists.txt`. **Not yet built/run against real hardware or WARP** — written on a
 machine with no local C++ toolchain available; DirectML enum/struct names were verified
 against the actual fetched `DirectML.h` rather than trusted from memory, but the code is

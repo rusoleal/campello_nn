@@ -251,7 +251,7 @@ available to develop against.
       → `DirectMlBackend` (`src/pi/context.cpp`, `#elif defined(_WIN32)`,
       parallel to the `__APPLE__` branch).
 - [x] DirectML SDK fetched via NuGet through CMake `FetchContent` in
-      `windows.cmake` (`Microsoft.AI.DirectML` 1.15.4 — mirrors the
+      `cmake/windows.cmake` (`Microsoft.AI.DirectML` 1.15.4 — mirrors the
       GoogleTest/campello_image `FetchContent` pattern already used in
       `tests/CMakeLists.txt`; the `.nupkg` is a plain zip, `DOWNLOAD_NAME
       directml.zip` forces CMake to recognize/auto-extract it despite the

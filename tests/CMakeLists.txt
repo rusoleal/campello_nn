@@ -79,7 +79,7 @@ if(BUILD_INTEGRATION_TESTS)
         set_target_properties(campello_nn_integration_tests PROPERTIES
             CXX_STANDARD 20
         )
-        # DirectML.dll (the redistributable NuGet version, see windows.cmake)
+        # DirectML.dll (the redistributable NuGet version, see cmake/windows.cmake)
         # must sit next to the test executable at runtime.
         add_custom_command(TARGET campello_nn_integration_tests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

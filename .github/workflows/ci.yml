@@ -86,7 +86,7 @@ jobs:
   # selection falls back to the WARP software adapter (DirectML fully supports
   # WARP at our required feature level) — this still exercises the real
   # IR-to-DML-operator mapping end-to-end, just slower than real hardware.
-  # windows.cmake selects the matching arm64-win/x64-win DirectML binaries
+  # cmake/windows.cmake selects the matching arm64-win/x64-win DirectML binaries
   # from the fetched NuGet package based on CMAKE_VS_PLATFORM_NAME, which
   # follows the -A flag passed below.
   # ---------------------------------------------------------------------------
