@@ -234,6 +234,24 @@ void *MpsBackend::compileGraph(const GraphIR &ir)
                                                     name:nil];
             break;
         }
+        case OpKind::RmsNorm:
+        {
+            MPSGraphTensor *x = tensors[node.inputs[0]];
+            MPSDataType dt = mpsDataType(node.dataType);
+            NSInteger lastAxis = (NSInteger)node.shape.size() - 1;
+            NSArray<NSNumber *> *axes = @[ @(lastAxis) ];
+            MPSGraphTensor *square = [graph squareWithTensor:x name:nil];
+            MPSGraphTensor *meanSquare = [graph meanOfTensor:square axes:axes name:nil];
+            MPSGraphTensor *epsConst = [graph constantWithScalar:(double)node.floatAttr0 dataType:dt];
+            MPSGraphTensor *meanSquarePlusEps = [graph additionWithPrimaryTensor:meanSquare
+                                                                  secondaryTensor:epsConst
+                                                                             name:nil];
+            MPSGraphTensor *invRms = [graph reciprocalSquareRootWithTensor:meanSquarePlusEps name:nil];
+            MPSGraphTensor *gamma = reshapeTrailing(graph, tensors[node.inputs[1]], node.shape.size(), node.shape.back());
+            MPSGraphTensor *normalized = [graph multiplicationWithPrimaryTensor:x secondaryTensor:invRms name:nil];
+            tensors[i] = [graph multiplicationWithPrimaryTensor:normalized secondaryTensor:gamma name:nil];
+            break;
+        }
         case OpKind::BatchNorm:
         {
             MPSGraphTensor *x = tensors[node.inputs[0]];

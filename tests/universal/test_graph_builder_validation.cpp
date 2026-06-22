@@ -69,3 +69,22 @@ TEST(GraphBuilderValidation, LayerNormScaleSizeMismatchThrows)
     auto bias = builder.input("bias", {cnn::DataType::Float32, {4}});
     EXPECT_THROW(builder.layerNorm(x, scale, bias, 1e-5f), std::runtime_error);
 }
+
+TEST(GraphBuilderValidation, RmsNormScaleSizeMismatchThrows)
+{
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto x = builder.input("x", {cnn::DataType::Float32, {1, 4}});
+    auto scale = builder.input("scale", {cnn::DataType::Float32, {3}});
+    EXPECT_THROW(builder.rmsNorm(x, scale, 1e-5f), std::runtime_error);
+}
+
+TEST(GraphBuilderValidation, RotaryEmbeddingOddLastDimThrows)
+{
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto x = builder.input("x", {cnn::DataType::Float32, {1, 3}});
+    auto cos = builder.input("cos", {cnn::DataType::Float32, {3}});
+    auto sin = builder.input("sin", {cnn::DataType::Float32, {3}});
+    EXPECT_THROW(builder.rotaryEmbedding(x, cos, sin), std::runtime_error);
+}

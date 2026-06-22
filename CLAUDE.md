@@ -357,6 +357,32 @@ natively, confirmed empirically (`MpsOps.AddBroadcastRowVector`/`MulBroadcastCol
 just from the SDK docs. Other binary ops (`matmul`, etc.) still require exact shapes — broadcasting
 was only added where a real need showed up (ONNX `Conv` bias).
 
+`rmsNorm`/`rotaryEmbedding` (Phase 5 prep — LLaMA/GPT-style decoder blocks need both, neither
+existed in the original transformer-block op set) were added with two different strategies:
+- **`rmsNorm(x, scale, eps)`** is a new fused `OpKind::RmsNorm`, structurally `layerNorm` minus
+  mean-centering and the bias/shift term (`out = x * rsqrt(mean(x^2) + eps) * scale`) — same
+  precedent as `batchNorm`/`instanceNorm` each being their own op rather than composed from a
+  generic reduce primitive (no such primitive is exposed). CPU kernel mirrors `evalLayerNorm`;
+  MPSGraph composes from `squareWithTensor:`/`meanOfTensor:axes:`/`reciprocalSquareRootWithTensor:`
+  (all verified against the real `MPSGraphArithmeticOps.h`/`MPSGraphReductionOps.h` headers before
+  use, same standard as everywhere else in this codebase) — no single native MPSGraph op for this,
+  same situation as `gelu`/`gemm`. **DirectML case intentionally left unimplemented** (falls
+  through to the backend's existing default case, which throws `"unhandled OpKind"` rather than
+  silently misbehaving) — `DML_MEAN_VARIANCE_NORMALIZATION1_OPERATOR_DESC` (already used for
+  `LayerNorm` in this backend) looks like the right operator, but its `NormalizeVariance` flag's
+  exact semantics need checking against the real `DirectML.h`/docs on Windows before trusting it;
+  left for that platform's follow-up work.
+- **`rotaryEmbedding(x, cos, sin)`** needed *no new op at all*. The standard "rotate-half" RoPE
+  (`out = x*cos + rotateHalf(x)*sin`, `rotateHalf` = split the last dim in half and return
+  `concat(-secondHalf, firstHalf)`) decomposes entirely into `slice`/`concat`/`mul`/`add` — all
+  already implemented and verified on every backend. `GraphBuilder::rotaryEmbedding()` is a pure
+  composition calling those same public methods, exactly like `quantizedMatmul()` already does
+  (`dequantizeLinear()` then `matmul()`) — so it works on CPU/MPSGraph/DirectML automatically,
+  with zero backend-specific code. The one bit of new logic is building a dtype-correct `-1.0`
+  constant (`encodeFloat16()` for `Float16`, raw bytes for `Float32`) to negate the second half via
+  `mul()`, since there's no dedicated negate/subtract op. Restricted to Float32/Float16 (rotary
+  embeddings aren't meaningful for the other `DataType`s); `x`'s last dimension must be even.
+
 ## Roadmap
 
 See `TODO.md` for the full phased plan. Phase 1 (core API), Phase 2 (CPU reference backend),

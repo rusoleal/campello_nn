@@ -247,6 +247,68 @@ TEST(CpuOps, LayerNorm)
         EXPECT_NEAR(result[i], (xv[i] - mean) * invStd, 1e-4f);
 }
 
+TEST(CpuOps, RmsNorm)
+{
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto x = builder.input("x", {cnn::DataType::Float32, {1, 4}});
+    auto scale = builder.input("scale", {cnn::DataType::Float32, {4}});
+    auto graph = builder.build({{"out", builder.rmsNorm(x, scale, 1e-5f)}});
+
+    auto tx = context->createTensor({cnn::DataType::Float32, {1, 4}, false, true});
+    auto tscale = context->createTensor({cnn::DataType::Float32, {4}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {1, 4}, true, false});
+
+    float xv[4] = {1, 2, 3, 4};
+    float scaleV[4] = {2, 1, 0.5f, 1};
+    tx->write(xv, sizeof(xv));
+    tscale->write(scaleV, sizeof(scaleV));
+
+    auto fence = context->dispatch(*graph, {{"x", tx}, {"scale", tscale}}, {{"out", tout}});
+    fence->wait();
+
+    float result[4];
+    tout->read(result, sizeof(result));
+
+    float meanSquare = (1.f * 1.f + 2.f * 2.f + 3.f * 3.f + 4.f * 4.f) / 4.f; // 7.5
+    float invRms = 1.0f / std::sqrt(meanSquare + 1e-5f);
+    for (int i = 0; i < 4; i++)
+        EXPECT_NEAR(result[i], xv[i] * invRms * scaleV[i], 1e-4f);
+}
+
+TEST(CpuOps, RotaryEmbedding)
+{
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto x = builder.input("x", {cnn::DataType::Float32, {1, 4}});
+    auto cos = builder.input("cos", {cnn::DataType::Float32, {4}});
+    auto sin = builder.input("sin", {cnn::DataType::Float32, {4}});
+    auto graph = builder.build({{"out", builder.rotaryEmbedding(x, cos, sin)}});
+
+    auto tx = context->createTensor({cnn::DataType::Float32, {1, 4}, false, true});
+    auto tcos = context->createTensor({cnn::DataType::Float32, {4}, false, true});
+    auto tsin = context->createTensor({cnn::DataType::Float32, {4}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {1, 4}, true, false});
+
+    float xv[4] = {1, 2, 3, 4};
+    float cosV[4] = {0.6f, 0.6f, 0.6f, 0.6f};
+    float sinV[4] = {0.8f, 0.8f, 0.8f, 0.8f};
+    tx->write(xv, sizeof(xv));
+    tcos->write(cosV, sizeof(cosV));
+    tsin->write(sinV, sizeof(sinV));
+
+    auto fence = context->dispatch(*graph, {{"x", tx}, {"cos", tcos}, {"sin", tsin}}, {{"out", tout}});
+    fence->wait();
+
+    float result[4];
+    tout->read(result, sizeof(result));
+
+    // rotateHalf({1,2,3,4}) = {-3,-4,1,2}; out = x*cos + rotateHalf*sin
+    float expected[4] = {1 * 0.6f + -3 * 0.8f, 2 * 0.6f + -4 * 0.8f, 3 * 0.6f + 1 * 0.8f, 4 * 0.6f + 2 * 0.8f};
+    for (int i = 0; i < 4; i++)
+        EXPECT_NEAR(result[i], expected[i], 1e-4f);
+}
+
 TEST(CpuOps, BatchNorm)
 {
     auto context = makeCpuContext();

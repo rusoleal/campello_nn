@@ -628,6 +628,23 @@ Goal: implement the layer described in §4 of the architecture doc — everythin
 supplied by code that already knows it). Models distributed as ONNX/TFLite skip this layer
 entirely and go through `campello_nn`'s own importer (Phase 4) instead.
 
+### Op-set prep (`campello_nn`) ✅
+LLaMA/GPT-style decoder blocks need two pieces the original transformer-block op set didn't have:
+- [x] `GraphBuilder::rmsNorm(x, scale, eps)` — new `OpKind::RmsNorm` (`layerNorm` minus
+      mean-centering/bias: `out = x * rsqrt(mean(x^2)+eps) * scale`). CPU + MPSGraph implemented
+      and tested on real GPU hardware (`CpuOps.RmsNorm`/`MpsOps.RmsNorm`). **DirectML
+      intentionally not implemented yet** — falls through to that backend's existing
+      `"unhandled OpKind"` default-throw rather than guessing; `DML_MEAN_VARIANCE_NORMALIZATION1_
+      OPERATOR_DESC` (already used for `LayerNorm` there) is the likely operator, but its
+      `NormalizeVariance` flag needs checking against real `DirectML.h`/docs on Windows before
+      trusting it — follow-up for that platform.
+- [x] `GraphBuilder::rotaryEmbedding(x, cos, sin)` — **no new IR op**. Standard "rotate-half" RoPE
+      decomposes entirely into existing `slice`/`concat`/`mul`/`add`, so this is pure composition
+      (same pattern as `quantizedMatmul`) — works on CPU/MPSGraph/DirectML automatically, verified
+      on CPU + real MPSGraph/GPU hardware (`CpuOps.RotaryEmbedding`/`MpsOps.RotaryEmbedding`).
+      Restricted to Float32/Float16; throws if `x`'s last dimension is odd.
+- [x] Validation tests: `RmsNormScaleSizeMismatchThrows`, `RotaryEmbeddingOddLastDimThrows`.
+
 - [ ] `GenerationConfig` struct (maxTokens, temperature, topP, topK)
 - [ ] Tokenizer support (start with one format, e.g. BPE/SentencePiece compatible with common
       LLaMA/GPT tokenizer files; chat template handling)

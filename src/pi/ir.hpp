@@ -28,6 +28,7 @@ namespace systems::leal::campello_nn
         Gelu,
         Softmax,
         LayerNorm,
+        RmsNorm,
         MatMul,
         Gemm,
         Reshape,
@@ -60,7 +61,7 @@ namespace systems::leal::campello_nn
         std::vector<int64_t> intAttr0; // Reshape: target shape; Transpose: perm; Slice: starts
         std::vector<int64_t> intAttr1; // Slice: sizes
         int32_t axis = 0;              // Softmax/Concat/Gather: axis
-        float floatAttr0 = 0.f;        // LayerNorm: eps; Gemm: alpha
+        float floatAttr0 = 0.f;        // LayerNorm/RmsNorm: eps; Gemm: alpha
         float floatAttr1 = 0.f;        // Gemm: beta
 
         Conv2dDescriptor convParams;   // Conv2d

@@ -2,6 +2,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <campello_nn/graph_builder.hpp>
+#include <campello_nn/float16.hpp>
 #include "graph_builder_data.hpp"
 #include "context_data.hpp"
 #include "resource_data.hpp"
@@ -202,6 +203,75 @@ Operand GraphBuilder::layerNorm(Operand x, Operand scale, Operand bias, float ep
     node.floatAttr0 = eps;
     data->ir.nodes.push_back(std::move(node));
     return Operand(native, data->ir.nodes.size() - 1);
+}
+
+Operand GraphBuilder::rmsNorm(Operand x, Operand scale, float eps)
+{
+    requireSameBuilder(x.builder, native);
+    requireSameBuilder(scale.builder, native);
+    auto data = (GraphBuilderData *)native;
+    const Node &nx = nodeOf(data->ir, x.nodeId);
+    const Node &nscale = nodeOf(data->ir, scale.nodeId);
+    if (nx.shape.empty())
+        throw std::runtime_error("campello_nn: rmsNorm() input must have rank >= 1");
+    int64_t lastDim = nx.shape.back();
+    if (numElements(nscale.shape) != lastDim)
+        throw std::runtime_error("campello_nn: rmsNorm() scale must match the input's last dimension");
+    Node node;
+    node.kind = OpKind::RmsNorm;
+    node.inputs = {x.nodeId, scale.nodeId};
+    node.dataType = nx.dataType;
+    node.shape = nx.shape;
+    node.floatAttr0 = eps;
+    data->ir.nodes.push_back(std::move(node));
+    return Operand(native, data->ir.nodes.size() - 1);
+}
+
+Operand GraphBuilder::rotaryEmbedding(Operand x, Operand cosOp, Operand sinOp)
+{
+    requireSameBuilder(x.builder, native);
+    requireSameBuilder(cosOp.builder, native);
+    requireSameBuilder(sinOp.builder, native);
+    auto data = (GraphBuilderData *)native;
+    const Node &nx = nodeOf(data->ir, x.nodeId);
+    if (nx.shape.empty())
+        throw std::runtime_error("campello_nn: rotaryEmbedding() input must have rank >= 1");
+    int64_t lastDim = nx.shape.back();
+    if (lastDim % 2 != 0)
+        throw std::runtime_error("campello_nn: rotaryEmbedding() input's last dimension must be even");
+
+    int32_t lastAxis = (int32_t)nx.shape.size() - 1;
+    int64_t half = lastDim / 2;
+
+    std::vector<int64_t> starts(nx.shape.size(), 0);
+    std::vector<int64_t> sizes = nx.shape;
+    sizes[lastAxis] = half;
+    Operand firstHalf = slice(x, starts, sizes);
+
+    starts[lastAxis] = half;
+    Operand secondHalf = slice(x, starts, sizes);
+
+    std::vector<uint8_t> negOneBytes;
+    if (nx.dataType == DataType::Float32)
+    {
+        float v = -1.0f;
+        negOneBytes.assign((const uint8_t *)&v, (const uint8_t *)&v + sizeof(v));
+    }
+    else if (nx.dataType == DataType::Float16)
+    {
+        uint16_t v = encodeFloat16(-1.0f);
+        negOneBytes.assign((const uint8_t *)&v, (const uint8_t *)&v + sizeof(v));
+    }
+    else
+    {
+        throw std::runtime_error("campello_nn: rotaryEmbedding() only supports Float32/Float16 input");
+    }
+    Operand negOne = constant({nx.dataType, {1}, false, false}, negOneBytes.data(), negOneBytes.size());
+
+    Operand negatedSecondHalf = mul(secondHalf, negOne);
+    Operand rotatedHalf = concat({negatedSecondHalf, firstHalf}, lastAxis);
+
+    return add(mul(x, cosOp), mul(rotatedHalf, sinOp));
 }
 
 Operand GraphBuilder::batchNorm(Operand x, Operand mean, Operand variance, Operand scale, Operand bias, float eps)

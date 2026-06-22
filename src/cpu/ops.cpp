@@ -205,6 +205,30 @@ namespace
         }
     }
 
+    void evalRmsNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
+    {
+        requireFloat32(node, "rmsNorm");
+        const CpuValue &x = values[node.inputs[0]];
+        const CpuValue &scale = values[node.inputs[1]];
+        out = makeFloatValue(node.shape);
+        int64_t lastDim = node.shape.back();
+        int64_t outerTotal = numElements(node.shape) / lastDim;
+        float eps = node.floatAttr0;
+
+        for (int64_t o = 0; o < outerTotal; o++)
+        {
+            const float *row = x.f() + o * lastDim;
+            float meanSquare = 0.f;
+            for (int64_t k = 0; k < lastDim; k++)
+                meanSquare += row[k] * row[k];
+            meanSquare /= (float)lastDim;
+            float invRms = 1.0f / std::sqrt(meanSquare + eps);
+            float *outRow = out.f() + o * lastDim;
+            for (int64_t k = 0; k < lastDim; k++)
+                outRow[k] = row[k] * invRms * scale.f()[k];
+        }
+    }
+
     void evalBatchNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "batchNorm");
@@ -639,6 +663,7 @@ void systems::leal::campello_nn::evalNode(const Node &node, size_t selfIndex, st
     case OpKind::Sigmoid: evalSigmoid(node, values, out); break;
     case OpKind::Softmax: evalSoftmax(node, values, out); break;
     case OpKind::LayerNorm: evalLayerNorm(node, values, out); break;
+    case OpKind::RmsNorm: evalRmsNorm(node, values, out); break;
     case OpKind::BatchNorm: evalBatchNorm(node, values, out); break;
     case OpKind::InstanceNorm: evalInstanceNorm(node, values, out); break;
     case OpKind::MatMul: evalMatMul(node, values, out); break;

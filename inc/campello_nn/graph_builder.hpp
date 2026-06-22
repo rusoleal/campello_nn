@@ -42,6 +42,16 @@ namespace systems::leal::campello_nn
         Operand sigmoid(Operand x);
         Operand softmax(Operand x, int32_t axis);
         Operand layerNorm(Operand x, Operand scale, Operand bias, float eps);
+        // LLaMA-style RMSNorm: normalizes over the last axis like layerNorm, but
+        // without mean-centering or a bias/shift term — out = x * rsqrt(mean(x^2) + eps) * scale.
+        Operand rmsNorm(Operand x, Operand scale, float eps);
+        // Rotary position embedding (GPT-NeoX/LLaMA "rotate-half" convention), composed
+        // from existing ops (slice/concat/mul/add) rather than a dedicated IR op — works
+        // on every backend automatically. `x`'s last dimension must be even; `cos`/`sin`
+        // must be broadcastable against `x` (same rules as add()/mul()).
+        // out = x * cos + rotateHalf(x) * sin, where rotateHalf splits the last dim in
+        // half and returns concat(-secondHalf, firstHalf).
+        Operand rotaryEmbedding(Operand x, Operand cos, Operand sin);
 
         // linear algebra
         Operand matmul(Operand a, Operand b);
