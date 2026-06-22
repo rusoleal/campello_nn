@@ -20,6 +20,7 @@ add_executable(campello_nn_universal_tests
     universal/test_graph_builder_validation.cpp
     universal/test_transformer_block.cpp
     universal/test_onnx_importer.cpp
+    universal/test_tflite_importer.cpp
     universal/test_graph_cache.cpp
 )
 target_include_directories(campello_nn_universal_tests PRIVATE

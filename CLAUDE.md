@@ -38,7 +38,9 @@ model files directly. ONNX import is implemented (`inc/campello_nn/onnx_importer
 `importOnnxFromMemory(context, data, size)`, with `importOnnxFromFile(context, path)` as a
 convenience wrapper — split the same way `campello_image::Image` splits `fromMemory`/`fromFile`,
 so callers without a real filesystem path (Android `AAssetManager`, etc.) aren't forced through
-one). TFLite is a planned follow-up. Graph caching is implemented (see "Graph Caching" below):
+one). TFLite import is also implemented (`inc/campello_nn/tflite_importer.hpp`, same
+`importTfliteFromMemory`/`importTfliteFromFile` split — see "TFLite Import" below). Graph
+caching is implemented (see "Graph Caching" below):
 the IR `GraphBuilder::build()` would otherwise hand straight to `Backend::compileGraph()` can
 instead be serialized to bytes and reloaded later, skipping `GraphBuilder` reconstruction. The
 planned `campello_llm` layer (tokenization,
@@ -170,6 +172,60 @@ Test fixtures:
   this project's — building both options together also builds `campello_image`'s own test suite
   as a harmless side effect.
 
+### TFLite Import
+
+`src/tflite/` — same shape as `src/onnx/`, internal except for the top-level
+`inc/campello_nn/tflite_importer.hpp` (`importTfliteFromMemory`/`importTfliteFromFile`). TFLite's
+`.tflite` files are FlatBuffers, not protobuf — a vtable + byte-offset-indirection wire format
+that's meaningfully easier to get subtly wrong by hand than protobuf's flat tag+value scheme, so
+unlike `proto_reader.hpp`'s hand-rolled reader, this fetches Google's official `flatbuffers`
+header-only runtime (`FlatBuffers::FlatBuffers` interface target, `FetchContent`'d in the
+top-level `CMakeLists.txt` next to `CAMPELLO_NN_CORE_SOURCES`) and hand-writes field-ID accessors
+directly on its `flatbuffers::Table`/`Vector` primitives — no `flatc` codegen step, no generated
+schema header. Field IDs were verified against the real, current schema (now at
+`google-ai-edge/LiteRT`'s `tflite/converter/schema/schema.fbs` — the old `tensorflow/tensorflow`
+path 404s, the file moved during the TFLite→LiteRT migration), the same "verify against the real
+thing, not memory" discipline the ONNX importer's protobuf field numbers followed.
+
+- `tflite_model.hpp`/`tflite_parser.cpp`: parses a TFLite `Model` (subgraph 0 only, same
+  single-graph assumption ONNX import makes) into plain structs (`TfliteGraph`/`TfliteOperator`/
+  `TfliteTensor`/`TfliteBuffer`). Unlike ONNX's generic name-keyed `OnnxAttribute`, TFLite's
+  builtin-options are per-op-type FlatBuffers tables known entirely from the op code, so the
+  parser eagerly extracts every field a *supported* op might need into `TfliteOperator`'s flat
+  named fields rather than keeping a generic options blob the importer would re-interpret itself.
+- `tflite_importer.cpp`: the op-mapping table (`Conv2D`→`conv2d`, `Add`→`add`, `Relu`→`relu`,
+  `MaxPool2D`/`AveragePool2D`→`maxPool2d`/`avgPool2d`, `Reshape`→`reshape`, `Transpose`→`transpose`,
+  `Softmax`→`softmax`, `Concatenation`→`concat`, `Gather`→`gather`, `FullyConnected`→`gemm`/`matmul`,
+  `ResizeBilinear`/`ResizeNearestNeighbor`→`resize`, `Quantize`/`Dequantize`→`quantizeLinear`/
+  `dequantizeLinear`). `DepthwiseConv2D`/`BatchMatMul` deliberately throw rather than guess —
+  `DepthwiseConv2D`'s OHWI-with-depth-multiplier weight layout needs verifying against a real
+  exported model's actual bytes before trusting any byte-reorder logic blind (see `TODO.md`
+  Phase 4b's last items).
+- **NHWC/OHWI ↔ NCHW/OIHW, the one piece with no ONNX precedent:** TFLite tensors are NHWC and
+  conv weights are OHWI, unlike campello_nn's (and ONNX's) NCHW/OIHW throughout. Converting
+  happens *only* at the graph boundary — a single `transpose()` right after each rank-4 graph
+  input and right before each rank-4 graph output — not per-op; every interior op operates in
+  NCHW exactly like an ONNX-imported graph. `Conv2D`/`FullyConnected` weight *constants* are
+  pre-transposed at import time by reordering their raw bytes directly (`permuteBytes()` in
+  `tflite_importer.cpp`) rather than inserting a runtime transpose op — the same "fold a
+  resolvable shape op into the constant itself" trick as the ONNX importer's Conv-bias
+  `[C]`→`[1,C,1,1]` reshape. **Known limitation:** axis-bearing ops (`Concatenation`/`Softmax`/
+  `Gather`) remap TFLite's NHWC-numbered axis to NCHW assuming no intervening `Reshape`/
+  `Transpose` has already broken the correspondence between the current operand and the original
+  NHWC tensor it traces back to — documented in `tflite_importer.cpp`, not exercised by models
+  that only reshape/transpose right before their final output.
+- TFLite's quantization scale/zero-point lives on the *tensor* (`Tensor.quantization`), not the
+  operator, unlike ONNX's `QuantizeLinear`/`DequantizeLinear` nodes carrying their own scale/
+  zero-point inputs — `Quantize`/`Dequantize` read it straight off the relevant tensor.
+
+Test fixture: `tests/fixtures/conv_add_relu.tflite` — synthetic, hand-written as
+`conv_add_relu_tflite.json` and compiled with `flatc --binary tflite_schema.fbs
+conv_add_relu_tflite.json` (schema provenance in `tests/fixtures/NOTICE.md`), computing the
+identical Conv→Add→Relu graph as `conv_add_relu.onnx` so `tests/universal/test_tflite_importer.cpp`
+checks against the exact same expected values as the ONNX importer's test. Not yet validated
+against a real third-party TFLite model the way Phase 4a's YuNet test validates ONNX import — see
+`TODO.md` Phase 4b's last item.
+
 ### Graph Caching
 
 `GraphBuilder::build()` normally hands its IR straight to `Backend::compileGraph()` and discards
@@ -254,8 +310,10 @@ was only added where a real need showed up (ONNX `Conv` bias).
 ## Roadmap
 
 See `TODO.md` for the full phased plan. Phase 1 (core API), Phase 2 (CPU reference backend),
-Phase 3a (MPSGraph backend, macOS/iOS), Phase 4a (ONNX import), and Phase 4c (graph caching) are
-implemented and tested — Phase 4a is validated end-to-end against a real, standard pretrained
-model (YuNet face detection) on real images, not just synthetic fixtures. Still open: the rest of
-Phase 3 (DirectML, oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough), Phase 4b (TFLite import), and
-Phase 5 (`campello_llm`/`campello_vision`).
+Phase 3a (MPSGraph backend, macOS/iOS), Phase 3b (DirectML backend, Windows), Phase 4a (ONNX
+import), Phase 4b (TFLite import), and Phase 4c (graph caching) are implemented and tested — Phase
+4a is validated end-to-end against a real, standard pretrained model (YuNet face detection) on
+real images, not just synthetic fixtures; Phase 4b is currently synthetic-fixture-only (see
+"TFLite Import" above) and doesn't yet have an equivalent real-model test. Still open: the rest of
+Phase 3 (oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough), Phase 4b's `DepthwiseConv2D`/
+`BatchMatMul` follow-ups, and Phase 5 (`campello_llm`/`campello_vision`).

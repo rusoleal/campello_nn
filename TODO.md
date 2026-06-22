@@ -499,15 +499,46 @@ far enough along that the op set and `Graph` representation are stable.
       plus a plain broadcasting `add()`. Re-ran `YuNetFaceDetection` afterward — same thresholds
       pass, confirming no regression.
 
-### 4b. TFLite import (follow-up, comparable effort to 4a, not free once 4a exists)
-- [ ] Vendor or `FetchContent` FlatBuffers (TFLite's serialization format)
-- [ ] Parse a TFLite `Model` → `SubGraph` (operators, tensors, buffers)
-- [ ] Op-mapping table, TFLite op codes → `GraphBuilder` calls — different naming than ONNX
-- [ ] Handle NHWC-default layout (vs. this codebase's NCHW convention) — either insert
-      transposes at import time or decide some ops should accept a layout hint
-- [ ] Handle TFLite's attribute-fused quantization (vs. our separate `QuantizeLinear`/
-      `DequantizeLinear` nodes)
-- [ ] Test: import a small real TFLite vision model (e.g. a MediaPipe model) end-to-end
+### 4b. TFLite import ✅ (initial op set; DEPTHWISE_CONV_2D/BATCH_MATMUL are fast-follow)
+- [x] **Decision:** `FetchContent` Google's official `flatbuffers` header-only runtime
+      (`FlatBuffers::FlatBuffers` interface target, same `FetchContent` pattern as
+      GoogleTest/DirectML) rather than hand-rolling a FlatBuffers reader the way
+      `proto_reader.hpp` hand-rolls protobuf — FlatBuffers' vtable + byte-offset
+      indirection is a meaningfully higher bug-risk format to reimplement blind than
+      protobuf's flat tag+value scheme. No `flatc` codegen step, no generated schema
+      header: `src/tflite/tflite_parser.cpp` hand-writes field-ID accessors directly on
+      `flatbuffers::Table`/`Vector`, verified against the real schema (now at
+      `google-ai-edge/LiteRT`'s `tflite/converter/schema/schema.fbs` — the old
+      `tensorflow/tensorflow` path moved during the TFLite→LiteRT migration).
+- [x] Parse a TFLite `Model` → `SubGraph` (operators, tensors, buffers) — `tflite_model.hpp`/
+      `tflite_parser.cpp`, mirroring `onnx_model.hpp`/`onnx_parser.cpp`'s shape. Only
+      subgraph 0 is imported, same single-graph assumption the ONNX importer makes.
+- [x] Op-mapping table (`tflite_importer.cpp`'s `applyOperator()`, mirrors `onnx_importer.cpp`'s
+      `applyNode()`): `CONV_2D`, `ADD`, `MUL`, `RELU`, `LOGISTIC` (sigmoid), `MAX_POOL_2D`/
+      `AVERAGE_POOL_2D`, `RESHAPE`, `TRANSPOSE`, `SOFTMAX`, `CONCATENATION`, `GATHER`,
+      `FULLY_CONNECTED`, `RESIZE_BILINEAR`/`RESIZE_NEAREST_NEIGHBOR`, `QUANTIZE`/`DEQUANTIZE`.
+- [x] **Decision:** NHWC/OHWI ↔ NCHW/OIHW conversion happens *only* at the graph boundary —
+      a single `transpose()` right after each graph input and right before each graph output
+      (rank-4 tensors only), not per-op. `CONV_2D`/`FULLY_CONNECTED` weight constants are
+      pre-transposed at import time (bytes reordered once, zero added runtime ops), same
+      trick as the ONNX importer's Conv-bias `[C]`→`[1,C,1,1]` reshape. **Known limitation:**
+      axis-bearing ops (`CONCATENATION`/`SOFTMAX`/`GATHER`) remap TFLite's NHWC-numbered axis
+      to NCHW assuming no intervening `RESHAPE`/`TRANSPOSE` has already broken that
+      correspondence — documented in `tflite_importer.cpp`, not exercised by the current test.
+- [x] TFLite's quantization (scale/zero_point on the *tensor*, not the op) handled by reading
+      `Tensor.quantization` directly for `QUANTIZE`/`DEQUANTIZE`'s campello_nn-side
+      `scale`/`zeroPoint` arguments — no separate fused-attribute path needed.
+- [x] Test: `tests/universal/test_tflite_importer.cpp` against a synthetic fixture
+      (`tests/fixtures/conv_add_relu.tflite`, hand-written JSON + `flatc --binary`, see
+      `fixtures/NOTICE.md`) computing the identical graph as `conv_add_relu.onnx` — same
+      expected output values, checked against both importers.
+- [ ] **Deliberately out of scope for v1:** `DEPTHWISE_CONV_2D` (OHWI weight layout with
+      depth-multiplier semantics needs verifying against a real exported model's actual bytes
+      before trusting any byte-reorder logic blind) and `BATCH_MATMUL` (only `adj_x=adj_y=false`
+      would be supported anyway).
+- [ ] Test against a real TFLite vision model (e.g. a MediaPipe model) end-to-end, the way
+      Phase 4a's YuNet test validates the ONNX importer against a real model — the current
+      test fixture is synthetic only.
 
 ### 4c. Graph caching (serialize/load a compiled `Graph`)
 - [x] **Decision:** caches the backend-agnostic `GraphIR` (built by `GraphBuilder`, normally

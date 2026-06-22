@@ -11,6 +11,30 @@ include(GNUInstallDirs)
 include_directories(inc)
 
 # ---------------------------------------------------------------------------
+# FlatBuffers — TFLite import (Phase 4b of TODO.md). TFLite's .tflite files
+# are FlatBuffers, not protobuf, so the ONNX importer's hand-rolled
+# proto_reader.hpp approach doesn't carry over safely: FlatBuffers' vtable +
+# byte-offset indirection is much easier to get subtly wrong than protobuf's
+# flat tag+value scheme. Fetched the same way GoogleTest/DirectML are
+# (FetchContent), but only the header-only `FlatBuffers::FlatBuffers`
+# interface target (Table/Vector field-accessor primitives) — no flatc
+# codegen step, no generated schema header; src/tflite/tflite_parser.cpp
+# hand-writes the field-ID accessors on top of it instead, verified against
+# the real schema.fbs (now at google-ai-edge/LiteRT, the old
+# tensorflow/tensorflow path moved during the TFLite->LiteRT migration).
+# ---------------------------------------------------------------------------
+include(FetchContent)
+set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_BUILD_FLATC OFF CACHE BOOL "" FORCE)
+set(FLATBUFFERS_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    flatbuffers
+    GIT_REPOSITORY https://github.com/google/flatbuffers.git
+    GIT_TAG v25.12.19-2026-02-06-03fffb2
+)
+FetchContent_MakeAvailable(flatbuffers)
+
+# ---------------------------------------------------------------------------
 # Core sources — graph IR, GraphBuilder, Context/Tensor/Graph/Fence, and the
 # CPU reference backend. Cross-platform; no accelerator SDK required.
 # Each platform .cmake file appends accelerator-backend sources (Phase 3 of
@@ -29,6 +53,8 @@ set(CAMPELLO_NN_CORE_SOURCES
     src/cpu/ops.cpp
     src/onnx/onnx_parser.cpp
     src/onnx/onnx_importer.cpp
+    src/tflite/tflite_parser.cpp
+    src/tflite/tflite_importer.cpp
 )
 
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Android")
@@ -44,6 +70,8 @@ elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
 elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Emscripten")
     include(wasm.cmake)
 endif()
+
+target_link_libraries(${PROJECT_NAME} FlatBuffers::FlatBuffers)
 
 add_library(campello_nn::campello_nn ALIAS ${PROJECT_NAME})
 
