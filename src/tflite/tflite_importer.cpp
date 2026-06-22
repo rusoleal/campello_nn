@@ -30,6 +30,7 @@ namespace
         TFL_RESHAPE = 22,
         TFL_RESIZE_BILINEAR = 23,
         TFL_SOFTMAX = 25,
+        TFL_PAD = 34,
         TFL_GATHER = 36,
         TFL_TRANSPOSE = 39,
         TFL_RESIZE_NEAREST_NEIGHBOR = 97,
@@ -193,6 +194,37 @@ namespace
         return std::vector<int64_t>(p, p + n);
     }
 
+    // Resolves TFLite RESHAPE's -1 ("infer from total element count")
+    // sentinel into a concrete dimension — GraphBuilder::reshape() itself
+    // requires an exact, already-resolved target shape (no -1 support), same
+    // as the ONNX importer's own resolveReshapeTarget() (TFLite's Reshape has
+    // no ONNX-style '0' sentinel, so that case isn't handled here).
+    std::vector<int64_t> resolveReshapeTarget(const std::vector<int64_t> &targetShape,
+                                               const std::vector<int64_t> &inputShape)
+    {
+        std::vector<int64_t> resolved = targetShape;
+        int64_t inferIndex = -1;
+        int64_t knownProduct = 1;
+        for (size_t i = 0; i < resolved.size(); i++)
+        {
+            if (resolved[i] == -1)
+                inferIndex = (int64_t)i;
+            else
+                knownProduct *= resolved[i];
+        }
+        if (inferIndex >= 0)
+        {
+            int64_t totalInput = 1;
+            for (auto d : inputShape)
+                totalInput *= d;
+            if (knownProduct == 0 || totalInput % knownProduct != 0)
+                throw std::runtime_error(
+                    "campello_nn: TFLite RESHAPE's inferred (-1) dimension does not evenly divide the input element count");
+            resolved[inferIndex] = totalInput / knownProduct;
+        }
+        return resolved;
+    }
+
     // Lazily binds a TFLite tensor as a campello_nn constant on first use.
     // Graph-input tensors are already bound (and transposed to NCHW) before
     // any operator runs — see importTfliteFromMemory — so reaching here means
@@ -227,13 +259,25 @@ namespace
     // clear "not yet supported" error rather than silently producing wrong
     // output.
     void applyOperator(GraphBuilder &builder, const tflite::TfliteOperator &op, const tflite::TfliteGraph &g,
-                        std::unordered_map<int32_t, Operand> &values)
+                        std::unordered_map<int32_t, Operand> &values,
+                        std::unordered_map<int32_t, int32_t> &dequantSource)
     {
         auto in = [&](size_t idx) -> Operand
         {
             if (idx >= op.inputs.size() || op.inputs[idx] < 0)
                 throw std::runtime_error("campello_nn: TFLite operator missing required input " + std::to_string(idx));
             return resolveTensor(builder, g, values, op.inputs[idx]);
+        };
+        // A float16-weights TFLite export wraps every weight/bias constant in
+        // an explicit DEQUANTIZE (see TFL_DEQUANTIZE below) — CONV_2D/
+        // DEPTHWISE_CONV_2D/FULLY_CONNECTED's import-time byte permutation
+        // needs the *original* constant's raw bytes/shape, so it resolves
+        // through this map first rather than assuming op.inputs[1]/[2] always
+        // directly own a Buffer.
+        auto constIdx = [&](int32_t tensorIndex) -> int32_t
+        {
+            auto it = dequantSource.find(tensorIndex);
+            return it != dequantSource.end() ? it->second : tensorIndex;
         };
 
         if (op.outputs.empty())
@@ -251,7 +295,7 @@ namespace
             if (inShape.size() != 4)
                 throw std::runtime_error("campello_nn: TFLite CONV_2D on a non-rank-4 tensor is not yet supported");
 
-            const tflite::TfliteTensor &wt = g.tensors.at(op.inputs[1]);
+            const tflite::TfliteTensor &wt = g.tensors.at(constIdx(op.inputs[1]));
             const tflite::TfliteBuffer &wbuf = g.buffers.at(wt.bufferIndex);
             if (wbuf.data.empty())
                 throw std::runtime_error("campello_nn: TFLite CONV_2D's weight input must be a constant");
@@ -281,7 +325,7 @@ namespace
 
             if (op.inputs.size() > 2 && op.inputs[2] >= 0)
             {
-                const tflite::TfliteTensor &bt = g.tensors.at(op.inputs[2]);
+                const tflite::TfliteTensor &bt = g.tensors.at(constIdx(op.inputs[2]));
                 const tflite::TfliteBuffer &bbuf = g.buffers.at(bt.bufferIndex);
                 if (bbuf.data.empty())
                     throw std::runtime_error("campello_nn: TFLite CONV_2D's bias input must be a constant");
@@ -312,7 +356,7 @@ namespace
                 throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D on a non-rank-4 tensor is not yet supported");
             int64_t inputChannels = inShape[1];
 
-            const tflite::TfliteTensor &wt = g.tensors.at(op.inputs[1]);
+            const tflite::TfliteTensor &wt = g.tensors.at(constIdx(op.inputs[1]));
             const tflite::TfliteBuffer &wbuf = g.buffers.at(wt.bufferIndex);
             if (wbuf.data.empty())
                 throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D's weight input must be a constant");
@@ -349,7 +393,7 @@ namespace
 
             if (op.inputs.size() > 2 && op.inputs[2] >= 0)
             {
-                const tflite::TfliteTensor &bt = g.tensors.at(op.inputs[2]);
+                const tflite::TfliteTensor &bt = g.tensors.at(constIdx(op.inputs[2]));
                 const tflite::TfliteBuffer &bbuf = g.buffers.at(bt.bufferIndex);
                 if (bbuf.data.empty())
                     throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D's bias input must be a constant");
@@ -407,6 +451,8 @@ namespace
                 target = constantInt32Vector(g, op.inputs[1]);
             else
                 throw std::runtime_error("campello_nn: TFLite RESHAPE without a new_shape option or shape input is not yet supported");
+            std::vector<int64_t> inShape = internal::operandShapeForImport(x);
+            target = resolveReshapeTarget(target, inShape);
             result = builder.reshape(x, target);
             break;
         }
@@ -444,6 +490,48 @@ namespace
             result = applyFusedActivation(builder, builder.concat(xs, axis), op.fusedActivation);
             break;
         }
+        case TFL_PAD:
+        {
+            Operand x = in(0);
+            std::vector<int64_t> inShape = internal::operandShapeForImport(x);
+            if (op.inputs.size() < 2 || op.inputs[1] < 0)
+                throw std::runtime_error("campello_nn: TFLite PAD without a paddings input is not yet supported");
+            std::vector<int64_t> paddings = constantInt32Vector(g, op.inputs[1]); // [rank,2], TFLite's own axis order
+            size_t rank = inShape.size();
+            if (paddings.size() != rank * 2)
+                throw std::runtime_error("campello_nn: TFLite PAD paddings tensor size doesn't match input rank");
+
+            // Only the pattern actually seen in a real model (MediaPipe
+            // BlazeFace's residual channel-padding before an add) is supported:
+            // zero-padding the channel axis only, after-only. Expressed as
+            // concat(x, zeros) along that axis rather than adding a new core
+            // `pad` op for this one narrow use — every other axis/before-padding
+            // combination throws rather than guessing.
+            for (size_t axis = 0; axis + 1 < rank; axis++)
+                if (paddings[axis * 2] != 0 || paddings[axis * 2 + 1] != 0)
+                    throw std::runtime_error("campello_nn: TFLite PAD is only supported on the channel axis");
+            int64_t before = paddings[(rank - 1) * 2];
+            int64_t after = paddings[(rank - 1) * 2 + 1];
+            if (before != 0)
+                throw std::runtime_error("campello_nn: TFLite PAD with before-padding is not yet supported");
+            if (after == 0)
+            {
+                result = x;
+                break;
+            }
+
+            int32_t concatAxis = rank == 4 ? 1 : (int32_t)(rank - 1);
+            DataType dt = g.tensors.at(op.inputs[0]).toDataType();
+            std::vector<int64_t> zeroShape = inShape;
+            zeroShape[concatAxis] = after;
+            int64_t zeroCount = 1;
+            for (auto d : zeroShape)
+                zeroCount *= d;
+            std::vector<uint8_t> zeroBytes((size_t)zeroCount * elementByteSize(dt), 0);
+            Operand zeros = builder.constant({dt, zeroShape, false, false}, zeroBytes.data(), zeroBytes.size());
+            result = builder.concat({x, zeros}, concatAxis);
+            break;
+        }
         case TFL_GATHER:
         {
             if (op.batchDims != 0)
@@ -457,7 +545,7 @@ namespace
         case TFL_FULLY_CONNECTED:
         {
             Operand x = in(0);
-            const tflite::TfliteTensor &wt = g.tensors.at(op.inputs[1]);
+            const tflite::TfliteTensor &wt = g.tensors.at(constIdx(op.inputs[1]));
             const tflite::TfliteBuffer &wbuf = g.buffers.at(wt.bufferIndex);
             if (wbuf.data.empty())
                 throw std::runtime_error("campello_nn: TFLite FULLY_CONNECTED's weight input must be a constant");
@@ -473,7 +561,7 @@ namespace
             Operand fcOut;
             if (hasBias)
             {
-                const tflite::TfliteTensor &bt = g.tensors.at(op.inputs[2]);
+                const tflite::TfliteTensor &bt = g.tensors.at(constIdx(op.inputs[2]));
                 const tflite::TfliteBuffer &bbuf = g.buffers.at(bt.bufferIndex);
                 Operand biasOp =
                     builder.constant({bt.toDataType(), bt.shape, false, false}, bbuf.data.data(), bbuf.data.size());
@@ -518,9 +606,26 @@ namespace
         case TFL_DEQUANTIZE:
         {
             const tflite::TfliteTensor &inT = g.tensors.at(op.inputs[0]);
-            if (!inT.hasQuantization)
-                throw std::runtime_error("campello_nn: TFLite DEQUANTIZE input tensor has no quantization parameters");
-            result = builder.dequantizeLinear(in(0), inT.quantScale, inT.quantZeroPoint);
+            if (inT.hasQuantization)
+            {
+                result = builder.dequantizeLinear(in(0), inT.quantScale, inT.quantZeroPoint);
+            }
+            else
+            {
+                // A float16-weights export (e.g. MediaPipe's "float16" TFLite
+                // variant) inserts DEQUANTIZE as a pure FLOAT16->FLOAT32
+                // precision cast ahead of every weight's use, not real int8
+                // quantization. campello_nn's backends already treat a
+                // Float16-declared constant as Float32 transparently (see
+                // CLAUDE.md "Dtype Support"), so this is a no-op at the IR
+                // level — just pass the operand through. Also record the
+                // alias so CONV_2D/DEPTHWISE_CONV_2D/FULLY_CONNECTED's
+                // import-time weight-byte permutation (which reads raw
+                // Buffer bytes directly, bypassing this Operand) can resolve
+                // back to the original constant tensor via `constIdx()`.
+                dequantSource[op.outputs[0]] = op.inputs[0];
+                result = in(0);
+            }
             break;
         }
         case TFL_BATCH_MATMUL:
@@ -583,8 +688,9 @@ TfliteImportResult systems::leal::campello_nn::importTfliteFromMemory(std::share
     // TFLite's operators array is already in execution order (schema.fbs:
     // "All operators, in execution order"), same single-linear-pass assumption
     // the ONNX importer makes.
+    std::unordered_map<int32_t, int32_t> dequantSource;
     for (auto &op : g.operators)
-        applyOperator(builder, op, g, values);
+        applyOperator(builder, op, g, values, dequantSource);
 
     // Convert rank-4 outputs back to NHWC before finalizing, so the returned
     // TensorDescriptor matches what the original .tflite file itself declares

@@ -171,7 +171,9 @@ Test fixtures:
   exactly where that convention was confirmed (`libfacedetection.train`'s own training transform).
   Note: `campello_image` declares its own `option(BUILD_TESTS ...)`, which collides by name with
   this project's — building both options together also builds `campello_image`'s own test suite
-  as a harmless side effect.
+  as a harmless side effect. The same two images, plus a second real model
+  (`blaze_face_short_range.tflite`), are reused by the TFLite importer's own real-model test — see
+  "TFLite Import" below — rather than introducing a second pair of test images.
 
 ### TFLite Import
 
@@ -199,9 +201,9 @@ thing, not memory" discipline the ONNX importer's protobuf field numbers followe
   `Reshape`→`reshape`, `Transpose`→`transpose`, `Softmax`→`softmax`, `Concatenation`→`concat`,
   `Gather`→`gather`, `FullyConnected`→`gemm`/`matmul`, `BatchMatMul`→`matmul`,
   `ResizeBilinear`/`ResizeNearestNeighbor`→`resize`, `Quantize`/`Dequantize`→`quantizeLinear`/
-  `dequantizeLinear`). `DepthwiseConv2D`'s weight layout (`[1,filter_height,filter_width,
-  output_depth]`) and output-channel numbering (`oc = m + ic*depth_multiplier`) were verified
-  against TFLite's own reference kernel source
+  `dequantizeLinear`, `Pad`→`concat`-with-a-zero-constant). `DepthwiseConv2D`'s weight layout
+  (`[1,filter_height,filter_width, output_depth]`) and output-channel numbering
+  (`oc = m + ic*depth_multiplier`) were verified against TFLite's own reference kernel source
   (`tflite/kernels/internal/reference/depthwiseconv_float.h`) rather than guessed — that numbering
   turns out to already match the standard "groups=input_channels" convention `conv2d()`'s `groups`
   parameter implements (the same one ONNX import already relies on for `Conv`'s `group` attribute),
@@ -209,7 +211,31 @@ thing, not memory" discipline the ONNX importer's protobuf field numbers followe
   `Conv2D`'s own weight conversion just with a different axis mapping. `BatchMatMul`'s `adj_x`/
   `adj_y` were confirmed against `tflite/kernels/batch_matmul.cc` ("transpose the last two
   dimensions") and become an explicit `transpose()` of the operand's last two axes before the
-  matmul, since `GraphBuilder::matmul()` has no transpose flag of its own.
+  matmul, since `GraphBuilder::matmul()` has no transpose flag of its own. `Reshape`'s `-1`
+  ("infer from total element count") is resolved by the importer itself before calling
+  `builder.reshape()` (`resolveReshapeTarget()`, same logic as the ONNX importer's
+  `resolveReshapeTarget()` minus ONNX's extra `0` sentinel, which TFLite's `Reshape` doesn't have) —
+  `GraphBuilder::reshape()` requires an exact, already-resolved target shape.
+  **`Pad`:** there's no dedicated core `pad` op (and none was added for this) — the only pattern
+  actually seen in a real model (MediaPipe BlazeFace's residual channel-padding before an `add`,
+  confirmed via its `Paddings` constant's actual bytes: zero everywhere except the channel axis,
+  and zero *before*) is expressed as `concat(x, zeros)` along the channel axis, with every other
+  axis/before-padding combination throwing rather than guessing. A real core `pad` op is worth
+  adding if a future model needs a pattern this can't express.
+  **Float16-weight `Dequantize`:** a "float16-weights" TFLite export (e.g. MediaPipe's `float16`
+  variant) wraps every weight/bias constant in an explicit `Dequantize` purely as a precision cast
+  (FLOAT16→FLOAT32), not real int8 quantization — distinguished from real quantization by checking
+  whether the input tensor actually carries `QuantizationParameters` (`TfliteTensor::hasQuantization`).
+  Since campello_nn's CPU backend already decodes any Float16-declared `Constant`/`Input` node to
+  Float32 transparently at dispatch time (see "Dtype Support" below), this case is a no-op at the
+  IR level — the importer just passes the operand through instead of emitting a real op. The
+  trickier part: `Conv2D`/`DepthwiseConv2D`/`FullyConnected`'s import-time weight-byte permutation
+  reads a weight/bias input's raw `Buffer` bytes *directly* (bypassing the lazy per-tensor `Operand`
+  cache, since it needs to reorder bytes, not just reference a value) — when that weight is wrapped
+  in a `Dequantize`, the permutation code needs the *original* constant tensor, not the
+  `Dequantize`'s (bufferless, computed) output tensor. A `dequantSource` map (recorded when
+  `Dequantize`'s no-op case runs, consulted via `applyOperator()`'s local `constIdx()` helper)
+  redirects the permutation code back to the real underlying tensor index.
 - **NHWC/OHWI ↔ NCHW/OIHW, the one piece with no ONNX precedent:** TFLite tensors are NHWC and
   conv weights are OHWI, unlike campello_nn's (and ONNX's) NCHW/OIHW throughout. Converting
   happens *only* at the graph boundary — a single `transpose()` right after each rank-4 graph
@@ -234,8 +260,21 @@ tflite_schema.fbs <name>.json` — schema provenance in `tests/fixtures/NOTICE.m
 ONNX importer's test; `depthwise_conv2d.tflite` and `batch_matmul.tflite` each check against
 expected values computed by hand independently (not just round-tripped through the importer
 itself), specifically to verify the `DepthwiseConv2D`/`BatchMatMul` layout claims above are
-actually correct, not just plausible-sounding. Not yet validated against a real third-party TFLite
-model the way Phase 4a's YuNet test validates ONNX import — see `TODO.md` Phase 4b's last item.
+actually correct, not just plausible-sounding.
+
+Also validated end-to-end against a real, standard pretrained model — `tests/fixtures/
+blaze_face_short_range.tflite` (MediaPipe's BlazeFace short-range face detector, Apache 2.0,
+provenance in `tests/fixtures/NOTICE.md`), exercised by
+`tests/universal/test_blazeface_face_detection.cpp`, gated behind `BUILD_MODEL_TESTS` alongside
+the YuNet test. This is specifically what motivated adding `Pad` and the float16-weight
+`Dequantize` handling above — the synthetic fixtures never needed either. Unlike YuNet's ~1800x
+face-vs-no-face margin, this test's margin is modest (~2x: face.jpg scores ~0.47, no_face.jpg
+scores ~0.23) — explained in the test file's comments: face.jpg is a conservatively-framed 1911
+portrait, not a close-up selfie (this model's actual training distribution), and the test
+deliberately skips MediaPipe's own letterbox preprocessing (measured to *hurt* this specific
+fixture's score — shrinks the face further below the model's expected framing) and the real
+product's anchor-decode/NMS/`min_score_thresh=0.5` pipeline, checking only the raw max per-anchor
+sigmoid score.
 
 ### Graph Caching
 
@@ -322,9 +361,7 @@ was only added where a real need showed up (ONNX `Conv` bias).
 
 See `TODO.md` for the full phased plan. Phase 1 (core API), Phase 2 (CPU reference backend),
 Phase 3a (MPSGraph backend, macOS/iOS), Phase 3b (DirectML backend, Windows), Phase 4a (ONNX
-import), Phase 4b (TFLite import), and Phase 4c (graph caching) are implemented and tested — Phase
-4a is validated end-to-end against a real, standard pretrained model (YuNet face detection) on
-real images, not just synthetic fixtures; Phase 4b is currently synthetic-fixture-only (see
-"TFLite Import" above) and doesn't yet have an equivalent real-model test. Still open: the rest of
-Phase 3 (oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough), Phase 4b's real-model test, and Phase 5
-(`campello_llm`/`campello_vision`).
+import), Phase 4b (TFLite import), and Phase 4c (graph caching) are implemented and tested — both
+Phase 4a (YuNet) and Phase 4b (MediaPipe BlazeFace) are validated end-to-end against real, standard
+pretrained models on real images, not just synthetic fixtures. Still open: the rest of Phase 3
+(oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough) and Phase 5 (`campello_llm`/`campello_vision`).

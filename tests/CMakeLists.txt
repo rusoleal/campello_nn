@@ -95,13 +95,13 @@ if(BUILD_INTEGRATION_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
-# Model tests — exercise a real third-party model (YuNet, an ONNX face
-# detector) end-to-end via the ONNX importer, on real decoded images. Pulls in
-# campello_image (FetchContent) to decode the test images, which itself pulls
-# in basis_universal + libwebp — opt-in via its own flag so a normal
-# `-DBUILD_TESTS=ON` build stays light.
+# Model tests — exercise real third-party models (YuNet/ONNX and BlazeFace/
+# TFLite, both face detectors) end-to-end via their respective importers, on
+# real decoded images. Pulls in campello_image (FetchContent) to decode the
+# test images, which itself pulls in basis_universal + libwebp — opt-in via
+# its own flag so a normal `-DBUILD_TESTS=ON` build stays light.
 # ---------------------------------------------------------------------------
-option(BUILD_MODEL_TESTS "Build the YuNet face-detection ONNX import test (pulls in campello_image)" OFF)
+option(BUILD_MODEL_TESTS "Build the YuNet/BlazeFace face-detection model import tests (pulls in campello_image)" OFF)
 
 if(BUILD_MODEL_TESTS)
     FetchContent_Declare(
@@ -113,6 +113,7 @@ if(BUILD_MODEL_TESTS)
 
     add_executable(campello_nn_model_tests
         universal/test_yunet_face_detection.cpp
+        universal/test_blazeface_face_detection.cpp
     )
     target_include_directories(campello_nn_model_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/inc
@@ -128,6 +129,16 @@ if(BUILD_MODEL_TESTS)
     set_target_properties(campello_nn_model_tests PROPERTIES
         CXX_STANDARD 20
     )
+    if(WIN32)
+        # campello_image is a shared library on Windows (no rpath/install_name
+        # trick like macOS/Linux) — it must sit next to the test executable at
+        # runtime, same reasoning as DirectML.dll's copy step above.
+        add_custom_command(TARGET campello_nn_model_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:campello_image>"
+                "$<TARGET_FILE_DIR:campello_nn_model_tests>"
+        )
+    endif()
     include(GoogleTest)
     gtest_discover_tests(campello_nn_model_tests)
 endif()

@@ -515,7 +515,7 @@ far enough along that the op set and `Graph` representation are stable.
       subgraph 0 is imported, same single-graph assumption the ONNX importer makes.
 - [x] Op-mapping table (`tflite_importer.cpp`'s `applyOperator()`, mirrors `onnx_importer.cpp`'s
       `applyNode()`): `CONV_2D`, `DEPTHWISE_CONV_2D`, `ADD`, `MUL`, `RELU`, `LOGISTIC` (sigmoid),
-      `MAX_POOL_2D`/`AVERAGE_POOL_2D`, `RESHAPE`, `TRANSPOSE`, `SOFTMAX`, `CONCATENATION`,
+      `MAX_POOL_2D`/`AVERAGE_POOL_2D`, `RESHAPE`, `TRANSPOSE`, `SOFTMAX`, `CONCATENATION`, `PAD`,
       `GATHER`, `FULLY_CONNECTED`, `BATCH_MATMUL`, `RESIZE_BILINEAR`/`RESIZE_NEAREST_NEIGHBOR`,
       `QUANTIZE`/`DEQUANTIZE`.
 - [x] **`DEPTHWISE_CONV_2D`:** weight layout (`[1,filter_height,filter_width,output_depth]`) and
@@ -548,9 +548,37 @@ far enough along that the op set and `Graph` representation are stable.
       importers); `depthwise_conv2d.tflite` and `batch_matmul.tflite` each check against
       independently hand-computed expected values (not just round-tripped through the importer
       itself) — see those tests' comments for the by-hand arithmetic.
-- [ ] Test against a real TFLite vision model (e.g. a MediaPipe model) end-to-end, the way
-      Phase 4a's YuNet test validates the ONNX importer against a real model — the current
-      test fixtures are all synthetic.
+- [x] **Test against a real TFLite vision model end-to-end**, the way Phase 4a's YuNet test
+      validates the ONNX importer: `tests/universal/test_blazeface_face_detection.cpp` imports
+      MediaPipe's BlazeFace short-range face detector (`blaze_face_short_range.tflite`, the
+      official "float16" export, Apache 2.0; see `tests/fixtures/NOTICE.md`), reuses the same two
+      real test images as the YuNet test (`tests/fixtures/images/`), resizes to 128×128 via
+      campello_nn's own `resize` op, converts to RGB (not BGR — MediaPipe's
+      `ImageToTensorCalculator` uses RGB, unlike YuNet's OpenCV-trained BGR) normalized to
+      `[-1, 1]` (confirmed against MediaPipe's actual `face_detection.pbtxt`:
+      `output_tensor_float_range { min: -1.0 max: 1.0 }`), runs the model, applies sigmoid to the
+      raw `classificators` logits (this exported graph, unlike YuNet's, has no baked-in
+      `Sigmoid`), and takes the max over all 896 anchors. **Measured: ~0.47 on the face photo vs.
+      ~0.23 on the abstract no-face image** — a real but modest ~2x margin, not YuNet's ~1800x one
+      (the face photo is a conservatively-framed 1911 portrait, not this model's close-up-selfie
+      training distribution; the test also deliberately skips MediaPipe's own letterbox
+      preprocessing — measured to *shrink* the face further and *lower* the score for this
+      particular fixture — and the real product's anchor-decode/NMS/`min_score_thresh=0.5` stage).
+  - Getting this model importing required two fixes neither synthetic fixture had exercised:
+    - **`PAD`** (BlazeFace pads the smaller residual branch's channel count to match the main
+      branch before an `ADD`): no dedicated core `pad` op was added — confirmed via the actual
+      `Paddings` constant bytes that every instance in this model is zero-padding, after-only, on
+      the channel axis alone, so it's expressed as `concat(x, zeros)` along that axis instead.
+      Every other axis/before-padding combination throws rather than guessing.
+    - **Float16-weight `DEQUANTIZE`:** this model's weights are FLOAT16, and the export wraps
+      every weight/bias constant in a `DEQUANTIZE` that's a pure precision cast (no
+      `QuantizationParameters` on the input), not real int8 dequantization — handled as a no-op
+      pass-through (the CPU backend already decodes Float16 constants to Float32 transparently),
+      with a `dequantSource` redirect map so `CONV_2D`/`DEPTHWISE_CONV_2D`/`FULLY_CONNECTED`'s
+      raw-byte weight permutation can still find the real underlying constant tensor through the
+      `DEQUANTIZE` wrapper.
+    - Also needed `RESHAPE`'s `-1` inference (`resolveReshapeTarget()`), mirroring the ONNX
+      importer's own — `GraphBuilder::reshape()` itself has no `-1` support.
 
 ### 4c. Graph caching (serialize/load a compiled `Graph`)
 - [x] **Decision:** caches the backend-agnostic `GraphIR` (built by `GraphBuilder`, normally
