@@ -194,14 +194,22 @@ thing, not memory" discipline the ONNX importer's protobuf field numbers followe
   builtin-options are per-op-type FlatBuffers tables known entirely from the op code, so the
   parser eagerly extracts every field a *supported* op might need into `TfliteOperator`'s flat
   named fields rather than keeping a generic options blob the importer would re-interpret itself.
-- `tflite_importer.cpp`: the op-mapping table (`Conv2D`→`conv2d`, `Add`→`add`, `Relu`→`relu`,
-  `MaxPool2D`/`AveragePool2D`→`maxPool2d`/`avgPool2d`, `Reshape`→`reshape`, `Transpose`→`transpose`,
-  `Softmax`→`softmax`, `Concatenation`→`concat`, `Gather`→`gather`, `FullyConnected`→`gemm`/`matmul`,
+- `tflite_importer.cpp`: the op-mapping table (`Conv2D`→`conv2d`, `DepthwiseConv2D`→`conv2d` with
+  `groups`, `Add`→`add`, `Relu`→`relu`, `MaxPool2D`/`AveragePool2D`→`maxPool2d`/`avgPool2d`,
+  `Reshape`→`reshape`, `Transpose`→`transpose`, `Softmax`→`softmax`, `Concatenation`→`concat`,
+  `Gather`→`gather`, `FullyConnected`→`gemm`/`matmul`, `BatchMatMul`→`matmul`,
   `ResizeBilinear`/`ResizeNearestNeighbor`→`resize`, `Quantize`/`Dequantize`→`quantizeLinear`/
-  `dequantizeLinear`). `DepthwiseConv2D`/`BatchMatMul` deliberately throw rather than guess —
-  `DepthwiseConv2D`'s OHWI-with-depth-multiplier weight layout needs verifying against a real
-  exported model's actual bytes before trusting any byte-reorder logic blind (see `TODO.md`
-  Phase 4b's last items).
+  `dequantizeLinear`). `DepthwiseConv2D`'s weight layout (`[1,filter_height,filter_width,
+  output_depth]`) and output-channel numbering (`oc = m + ic*depth_multiplier`) were verified
+  against TFLite's own reference kernel source
+  (`tflite/kernels/internal/reference/depthwiseconv_float.h`) rather than guessed — that numbering
+  turns out to already match the standard "groups=input_channels" convention `conv2d()`'s `groups`
+  parameter implements (the same one ONNX import already relies on for `Conv`'s `group` attribute),
+  so the only new logic needed is a `[1,H,W,outC]`→`[outC,1,H,W]` byte permute, same trick as
+  `Conv2D`'s own weight conversion just with a different axis mapping. `BatchMatMul`'s `adj_x`/
+  `adj_y` were confirmed against `tflite/kernels/batch_matmul.cc` ("transpose the last two
+  dimensions") and become an explicit `transpose()` of the operand's last two axes before the
+  matmul, since `GraphBuilder::matmul()` has no transpose flag of its own.
 - **NHWC/OHWI ↔ NCHW/OIHW, the one piece with no ONNX precedent:** TFLite tensors are NHWC and
   conv weights are OHWI, unlike campello_nn's (and ONNX's) NCHW/OIHW throughout. Converting
   happens *only* at the graph boundary — a single `transpose()` right after each rank-4 graph
@@ -219,13 +227,15 @@ thing, not memory" discipline the ONNX importer's protobuf field numbers followe
   operator, unlike ONNX's `QuantizeLinear`/`DequantizeLinear` nodes carrying their own scale/
   zero-point inputs — `Quantize`/`Dequantize` read it straight off the relevant tensor.
 
-Test fixture: `tests/fixtures/conv_add_relu.tflite` — synthetic, hand-written as
-`conv_add_relu_tflite.json` and compiled with `flatc --binary tflite_schema.fbs
-conv_add_relu_tflite.json` (schema provenance in `tests/fixtures/NOTICE.md`), computing the
-identical Conv→Add→Relu graph as `conv_add_relu.onnx` so `tests/universal/test_tflite_importer.cpp`
-checks against the exact same expected values as the ONNX importer's test. Not yet validated
-against a real third-party TFLite model the way Phase 4a's YuNet test validates ONNX import — see
-`TODO.md` Phase 4b's last item.
+Test fixtures (all synthetic, hand-written as JSON and compiled with `flatc --binary
+tflite_schema.fbs <name>.json` — schema provenance in `tests/fixtures/NOTICE.md`):
+`conv_add_relu.tflite` computes the identical Conv→Add→Relu graph as `conv_add_relu.onnx`, so
+`tests/universal/test_tflite_importer.cpp` checks it against the exact same expected values as the
+ONNX importer's test; `depthwise_conv2d.tflite` and `batch_matmul.tflite` each check against
+expected values computed by hand independently (not just round-tripped through the importer
+itself), specifically to verify the `DepthwiseConv2D`/`BatchMatMul` layout claims above are
+actually correct, not just plausible-sounding. Not yet validated against a real third-party TFLite
+model the way Phase 4a's YuNet test validates ONNX import — see `TODO.md` Phase 4b's last item.
 
 ### Graph Caching
 
@@ -316,5 +326,5 @@ import), Phase 4b (TFLite import), and Phase 4c (graph caching) are implemented 
 4a is validated end-to-end against a real, standard pretrained model (YuNet face detection) on
 real images, not just synthetic fixtures; Phase 4b is currently synthetic-fixture-only (see
 "TFLite Import" above) and doesn't yet have an equivalent real-model test. Still open: the rest of
-Phase 3 (oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough), Phase 4b's `DepthwiseConv2D`/
-`BatchMatMul` follow-ups, and Phase 5 (`campello_llm`/`campello_vision`).
+Phase 3 (oneDNN/Vulkan, NNAPI/XNNPACK, WebNN passthrough), Phase 4b's real-model test, and Phase 5
+(`campello_llm`/`campello_vision`).

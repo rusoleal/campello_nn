@@ -57,13 +57,13 @@ namespace systems::leal::campello_nn::tflite
         std::vector<int32_t> inputs;  // tensor indices; -1 marks an absent optional input
         std::vector<int32_t> outputs; // tensor indices
 
-        // Conv2DOptions / Pool2DOptions (shared shape; DepthwiseConv2DOptions is
-        // not parsed — DEPTHWISE_CONV_2D is not yet supported, see importer).
+        // Conv2DOptions / Pool2DOptions / DepthwiseConv2DOptions (shared shape).
         int32_t padding = 0; // Padding enum: 0=SAME, 1=VALID
         int32_t strideW = 1, strideH = 1;
-        int32_t dilationW = 1, dilationH = 1;     // Conv2DOptions only
+        int32_t dilationW = 1, dilationH = 1;     // Conv2DOptions / DepthwiseConv2DOptions
         int32_t filterWidth = 1, filterHeight = 1; // Pool2DOptions only
         int32_t fusedActivation = 0;                // ActivationFunctionType enum value
+        int32_t depthMultiplier = 1;                 // DepthwiseConv2DOptions only
 
         // ReshapeOptions
         std::vector<int32_t> newShape;
@@ -76,6 +76,10 @@ namespace systems::leal::campello_nn::tflite
         // ResizeBilinearOptions / ResizeNearestNeighborOptions
         bool alignCorners = false;
         bool halfPixelCenters = false;
+
+        // BatchMatMulOptions
+        bool adjX = false;
+        bool adjY = false;
     };
 
     /// A parsed TFLite model's *primary* (subgraph 0) graph — campello_nn, like

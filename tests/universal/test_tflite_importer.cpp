@@ -79,3 +79,65 @@ TEST(TfliteImporter, ImportFromMemory)
     for (int i = 0; i < 9; i++)
         EXPECT_FLOAT_EQ(out[i], expected[i]);
 }
+
+// DEPTHWISE_CONV_2D, the op-code this importer initially shipped without
+// support for (see TODO.md Phase 4b) — its weight layout ([1,filter_height,
+// filter_width,output_depth], confirmed against TFLite's own reference kernel,
+// tflite/kernels/internal/reference/depthwiseconv_float.h) is verified here by
+// hand-computing the expected output independently, not just trusting the
+// layout. 1x1 kernel (no spatial mixing) over 2 input channels, depth_multiplier
+// 1, weight=[2,3] (per-channel scalar), bias=[100,200], fused RELU (a no-op
+// here since everything stays positive).
+TEST(TfliteImporter, ImportDepthwiseConv2d)
+{
+    auto context = makeCpuContext();
+    std::string path = std::string(CAMPELLO_NN_TEST_FIXTURES_DIR) + "/depthwise_conv2d.tflite";
+    auto result = cnn::importTfliteFromFile(context, path);
+
+    auto tx = context->createTensor({cnn::DataType::Float32, {1, 2, 2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {1, 2, 2, 2}, true, false});
+
+    // NHWC: (h,w) pixels each holding [ch0,ch1] = (1,10),(2,20),(3,30),(4,40).
+    float xv[8] = {1, 10, 2, 20, 3, 30, 4, 40};
+    tx->write(xv, sizeof(xv));
+
+    auto fence = context->dispatch(*result.graph, {{"x", tx}}, {{"out", tout}});
+    fence->wait();
+
+    float out[8];
+    tout->read(out, sizeof(out));
+    // ch0 = x_ch0*2 + 100, ch1 = x_ch1*3 + 200, interleaved NHWC.
+    float expected[8] = {102, 230, 104, 260, 106, 290, 108, 320};
+    for (int i = 0; i < 8; i++)
+        EXPECT_FLOAT_EQ(out[i], expected[i]);
+}
+
+// BATCH_MATMUL with adj_y=true — exercises the transpose-insertion path
+// (GraphBuilder::matmul() has no transpose flag of its own, so adj_x/adj_y
+// become an explicit transpose() of the last two axes before the matmul; see
+// tflite_importer.cpp's swapLastTwoAxes()). adj_y semantics confirmed against
+// tflite/kernels/batch_matmul.cc ("transpose the last two dimensions").
+TEST(TfliteImporter, ImportBatchMatmulAdjY)
+{
+    auto context = makeCpuContext();
+    std::string path = std::string(CAMPELLO_NN_TEST_FIXTURES_DIR) + "/batch_matmul.tflite";
+    auto result = cnn::importTfliteFromFile(context, path);
+
+    auto ta = context->createTensor({cnn::DataType::Float32, {2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {2, 2}, true, false});
+
+    // a = [[1,2],[3,4]]; b (constant, stored as-is) = [[5,6],[7,8]].
+    float av[4] = {1, 2, 3, 4};
+    ta->write(av, sizeof(av));
+
+    auto fence = context->dispatch(*result.graph, {{"a", ta}}, {{"out", tout}});
+    fence->wait();
+
+    float out[4];
+    tout->read(out, sizeof(out));
+    // adj_y=true means the actual right-multiplicand is b^T = [[5,7],[6,8]].
+    // a @ b^T = [[1*5+2*6, 1*7+2*8], [3*5+4*6, 3*7+4*8]] = [[17,23],[39,53]].
+    float expected[4] = {17, 23, 39, 53};
+    for (int i = 0; i < 4; i++)
+        EXPECT_FLOAT_EQ(out[i], expected[i]);
+}

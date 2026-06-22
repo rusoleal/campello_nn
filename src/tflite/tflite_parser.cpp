@@ -26,6 +26,7 @@ namespace
         TFL_AVERAGE_POOL_2D = 1,
         TFL_CONCATENATION = 2,
         TFL_CONV_2D = 3,
+        TFL_DEPTHWISE_CONV_2D = 4,
         TFL_DEQUANTIZE = 6,
         TFL_FULLY_CONNECTED = 9,
         TFL_LOGISTIC = 14,
@@ -39,6 +40,7 @@ namespace
         TFL_TRANSPOSE = 39,
         TFL_RESIZE_NEAREST_NEIGHBOR = 97,
         TFL_QUANTIZE = 114,
+        TFL_BATCH_MATMUL = 126,
     };
 
     // Field-id constants per FlatBuffers table, in declared schema order — see
@@ -137,11 +139,32 @@ namespace
             FusedActivation = 5
         };
     }
+    namespace DepthwiseConv2DOptionsField
+    {
+        enum
+        {
+            Padding = 0,
+            StrideW = 1,
+            StrideH = 2,
+            DepthMultiplier = 3,
+            FusedActivation = 4,
+            DilationW = 5,
+            DilationH = 6
+        };
+    }
     namespace ReshapeOptionsField
     {
         enum
         {
             NewShape = 0
+        };
+    }
+    namespace BatchMatMulOptionsField
+    {
+        enum
+        {
+            AdjX = 0,
+            AdjY = 1
         };
     }
     namespace ActivationOnlyOptionsField // AddOptions / MulOptions / FullyConnectedOptions
@@ -238,6 +261,19 @@ namespace
             to.filterWidth = getScalar<int32_t>(opts, Pool2DOptionsField::FilterWidth, 1);
             to.filterHeight = getScalar<int32_t>(opts, Pool2DOptionsField::FilterHeight, 1);
             to.fusedActivation = getScalar<int8_t>(opts, Pool2DOptionsField::FusedActivation, 0);
+            break;
+        case TFL_DEPTHWISE_CONV_2D:
+            to.padding = getScalar<int8_t>(opts, DepthwiseConv2DOptionsField::Padding, 0);
+            to.strideW = getScalar<int32_t>(opts, DepthwiseConv2DOptionsField::StrideW, 1);
+            to.strideH = getScalar<int32_t>(opts, DepthwiseConv2DOptionsField::StrideH, 1);
+            to.depthMultiplier = getScalar<int32_t>(opts, DepthwiseConv2DOptionsField::DepthMultiplier, 1);
+            to.fusedActivation = getScalar<int8_t>(opts, DepthwiseConv2DOptionsField::FusedActivation, 0);
+            to.dilationW = getScalar<int32_t>(opts, DepthwiseConv2DOptionsField::DilationW, 1);
+            to.dilationH = getScalar<int32_t>(opts, DepthwiseConv2DOptionsField::DilationH, 1);
+            break;
+        case TFL_BATCH_MATMUL:
+            to.adjX = getScalar<bool>(opts, BatchMatMulOptionsField::AdjX, false);
+            to.adjY = getScalar<bool>(opts, BatchMatMulOptionsField::AdjY, false);
             break;
         case TFL_RESHAPE:
         {

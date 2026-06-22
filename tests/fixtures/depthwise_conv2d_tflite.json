@@ -1,0 +1,42 @@
+{
+  "version": 3,
+  "description": "campello_nn test fixture: DepthwiseConv2D(bias, fused RELU), 1x1 kernel, depth_multiplier=1, 2 input channels",
+  "operator_codes": [
+    {"builtin_code": "DEPTHWISE_CONV_2D"}
+  ],
+  "subgraphs": [
+    {
+      "name": "main",
+      "tensors": [
+        {"shape": [1, 2, 2, 2], "type": "FLOAT32", "buffer": 0, "name": "x"},
+        {"shape": [1, 1, 1, 2], "type": "FLOAT32", "buffer": 1, "name": "w"},
+        {"shape": [2], "type": "FLOAT32", "buffer": 2, "name": "bias"},
+        {"shape": [1, 2, 2, 2], "type": "FLOAT32", "buffer": 0, "name": "out"}
+      ],
+      "inputs": [0],
+      "outputs": [3],
+      "operators": [
+        {
+          "opcode_index": 0,
+          "inputs": [0, 1, 2],
+          "outputs": [3],
+          "builtin_options_type": "DepthwiseConv2DOptions",
+          "builtin_options": {
+            "padding": "VALID",
+            "stride_w": 1,
+            "stride_h": 1,
+            "depth_multiplier": 1,
+            "fused_activation_function": "RELU",
+            "dilation_w_factor": 1,
+            "dilation_h_factor": 1
+          }
+        }
+      ]
+    }
+  ],
+  "buffers": [
+    {},
+    {"data": [0,0,0,64, 0,0,64,64]},
+    {"data": [0,0,200,66, 0,0,72,67]}
+  ]
+}

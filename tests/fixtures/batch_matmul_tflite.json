@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "description": "campello_nn test fixture: BATCH_MATMUL with adj_y=true (exercises the transpose-insertion path)",
+  "operator_codes": [
+    {"builtin_code": "BATCH_MATMUL"}
+  ],
+  "subgraphs": [
+    {
+      "name": "main",
+      "tensors": [
+        {"shape": [2, 2], "type": "FLOAT32", "buffer": 0, "name": "a"},
+        {"shape": [2, 2], "type": "FLOAT32", "buffer": 1, "name": "b"},
+        {"shape": [2, 2], "type": "FLOAT32", "buffer": 0, "name": "out"}
+      ],
+      "inputs": [0],
+      "outputs": [2],
+      "operators": [
+        {
+          "opcode_index": 0,
+          "inputs": [0, 1],
+          "outputs": [2],
+          "builtin_options_type": "BatchMatMulOptions",
+          "builtin_options": {
+            "adj_x": false,
+            "adj_y": true
+          }
+        }
+      ]
+    }
+  ],
+  "buffers": [
+    {},
+    {"data": [0,0,160,64, 0,0,192,64, 0,0,224,64, 0,0,0,65]}
+  ]
+}

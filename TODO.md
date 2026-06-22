@@ -499,7 +499,7 @@ far enough along that the op set and `Graph` representation are stable.
       plus a plain broadcasting `add()`. Re-ran `YuNetFaceDetection` afterward — same thresholds
       pass, confirming no regression.
 
-### 4b. TFLite import ✅ (initial op set; DEPTHWISE_CONV_2D/BATCH_MATMUL are fast-follow)
+### 4b. TFLite import ✅
 - [x] **Decision:** `FetchContent` Google's official `flatbuffers` header-only runtime
       (`FlatBuffers::FlatBuffers` interface target, same `FetchContent` pattern as
       GoogleTest/DirectML) rather than hand-rolling a FlatBuffers reader the way
@@ -514,9 +514,23 @@ far enough along that the op set and `Graph` representation are stable.
       `tflite_parser.cpp`, mirroring `onnx_model.hpp`/`onnx_parser.cpp`'s shape. Only
       subgraph 0 is imported, same single-graph assumption the ONNX importer makes.
 - [x] Op-mapping table (`tflite_importer.cpp`'s `applyOperator()`, mirrors `onnx_importer.cpp`'s
-      `applyNode()`): `CONV_2D`, `ADD`, `MUL`, `RELU`, `LOGISTIC` (sigmoid), `MAX_POOL_2D`/
-      `AVERAGE_POOL_2D`, `RESHAPE`, `TRANSPOSE`, `SOFTMAX`, `CONCATENATION`, `GATHER`,
-      `FULLY_CONNECTED`, `RESIZE_BILINEAR`/`RESIZE_NEAREST_NEIGHBOR`, `QUANTIZE`/`DEQUANTIZE`.
+      `applyNode()`): `CONV_2D`, `DEPTHWISE_CONV_2D`, `ADD`, `MUL`, `RELU`, `LOGISTIC` (sigmoid),
+      `MAX_POOL_2D`/`AVERAGE_POOL_2D`, `RESHAPE`, `TRANSPOSE`, `SOFTMAX`, `CONCATENATION`,
+      `GATHER`, `FULLY_CONNECTED`, `BATCH_MATMUL`, `RESIZE_BILINEAR`/`RESIZE_NEAREST_NEIGHBOR`,
+      `QUANTIZE`/`DEQUANTIZE`.
+- [x] **`DEPTHWISE_CONV_2D`:** weight layout (`[1,filter_height,filter_width,output_depth]`) and
+      output-channel numbering (`oc = m + ic*depth_multiplier`) verified against TFLite's own
+      reference kernel source (`tflite/kernels/internal/reference/depthwiseconv_float.h`), not
+      guessed — confirms the channel ordering already matches the standard "groups=input_channels"
+      grouped-conv convention `conv2d()`'s `groups` parameter implements (and ONNX import already
+      relies on for `Conv`'s `group` attribute), so no extra channel-reordering trick was needed
+      beyond a `[1,H,W,outC]`→`[outC,1,H,W]` byte permute. Verified end-to-end with a hand-computed
+      fixture (`tests/fixtures/depthwise_conv2d.tflite`), not just trusting the layout claim.
+- [x] **`BATCH_MATMUL`:** `adj_x`/`adj_y` confirmed against `tflite/kernels/batch_matmul.cc`
+      ("transpose the last two dimensions") — `GraphBuilder::matmul()` has no transpose flag, so
+      these become an explicit `transpose()` of the operand's last two axes
+      (`swapLastTwoAxes()` in `tflite_importer.cpp`) before the matmul. Verified with a
+      hand-computed `adj_y=true` fixture (`tests/fixtures/batch_matmul.tflite`).
 - [x] **Decision:** NHWC/OHWI ↔ NCHW/OIHW conversion happens *only* at the graph boundary —
       a single `transpose()` right after each graph input and right before each graph output
       (rank-4 tensors only), not per-op. `CONV_2D`/`FULLY_CONNECTED` weight constants are
@@ -528,17 +542,15 @@ far enough along that the op set and `Graph` representation are stable.
 - [x] TFLite's quantization (scale/zero_point on the *tensor*, not the op) handled by reading
       `Tensor.quantization` directly for `QUANTIZE`/`DEQUANTIZE`'s campello_nn-side
       `scale`/`zeroPoint` arguments — no separate fused-attribute path needed.
-- [x] Test: `tests/universal/test_tflite_importer.cpp` against a synthetic fixture
-      (`tests/fixtures/conv_add_relu.tflite`, hand-written JSON + `flatc --binary`, see
-      `fixtures/NOTICE.md`) computing the identical graph as `conv_add_relu.onnx` — same
-      expected output values, checked against both importers.
-- [ ] **Deliberately out of scope for v1:** `DEPTHWISE_CONV_2D` (OHWI weight layout with
-      depth-multiplier semantics needs verifying against a real exported model's actual bytes
-      before trusting any byte-reorder logic blind) and `BATCH_MATMUL` (only `adj_x=adj_y=false`
-      would be supported anyway).
+- [x] Test: `tests/universal/test_tflite_importer.cpp` against synthetic fixtures (hand-written
+      JSON + `flatc --binary`, see `fixtures/NOTICE.md`): `conv_add_relu.tflite` computes the
+      identical graph as `conv_add_relu.onnx` (same expected values, checked against both
+      importers); `depthwise_conv2d.tflite` and `batch_matmul.tflite` each check against
+      independently hand-computed expected values (not just round-tripped through the importer
+      itself) — see those tests' comments for the by-hand arithmetic.
 - [ ] Test against a real TFLite vision model (e.g. a MediaPipe model) end-to-end, the way
       Phase 4a's YuNet test validates the ONNX importer against a real model — the current
-      test fixture is synthetic only.
+      test fixtures are all synthetic.
 
 ### 4c. Graph caching (serialize/load a compiled `Graph`)
 - [x] **Decision:** caches the backend-agnostic `GraphIR` (built by `GraphBuilder`, normally

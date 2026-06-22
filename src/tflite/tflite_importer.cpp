@@ -20,6 +20,7 @@ namespace
         TFL_AVERAGE_POOL_2D = 1,
         TFL_CONCATENATION = 2,
         TFL_CONV_2D = 3,
+        TFL_DEPTHWISE_CONV_2D = 4,
         TFL_DEQUANTIZE = 6,
         TFL_FULLY_CONNECTED = 9,
         TFL_LOGISTIC = 14,
@@ -33,6 +34,7 @@ namespace
         TFL_TRANSPOSE = 39,
         TFL_RESIZE_NEAREST_NEIGHBOR = 97,
         TFL_QUANTIZE = 114,
+        TFL_BATCH_MATMUL = 126,
     };
 
     // Padding enum (schema.fbs `enum Padding { SAME, VALID }`).
@@ -163,6 +165,19 @@ namespace
         return map[normalized];
     }
 
+    // Identity permutation with the last two axes swapped — TFLite BATCH_MATMUL's
+    // adj_x/adj_y (confirmed against tflite/kernels/batch_matmul.cc: "Transpose
+    // the last two dimensions") mean exactly this, applied to x/y respectively
+    // before the matmul, since GraphBuilder::matmul() has no transpose flag.
+    std::vector<int32_t> swapLastTwoAxes(size_t rank)
+    {
+        std::vector<int32_t> perm(rank);
+        for (size_t i = 0; i < rank; i++)
+            perm[i] = (int32_t)i;
+        std::swap(perm[rank - 1], perm[rank - 2]);
+        return perm;
+    }
+
     // Reads a constant INT32 tensor's raw bytes as a plain int64 list — for
     // TFLite's convention of passing shape/perm/size metadata (RESHAPE's
     // new_shape, TRANSPOSE's perm, RESIZE's size) as a 2nd *tensor* input
@@ -210,10 +225,7 @@ namespace
     // Mirrors onnx_importer.cpp's applyNode() in spirit: op coverage is
     // intentionally scoped to what's needed so far, each cut corner throws a
     // clear "not yet supported" error rather than silently producing wrong
-    // output. DEPTHWISE_CONV_2D and BATCH_MATMUL are deliberately not handled
-    // (see plan notes / TODO.md) — their weight-layout/transpose semantics need
-    // verifying against a real exported model before trusting any byte-reorder
-    // logic blind.
+    // output.
     void applyOperator(GraphBuilder &builder, const tflite::TfliteOperator &op, const tflite::TfliteGraph &g,
                         std::unordered_map<int32_t, Operand> &values)
     {
@@ -275,6 +287,73 @@ namespace
                     throw std::runtime_error("campello_nn: TFLite CONV_2D's bias input must be a constant");
                 int64_t C = oihwShape[0];
                 Operand biasConst = builder.constant({bt.toDataType(), {1, C, 1, 1}, false, false},
+                                                       bbuf.data.data(), bbuf.data.size());
+                convOut = builder.add(convOut, biasConst);
+            }
+            result = applyFusedActivation(builder, convOut, op.fusedActivation);
+            break;
+        }
+        case TFL_DEPTHWISE_CONV_2D:
+        {
+            // Weight layout confirmed against TFLite's own reference kernel
+            // (tflite/kernels/internal/reference/depthwiseconv_float.h):
+            // filter_shape is [1, filter_height, filter_width, output_depth]
+            // (batch dim always indexed at 0, not output_depth-sized like a
+            // regular Conv2D's weight leading dim), and the kernel's own output
+            // channel numbering is `oc = m + ic * depth_multiplier` (m = index
+            // within the multiplier, ic = input channel) — exactly the standard
+            // "groups = input_channels" grouped-conv convention conv2d()'s
+            // `groups` parameter already implements (and ONNX import already
+            // relies on for ONNX Conv's `group` attribute), so no extra
+            // channel-reordering trick is needed beyond the weight reshape below.
+            Operand x = in(0);
+            std::vector<int64_t> inShape = internal::operandShapeForImport(x);
+            if (inShape.size() != 4)
+                throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D on a non-rank-4 tensor is not yet supported");
+            int64_t inputChannels = inShape[1];
+
+            const tflite::TfliteTensor &wt = g.tensors.at(op.inputs[1]);
+            const tflite::TfliteBuffer &wbuf = g.buffers.at(wt.bufferIndex);
+            if (wbuf.data.empty())
+                throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D's weight input must be a constant");
+            if (wt.shape.size() != 4 || wt.shape[0] != 1)
+                throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D weight tensor must be shaped [1,H,W,outC]");
+            int64_t outputChannels = wt.shape[3];
+            if (outputChannels != inputChannels * op.depthMultiplier)
+                throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D weight's output channel count doesn't "
+                                          "match input_channels * depth_multiplier");
+
+            // [1,H,W,outC] -> [outC,1,H,W] (OIHW with inChannels/groups == 1).
+            std::vector<uint8_t> oihwBytes =
+                permuteBytes(wbuf.data, wt.shape, {3, 0, 1, 2}, elementByteSize(wt.toDataType()));
+            std::vector<int64_t> oihwShape = {outputChannels, 1, wt.shape[1], wt.shape[2]};
+            Operand weights =
+                builder.constant({wt.toDataType(), oihwShape, false, false}, oihwBytes.data(), oihwBytes.size());
+
+            Conv2dDescriptor desc;
+            desc.strideX = op.strideW;
+            desc.strideY = op.strideH;
+            desc.dilationX = op.dilationW;
+            desc.dilationY = op.dilationH;
+            desc.groups = inputChannels;
+            if (op.padding == TFL_PADDING_SAME)
+            {
+                PadAmounts vert = computeSamePadding(inShape[2], wt.shape[1], op.strideH, op.dilationH);
+                PadAmounts horiz = computeSamePadding(inShape[3], wt.shape[2], op.strideW, op.dilationW);
+                desc.paddingTop = vert.before;
+                desc.paddingBottom = vert.after;
+                desc.paddingLeft = horiz.before;
+                desc.paddingRight = horiz.after;
+            }
+            Operand convOut = builder.conv2d(x, weights, desc);
+
+            if (op.inputs.size() > 2 && op.inputs[2] >= 0)
+            {
+                const tflite::TfliteTensor &bt = g.tensors.at(op.inputs[2]);
+                const tflite::TfliteBuffer &bbuf = g.buffers.at(bt.bufferIndex);
+                if (bbuf.data.empty())
+                    throw std::runtime_error("campello_nn: TFLite DEPTHWISE_CONV_2D's bias input must be a constant");
+                Operand biasConst = builder.constant({bt.toDataType(), {1, outputChannels, 1, 1}, false, false},
                                                        bbuf.data.data(), bbuf.data.size());
                 convOut = builder.add(convOut, biasConst);
             }
@@ -442,6 +521,27 @@ namespace
             if (!inT.hasQuantization)
                 throw std::runtime_error("campello_nn: TFLite DEQUANTIZE input tensor has no quantization parameters");
             result = builder.dequantizeLinear(in(0), inT.quantScale, inT.quantZeroPoint);
+            break;
+        }
+        case TFL_BATCH_MATMUL:
+        {
+            Operand x = in(0);
+            Operand y = in(1);
+            if (op.adjX)
+            {
+                std::vector<int64_t> xShape = internal::operandShapeForImport(x);
+                if (xShape.size() < 2)
+                    throw std::runtime_error("campello_nn: TFLite BATCH_MATMUL operand must be at least rank 2");
+                x = builder.transpose(x, swapLastTwoAxes(xShape.size()));
+            }
+            if (op.adjY)
+            {
+                std::vector<int64_t> yShape = internal::operandShapeForImport(y);
+                if (yShape.size() < 2)
+                    throw std::runtime_error("campello_nn: TFLite BATCH_MATMUL operand must be at least rank 2");
+                y = builder.transpose(y, swapLastTwoAxes(yShape.size()));
+            }
+            result = builder.matmul(x, y);
             break;
         }
         default:
