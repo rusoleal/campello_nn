@@ -2,12 +2,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
+#include <campello_nn/graph_info.hpp>
 
 namespace systems::leal::campello_nn
 {
 
     class Operand;
+    class GraphBuilder;
 
     namespace internal
     {
@@ -18,6 +21,13 @@ namespace systems::leal::campello_nn
         /// duplicating it. Returns a copy, not a reference: the underlying IR node
         /// list can reallocate on subsequent `GraphBuilder` calls.
         std::vector<int64_t> operandShapeForImport(const Operand &op);
+
+        /// Describes the graph `builder` has accumulated so far, as if `outputs` were
+        /// passed to `build()` — without compiling it. Internal-only — lets model
+        /// importers (ONNX/TFLite) populate `OnnxImportResult::info`/
+        /// `TfliteImportResult::info` alongside the compiled `Graph`, reusing the same
+        /// IR `build()` already produces instead of re-deriving it.
+        GraphInfo graphInfoForImport(const GraphBuilder &builder, const std::unordered_map<std::string, Operand> &outputs);
     }
 
     /**
@@ -31,6 +41,7 @@ namespace systems::leal::campello_nn
     {
         friend class GraphBuilder;
         friend std::vector<int64_t> internal::operandShapeForImport(const Operand &op);
+        friend GraphInfo internal::graphInfoForImport(const GraphBuilder &builder, const std::unordered_map<std::string, Operand> &outputs);
         void *builder;
         size_t nodeId;
 

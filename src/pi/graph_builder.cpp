@@ -7,6 +7,7 @@
 #include "context_data.hpp"
 #include "resource_data.hpp"
 #include "ir_serialization.hpp"
+#include "graph_info.hpp"
 
 using namespace systems::leal::campello_nn;
 
@@ -642,6 +643,19 @@ Operand GraphBuilder::resize(Operand x, const ResizeDescriptor &desc)
     node.resizeParams = desc;
     data->ir.nodes.push_back(std::move(node));
     return Operand(native, data->ir.nodes.size() - 1);
+}
+
+GraphInfo systems::leal::campello_nn::internal::graphInfoForImport(
+    const GraphBuilder &builder, const std::unordered_map<std::string, Operand> &outputs)
+{
+    auto data = (GraphBuilderData *)builder.native;
+    GraphIR ir = data->ir;
+    for (auto &[name, op] : outputs)
+    {
+        requireSameBuilder(op.builder, builder.native);
+        ir.outputs.push_back({name, op.nodeId});
+    }
+    return describeGraphIR(ir);
 }
 
 std::shared_ptr<Graph> GraphBuilder::build(const std::unordered_map<std::string, Operand> &outputs)

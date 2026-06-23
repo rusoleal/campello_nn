@@ -708,6 +708,7 @@ TfliteImportResult systems::leal::campello_nn::importTfliteFromMemory(std::share
         outputOperands[name] = outOp;
         result.outputs[name] = TensorDescriptor{t.toDataType(), internal::operandShapeForImport(outOp), true, false};
     }
+    result.info = internal::graphInfoForImport(builder, outputOperands);
     result.graph = builder.build(outputOperands);
     return result;
 }

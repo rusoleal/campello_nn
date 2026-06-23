@@ -8,6 +8,7 @@
 #include <campello_nn/context.hpp>
 #include <campello_nn/operand.hpp>
 #include <campello_nn/graph.hpp>
+#include <campello_nn/graph_info.hpp>
 #include <campello_nn/descriptors/tensor_descriptor.hpp>
 #include <campello_nn/descriptors/conv2d_descriptor.hpp>
 #include <campello_nn/descriptors/pool2d_descriptor.hpp>
@@ -26,6 +27,8 @@ namespace systems::leal::campello_nn
     class GraphBuilder
     {
         void *native;
+
+        friend GraphInfo internal::graphInfoForImport(const GraphBuilder &builder, const std::unordered_map<std::string, Operand> &outputs);
 
     public:
         explicit GraphBuilder(std::shared_ptr<Context> context);

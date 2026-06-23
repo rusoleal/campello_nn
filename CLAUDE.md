@@ -303,6 +303,28 @@ plumbing a `GraphIR` through a public-header-safe API. Not yet wired into the ON
 (`importOnnxFromFile` doesn't transparently check for a cached sibling file) — left as future
 integration work.
 
+### Graph Introspection (`GraphInfo`)
+
+`inc/campello_nn/graph_info.hpp` is a public, display-safe mirror of the internal IR
+(`OpKind`/`Node`/`GraphIR` in `src/pi/ir.hpp`) for callers that need to inspect or visualize an
+imported graph's topology — node list, per-node shape/dtype/attributes, edges — without needing
+execution access to it. `OpKind` itself is the *one* internal IR type promoted to this public
+header: `ir.hpp` now includes `graph_info.hpp` and uses that enum directly rather than declaring a
+second one that would need to stay in sync.
+
+`GraphInfo`/`NodeInfo` are populated alongside the compiled `Graph` on `OnnxImportResult::info`/
+`TfliteImportResult::info` — not on `GraphBuilder::build()` directly, since nothing hand-building a
+graph needs this yet (avoids speculative API surface). The populate path:
+`internal::graphInfoForImport(builder, outputs)` (declared in `operand.hpp`'s `internal` namespace,
+friended by both `Operand` and `GraphBuilder`; implemented in `graph_builder.cpp`) mirrors
+`build()`'s own `GraphIR ir = data->ir;` + outputs-append step, then converts via
+`describeGraphIR()` (`src/pi/graph_info.cpp`) — called *before* `build()` compiles the graph in
+both importers, so it describes the IR as actually built, not a re-derivation.
+
+`NodeInfo::constantByteSize` replaces `Node::constantBytes` with just its `size_t` length — a real
+model's weights can be hundreds of megabytes; visualization needs to know a constant's size, not
+hold a second full copy of every weight tensor in memory.
+
 ### Dispatch Model — Fence, not Future
 
 `NN_ARCHITECTURE.md` originally sketched `Future<void> dispatch(...)`, but this repo follows
@@ -330,6 +352,7 @@ fence->wait(); output->read(...)
 | Resources | `Tensor`, `Fence` |
 | Descriptors | `TensorDescriptor`, `ContextDescriptor` |
 | Constants | `DeviceType`, `DataType` |
+| Introspection | `GraphInfo`, `NodeInfo`, `OpKind` |
 
 ### Op Set
 

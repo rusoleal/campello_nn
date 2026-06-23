@@ -8,6 +8,7 @@
 #include <campello_nn/descriptors/conv2d_descriptor.hpp>
 #include <campello_nn/descriptors/pool2d_descriptor.hpp>
 #include <campello_nn/descriptors/resize_descriptor.hpp>
+#include <campello_nn/graph_info.hpp>
 
 namespace systems::leal::campello_nn
 {
@@ -18,36 +19,12 @@ namespace systems::leal::campello_nn
      * Internal type — never exposed through a public header. Each `Node` already
      * carries its inferred output shape/dtype, so backends do not need to re-derive
      * them at compile time.
+     *
+     * `OpKind` itself is the one piece of this IR that is public
+     * (`campello_nn/graph_info.hpp`): it's also the type `GraphInfo`/`NodeInfo` use to
+     * describe an imported graph for inspection/visualization, so it has a single
+     * definition rather than two enums that must be kept in sync.
      */
-    enum class OpKind
-    {
-        Input,
-        Constant,
-        Add,
-        Mul,
-        Gelu,
-        Softmax,
-        LayerNorm,
-        RmsNorm,
-        MatMul,
-        Gemm,
-        Reshape,
-        Transpose,
-        Concat,
-        Slice,
-        Gather,
-        Conv2d,
-        MaxPool2d,
-        AvgPool2d,
-        Resize,
-        BatchNorm,
-        InstanceNorm,
-        QuantizeLinear,
-        DequantizeLinear,
-        Relu,
-        Sigmoid
-    };
-
     struct Node
     {
         OpKind kind;

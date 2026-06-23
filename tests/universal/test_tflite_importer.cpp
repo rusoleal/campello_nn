@@ -80,6 +80,38 @@ TEST(TfliteImporter, ImportFromMemory)
         EXPECT_FLOAT_EQ(out[i], expected[i]);
 }
 
+// Checks GraphInfo (the public topology-inspection API — see graph_info.hpp) against
+// the same conv_add_relu.tflite fixture. Unlike the ONNX importer, TFLite's rank-4
+// activations are converted NHWC<->NCHW at each graph boundary (see
+// tflite_importer.hpp), so the topology includes two extra Transpose nodes the ONNX
+// importer's GraphInfo doesn't have (see OnnxImporter.GraphInfoDescribesTopology):
+// one right after the input, one right before the output.
+TEST(TfliteImporter, GraphInfoDescribesTopology)
+{
+    auto context = makeCpuContext();
+    std::string path = std::string(CAMPELLO_NN_TEST_FIXTURES_DIR) + "/conv_add_relu.tflite";
+    auto result = cnn::importTfliteFromFile(context, path);
+
+    ASSERT_EQ(result.info.nodes.size(), 8u);
+
+    EXPECT_EQ(result.info.nodes[0].kind, cnn::OpKind::Input);
+    EXPECT_EQ(result.info.nodes[0].name, "x");
+    EXPECT_EQ(result.info.nodes[1].kind, cnn::OpKind::Transpose); // NHWC -> NCHW
+    EXPECT_EQ(result.info.nodes[2].kind, cnn::OpKind::Constant);  // conv weight, OIHW
+    EXPECT_EQ(result.info.nodes[3].kind, cnn::OpKind::Conv2d);
+    EXPECT_EQ(result.info.nodes[4].kind, cnn::OpKind::Constant); // bias
+    EXPECT_EQ(result.info.nodes[5].kind, cnn::OpKind::Add);
+    EXPECT_EQ(result.info.nodes[6].kind, cnn::OpKind::Relu);
+    EXPECT_EQ(result.info.nodes[7].kind, cnn::OpKind::Transpose); // NCHW -> NHWC
+
+    std::vector<int64_t> expectedOutShape = {1, 3, 3, 1}; // NHWC, matching the file's own declared shape
+    EXPECT_EQ(result.info.nodes[7].shape, expectedOutShape);
+
+    ASSERT_EQ(result.info.outputs.size(), 1u);
+    EXPECT_EQ(result.info.outputs[0].first, "out");
+    EXPECT_EQ(result.info.outputs[0].second, 7u);
+}
+
 // DEPTHWISE_CONV_2D, the op-code this importer initially shipped without
 // support for (see TODO.md Phase 4b) — its weight layout ([1,filter_height,
 // filter_width,output_depth], confirmed against TFLite's own reference kernel,

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_nn VERSION 0.1.0)
+project(campello_nn VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,7 @@ set(CAMPELLO_NN_CORE_SOURCES
     src/pi/graph_builder.cpp
     src/pi/ir_serialization.cpp
     src/pi/graph_cache.cpp
+    src/pi/graph_info.cpp
     src/cpu/cpu_backend.cpp
     src/cpu/ops.cpp
     src/onnx/onnx_parser.cpp

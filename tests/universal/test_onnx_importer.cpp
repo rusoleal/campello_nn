@@ -41,6 +41,41 @@ TEST(OnnxImporter, ImportConvAddRelu)
         EXPECT_FLOAT_EQ(out[i], expected[i]);
 }
 
+// Checks GraphInfo (the public topology-inspection API — see graph_info.hpp) against
+// the same conv_add_relu.onnx fixture: Input(x), two Constants (w/bias — order
+// between the two is unspecified, since onnxGraph.initializers is an unordered_map),
+// then Conv2d, Add, Relu in the file's own (deterministic) node order.
+TEST(OnnxImporter, GraphInfoDescribesTopology)
+{
+    auto context = makeCpuContext();
+    std::string path = std::string(CAMPELLO_NN_TEST_FIXTURES_DIR) + "/conv_add_relu.onnx";
+    auto result = cnn::importOnnxFromFile(context, path);
+
+    ASSERT_EQ(result.info.nodes.size(), 6u);
+
+    EXPECT_EQ(result.info.nodes[0].kind, cnn::OpKind::Input);
+    EXPECT_EQ(result.info.nodes[0].name, "x");
+    EXPECT_EQ(result.info.nodes[1].kind, cnn::OpKind::Constant);
+    EXPECT_EQ(result.info.nodes[2].kind, cnn::OpKind::Constant);
+    EXPECT_EQ(result.info.nodes[3].kind, cnn::OpKind::Conv2d);
+    EXPECT_EQ(result.info.nodes[4].kind, cnn::OpKind::Add);
+    EXPECT_EQ(result.info.nodes[5].kind, cnn::OpKind::Relu);
+
+    const cnn::NodeInfo &conv = result.info.nodes[3];
+    EXPECT_EQ(conv.inputs.size(), 2u);
+    EXPECT_EQ(conv.convParams.strideX, 1);
+    EXPECT_EQ(conv.convParams.strideY, 1);
+    EXPECT_EQ(conv.convParams.paddingLeft, 0);
+    EXPECT_EQ(conv.convParams.groups, 1);
+
+    std::vector<int64_t> expectedOutShape = {1, 1, 3, 3};
+    EXPECT_EQ(result.info.nodes[5].shape, expectedOutShape);
+
+    ASSERT_EQ(result.info.outputs.size(), 1u);
+    EXPECT_EQ(result.info.outputs[0].first, "out");
+    EXPECT_EQ(result.info.outputs[0].second, 5u);
+}
+
 // Same fixture, but via the primary importOnnxFromMemory() entry point — the one
 // that matters for callers without a real filesystem path (Android assets, etc.).
 TEST(OnnxImporter, ImportFromMemory)

@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <campello_nn/context.hpp>
 #include <campello_nn/graph.hpp>
+#include <campello_nn/graph_info.hpp>
 #include <campello_nn/descriptors/tensor_descriptor.hpp>
 
 namespace systems::leal::campello_nn
@@ -26,6 +27,10 @@ namespace systems::leal::campello_nn
         std::shared_ptr<Graph> graph;
         std::unordered_map<std::string, TensorDescriptor> inputs;
         std::unordered_map<std::string, TensorDescriptor> outputs;
+        // Topology of the imported graph, in campello_nn's own NCHW convention (post-
+        // conversion) — for inspection/visualization, not execution. See `info` on
+        // `OnnxImportResult` for the equivalent ONNX-side field.
+        GraphInfo info;
     };
 
     /**

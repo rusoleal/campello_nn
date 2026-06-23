@@ -299,6 +299,7 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
         result.outputs[vi.name] = TensorDescriptor{onnx::onnxElemTypeToDataType(vi.elemType),
                                                      internal::operandShapeForImport(op), true, false};
     }
+    result.info = internal::graphInfoForImport(builder, outputOperands);
     result.graph = builder.build(outputOperands);
     return result;
 }
