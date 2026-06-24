@@ -4,6 +4,16 @@
 #include <stdexcept>
 #include "ops.hpp"
 #include "strides.hpp"
+#include "thread_pool.hpp"
+#include "simd_kernels.hpp"
+
+namespace
+{
+    // kElementwiseGrain/kRowGrain/kNCUnitGrain/kMatmulRowGrain moved to
+    // simd_kernels.hpp (shared with the Arch-templated kernel bodies there).
+    // kConvUnitGrain stays here — conv2d/pool2d aren't vectorized/dispatched.
+    constexpr int64_t kConvUnitGrain = 4;
+}
 
 using namespace systems::leal::campello_nn;
 
@@ -38,100 +48,64 @@ namespace
         return v;
     }
 
-    // Maps an output multi-index to the corresponding flat index into a
-    // (possibly lower-rank, possibly broadcast) operand: a dimension of size 1
-    // (or a missing leading dimension) always reads index 0 along that axis,
-    // per NumPy/ONNX broadcasting rules — same alignment `computeBroadcastShape`
-    // (in graph_builder.cpp) used to compute `node.shape` in the first place.
-    int64_t broadcastInputIndex(const std::vector<int64_t> &outIdx, const std::vector<int64_t> &inShape,
-                                 const std::vector<int64_t> &inStrides)
-    {
-        size_t outRank = outIdx.size();
-        size_t inRank = inShape.size();
-        size_t offset = outRank - inRank;
-        int64_t flat = 0;
-        for (size_t i = 0; i < inRank; i++)
-        {
-            int64_t coord = inShape[i] == 1 ? 0 : outIdx[offset + i];
-            flat += coord * inStrides[i];
-        }
-        return flat;
-    }
-
-    template <typename BinOp>
-    void evalBroadcastBinaryOp(const Node &node, std::vector<CpuValue> &values, CpuValue &out, BinOp op)
-    {
-        const CpuValue &a = values[node.inputs[0]];
-        const CpuValue &b = values[node.inputs[1]];
-        out = makeFloatValue(node.shape);
-
-        // Fast path: both operands already match the output shape exactly (the
-        // common case, e.g. transformer residual adds) — no broadcast indexing.
-        if (a.shape == node.shape && b.shape == node.shape)
-        {
-            size_t n = out.floatCount();
-            for (size_t i = 0; i < n; i++)
-                out.f()[i] = op(a.f()[i], b.f()[i]);
-            return;
-        }
-
-        auto aStrides = rowMajorStrides(a.shape);
-        auto bStrides = rowMajorStrides(b.shape);
-        int64_t total = numElements(node.shape);
-        for (int64_t flat = 0; flat < total; flat++)
-        {
-            auto outIdx = unravelIndex(flat, node.shape);
-            int64_t aIdx = broadcastInputIndex(outIdx, a.shape, aStrides);
-            int64_t bIdx = broadcastInputIndex(outIdx, b.shape, bStrides);
-            out.f()[flat] = op(a.f()[aIdx], b.f()[bIdx]);
-        }
-    }
-
+    // Each wrapper below dispatches to the Arch-templated kernel in
+    // simd_kernels.hpp: AVX2+FMA3 if available at runtime (cached check, see
+    // cpuSupportsAvx2Fma()), else the safe SSE2/NEON default_arch baseline —
+    // mechanically the same code as before this round, just reached through a
+    // template parameter instead of the fixed FloatBatch/kSimdWidth aliases.
     void evalAdd(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "add");
-        evalBroadcastBinaryOp(node, values, out, [](float x, float y)
-                               { return x + y; });
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalBroadcastBinaryOpImpl<xsimd::fma3<xsimd::avx2>>(node, values, out, AddOp{});
+        else
+#endif
+            evalBroadcastBinaryOpImpl<xsimd::default_arch>(node, values, out, AddOp{});
     }
 
     void evalMul(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "mul");
-        evalBroadcastBinaryOp(node, values, out, [](float x, float y)
-                               { return x * y; });
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalBroadcastBinaryOpImpl<xsimd::fma3<xsimd::avx2>>(node, values, out, MulOp{});
+        else
+#endif
+            evalBroadcastBinaryOpImpl<xsimd::default_arch>(node, values, out, MulOp{});
     }
 
     void evalGelu(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "gelu");
-        const CpuValue &x = values[node.inputs[0]];
-        out = makeFloatValue(node.shape);
-        size_t n = out.floatCount();
-        for (size_t i = 0; i < n; i++)
-        {
-            float v = x.f()[i];
-            out.f()[i] = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752f));
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalGeluImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalGeluImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalRelu(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "relu");
-        const CpuValue &x = values[node.inputs[0]];
-        out = makeFloatValue(node.shape);
-        size_t n = out.floatCount();
-        for (size_t i = 0; i < n; i++)
-            out.f()[i] = std::max(x.f()[i], 0.0f);
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalReluImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalReluImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalSigmoid(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "sigmoid");
-        const CpuValue &x = values[node.inputs[0]];
-        out = makeFloatValue(node.shape);
-        size_t n = out.floatCount();
-        for (size_t i = 0; i < n; i++)
-            out.f()[i] = 1.0f / (1.0f + std::exp(-x.f()[i]));
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalSigmoidImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalSigmoidImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalSoftmax(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
@@ -145,210 +119,100 @@ namespace
         int64_t axisStride = strides[node.axis];
         int64_t outerTotal = numElements(node.shape) / axisSize;
 
-        for (int64_t o = 0; o < outerTotal; o++)
-        {
-            int64_t base = 0, remaining = o;
-            for (int64_t d = rank - 1; d >= 0; d--)
+        parallelFor(0, outerTotal, kRowGrain, [&](int64_t obegin, int64_t oend)
+                    {
+            for (int64_t o = obegin; o < oend; o++)
             {
-                if (d == node.axis)
-                    continue;
-                int64_t dimSize = node.shape[d];
-                int64_t coord = remaining % dimSize;
-                remaining /= dimSize;
-                base += coord * strides[d];
-            }
+                int64_t base = 0, remaining = o;
+                for (int64_t d = rank - 1; d >= 0; d--)
+                {
+                    if (d == node.axis)
+                        continue;
+                    int64_t dimSize = node.shape[d];
+                    int64_t coord = remaining % dimSize;
+                    remaining /= dimSize;
+                    base += coord * strides[d];
+                }
 
-            float maxV = x.f()[base];
-            for (int64_t k = 1; k < axisSize; k++)
-                maxV = std::max(maxV, x.f()[base + k * axisStride]);
-            float sum = 0.f;
-            for (int64_t k = 0; k < axisSize; k++)
-            {
-                float e = std::exp(x.f()[base + k * axisStride] - maxV);
-                out.f()[base + k * axisStride] = e;
-                sum += e;
-            }
-            for (int64_t k = 0; k < axisSize; k++)
-                out.f()[base + k * axisStride] /= sum;
-        }
+                float maxV = x.f()[base];
+                for (int64_t k = 1; k < axisSize; k++)
+                    maxV = std::max(maxV, x.f()[base + k * axisStride]);
+                float sum = 0.f;
+                for (int64_t k = 0; k < axisSize; k++)
+                {
+                    float e = std::exp(x.f()[base + k * axisStride] - maxV);
+                    out.f()[base + k * axisStride] = e;
+                    sum += e;
+                }
+                for (int64_t k = 0; k < axisSize; k++)
+                    out.f()[base + k * axisStride] /= sum;
+            } });
     }
 
     void evalLayerNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "layerNorm");
-        const CpuValue &x = values[node.inputs[0]];
-        const CpuValue &scale = values[node.inputs[1]];
-        const CpuValue &bias = values[node.inputs[2]];
-        out = makeFloatValue(node.shape);
-        int64_t lastDim = node.shape.back();
-        int64_t outerTotal = numElements(node.shape) / lastDim;
-        float eps = node.floatAttr0;
-
-        for (int64_t o = 0; o < outerTotal; o++)
-        {
-            const float *row = x.f() + o * lastDim;
-            float mean = 0.f;
-            for (int64_t k = 0; k < lastDim; k++)
-                mean += row[k];
-            mean /= (float)lastDim;
-            float var = 0.f;
-            for (int64_t k = 0; k < lastDim; k++)
-            {
-                float d = row[k] - mean;
-                var += d * d;
-            }
-            var /= (float)lastDim;
-            float invStd = 1.0f / std::sqrt(var + eps);
-            float *outRow = out.f() + o * lastDim;
-            for (int64_t k = 0; k < lastDim; k++)
-                outRow[k] = (row[k] - mean) * invStd * scale.f()[k] + bias.f()[k];
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalLayerNormImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalLayerNormImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalRmsNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "rmsNorm");
-        const CpuValue &x = values[node.inputs[0]];
-        const CpuValue &scale = values[node.inputs[1]];
-        out = makeFloatValue(node.shape);
-        int64_t lastDim = node.shape.back();
-        int64_t outerTotal = numElements(node.shape) / lastDim;
-        float eps = node.floatAttr0;
-
-        for (int64_t o = 0; o < outerTotal; o++)
-        {
-            const float *row = x.f() + o * lastDim;
-            float meanSquare = 0.f;
-            for (int64_t k = 0; k < lastDim; k++)
-                meanSquare += row[k] * row[k];
-            meanSquare /= (float)lastDim;
-            float invRms = 1.0f / std::sqrt(meanSquare + eps);
-            float *outRow = out.f() + o * lastDim;
-            for (int64_t k = 0; k < lastDim; k++)
-                outRow[k] = row[k] * invRms * scale.f()[k];
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalRmsNormImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalRmsNormImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalBatchNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "batchNorm");
-        const CpuValue &x = values[node.inputs[0]];
-        const CpuValue &mean = values[node.inputs[1]];
-        const CpuValue &variance = values[node.inputs[2]];
-        const CpuValue &scale = values[node.inputs[3]];
-        const CpuValue &bias = values[node.inputs[4]];
-        out = makeFloatValue(node.shape);
-        float eps = node.floatAttr0;
-
-        int64_t N = node.shape[0], C = node.shape[1], H = node.shape[2], W = node.shape[3];
-        std::vector<float> invStd(C);
-        for (int64_t c = 0; c < C; c++)
-            invStd[c] = 1.0f / std::sqrt(variance.f()[c] + eps);
-
-        for (int64_t n = 0; n < N; n++)
-        {
-            for (int64_t c = 0; c < C; c++)
-            {
-                const float *plane = x.f() + (n * C + c) * H * W;
-                float *outPlane = out.f() + (n * C + c) * H * W;
-                float m = mean.f()[c], s = scale.f()[c], b = bias.f()[c], inv = invStd[c];
-                for (int64_t k = 0; k < H * W; k++)
-                    outPlane[k] = (plane[k] - m) * inv * s + b;
-            }
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalBatchNormImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalBatchNormImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalInstanceNorm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "instanceNorm");
-        const CpuValue &x = values[node.inputs[0]];
-        const CpuValue &scale = values[node.inputs[1]];
-        const CpuValue &bias = values[node.inputs[2]];
-        out = makeFloatValue(node.shape);
-        float eps = node.floatAttr0;
-
-        int64_t N = node.shape[0], C = node.shape[1], H = node.shape[2], W = node.shape[3];
-        int64_t spatial = H * W;
-
-        for (int64_t n = 0; n < N; n++)
-        {
-            for (int64_t c = 0; c < C; c++)
-            {
-                const float *plane = x.f() + (n * C + c) * spatial;
-                float mean = 0.f;
-                for (int64_t k = 0; k < spatial; k++)
-                    mean += plane[k];
-                mean /= (float)spatial;
-                float var = 0.f;
-                for (int64_t k = 0; k < spatial; k++)
-                {
-                    float d = plane[k] - mean;
-                    var += d * d;
-                }
-                var /= (float)spatial;
-                float invStd = 1.0f / std::sqrt(var + eps);
-                float s = scale.f()[c], b = bias.f()[c];
-                float *outPlane = out.f() + (n * C + c) * spatial;
-                for (int64_t k = 0; k < spatial; k++)
-                    outPlane[k] = (plane[k] - mean) * invStd * s + b;
-            }
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalInstanceNormImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalInstanceNormImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalMatMul(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "matmul");
-        const CpuValue &a = values[node.inputs[0]];
-        const CpuValue &b = values[node.inputs[1]];
-        out = makeFloatValue(node.shape);
-
-        size_t rank = a.shape.size();
-        int64_t M = a.shape[rank - 2];
-        int64_t K = a.shape[rank - 1];
-        int64_t N = b.shape[rank - 1];
-        int64_t batchCount = numElements(node.shape) / (M * N);
-
-        for (int64_t batch = 0; batch < batchCount; batch++)
-        {
-            const float *aBase = a.f() + batch * M * K;
-            const float *bBase = b.f() + batch * K * N;
-            float *outBase = out.f() + batch * M * N;
-            for (int64_t m = 0; m < M; m++)
-            {
-                for (int64_t n = 0; n < N; n++)
-                {
-                    float sum = 0.f;
-                    for (int64_t k = 0; k < K; k++)
-                        sum += aBase[m * K + k] * bBase[k * N + n];
-                    outBase[m * N + n] = sum;
-                }
-            }
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalMatMulImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalMatMulImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalGemm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "gemm");
-        const CpuValue &a = values[node.inputs[0]];
-        const CpuValue &b = values[node.inputs[1]];
-        const CpuValue &c = values[node.inputs[2]];
-        out = makeFloatValue(node.shape);
-
-        int64_t M = a.shape[0], K = a.shape[1], N = b.shape[1];
-        float alpha = node.floatAttr0, beta = node.floatAttr1;
-        size_t cElems = c.floatCount();
-
-        for (int64_t m = 0; m < M; m++)
-        {
-            for (int64_t n = 0; n < N; n++)
-            {
-                float sum = 0.f;
-                for (int64_t k = 0; k < K; k++)
-                    sum += a.f()[m * K + k] * b.f()[k * N + n];
-                float cv = cElems == 1 ? c.f()[0] : (cElems == (size_t)N ? c.f()[n] : c.f()[m * N + n]);
-                out.f()[m * N + n] = alpha * sum + beta * cv;
-            }
-        }
+#ifdef CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED
+        if (cpuSupportsAvx2Fma())
+            evalGemmImpl<xsimd::fma3<xsimd::avx2>>(node, values, out);
+        else
+#endif
+            evalGemmImpl<xsimd::default_arch>(node, values, out);
     }
 
     void evalReshape(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
@@ -500,10 +364,12 @@ namespace
         int64_t inPerGroup = C / p.groups;
         int64_t outPerGroup = O / p.groups;
 
-        for (int64_t n = 0; n < N; n++)
-        {
-            for (int64_t o = 0; o < O; o++)
+        parallelFor(0, N * O, kConvUnitGrain, [&](int64_t begin, int64_t end)
+                    {
+            for (int64_t no = begin; no < end; no++)
             {
+                int64_t n = no / O;
+                int64_t o = no % O;
                 int64_t group = o / outPerGroup;
                 int64_t inChannelBase = group * inPerGroup;
                 for (int64_t oh = 0; oh < outH; oh++)
@@ -530,11 +396,10 @@ namespace
                                 }
                             }
                         }
-                        out.f()[((n * O + o) * outH + oh) * outW + ow] = sum;
+                        out.f()[no * outH * outW + oh * outW + ow] = sum;
                     }
                 }
-            }
-        }
+            } });
     }
 
     void evalPool2d(const Node &node, std::vector<CpuValue> &values, CpuValue &out, bool isMax)
@@ -547,9 +412,9 @@ namespace
         int64_t N = x.shape[0], C = x.shape[1], H = x.shape[2], W = x.shape[3];
         int64_t outH = node.shape[2], outW = node.shape[3];
 
-        for (int64_t n = 0; n < N; n++)
-        {
-            for (int64_t c = 0; c < C; c++)
+        parallelFor(0, N * C, kNCUnitGrain, [&](int64_t begin, int64_t end)
+                    {
+            for (int64_t nc = begin; nc < end; nc++)
             {
                 for (int64_t oh = 0; oh < outH; oh++)
                 {
@@ -567,16 +432,15 @@ namespace
                                 int64_t iw = ow * p.strideX - p.paddingLeft + kw;
                                 if (iw < 0 || iw >= W)
                                     continue;
-                                float v = x.f()[((n * C + c) * H + ih) * W + iw];
+                                float v = x.f()[nc * H * W + ih * W + iw];
                                 acc = isMax ? std::max(acc, v) : acc + v;
                                 count++;
                             }
                         }
-                        out.f()[((n * C + c) * outH + oh) * outW + ow] = isMax ? acc : (count > 0 ? acc / count : 0.f);
+                        out.f()[nc * outH * outW + oh * outW + ow] = isMax ? acc : (count > 0 ? acc / count : 0.f);
                     }
                 }
-            }
-        }
+            } });
     }
 
     // Maps a destination coordinate back to a source coordinate, per MPSGraphResizeOps'
@@ -603,12 +467,12 @@ namespace
         int64_t N = x.shape[0], C = x.shape[1], H = x.shape[2], W = x.shape[3];
         int64_t outH = node.shape[2], outW = node.shape[3];
 
-        for (int64_t n = 0; n < N; n++)
-        {
-            for (int64_t c = 0; c < C; c++)
+        parallelFor(0, N * C, kNCUnitGrain, [&](int64_t begin, int64_t end)
+                    {
+            for (int64_t nc = begin; nc < end; nc++)
             {
-                const float *plane = x.f() + (n * C + c) * H * W;
-                float *outPlane = out.f() + (n * C + c) * outH * outW;
+                const float *plane = x.f() + nc * H * W;
+                float *outPlane = out.f() + nc * outH * outW;
                 for (int64_t oh = 0; oh < outH; oh++)
                 {
                     float srcH = resizeSrcCoord(oh, H, outH, p.centerResult, p.alignCorners);
@@ -646,8 +510,7 @@ namespace
                         outPlane[oh * outW + ow] = value;
                     }
                 }
-            }
-        }
+            } });
     }
 }
 

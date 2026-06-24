@@ -17,6 +17,8 @@ add_executable(campello_nn_universal_tests
     universal/test_cpu_ops.cpp
     universal/test_cpu_float16_ops.cpp
     universal/test_cpu_quantization_ops.cpp
+    universal/test_cpu_threading.cpp
+    universal/test_cpu_simd.cpp
     universal/test_graph_builder_validation.cpp
     universal/test_transformer_block.cpp
     universal/test_onnx_importer.cpp

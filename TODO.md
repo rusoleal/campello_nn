@@ -187,6 +187,127 @@ three ops, implemented across every layer the original op set touches:
       `CpuOps`/`MpsOps::GatherUint32Indices`.
 - [x] All 65 tests passing across CPU + real MPSGraph/GPU hardware after this round (up from 47).
 
+### Future: CPU backend performance
+**Motivation:** `src/cpu/ops.cpp` is currently plain scalar loops — no SIMD, no multithreading.
+With Phase 3c/3d's GPU-acceleration story now resting on a from-scratch `campello_gpu` compute
+backend (see Phase 3 below) instead of borrowing a vendor inference runtime, the CPU backend stays
+load-bearing for longer in practice (the only backend with zero external dependency, and what
+every device falls back to before/without that work landing) — worth investing in directly rather
+than treating it as a placeholder.
+- [x] **Multithread the per-op evaluators.** New `src/cpu/thread_pool.hpp`/`thread_pool.cpp`: a
+      process-wide `ThreadPool` (`std::thread::hardware_concurrency()` workers, lazily constructed
+      singleton) plus a `parallelFor(begin, end, grainSize, body)` fork-join helper (`std::latch`
+      for the join). Wrapped the 10 compute-bound kernels in `ops.cpp` — `evalBroadcastBinaryOp`
+      (`add`/`mul`), `evalGelu`/`evalRelu`/`evalSigmoid`, `evalSoftmax`, `evalLayerNorm`/
+      `evalRmsNorm`, `evalBatchNorm`/`evalInstanceNorm`, `evalMatMul`/`evalGemm`, `evalConv2d`,
+      `evalPool2d`, `evalResize` — leaving the pure data-movement ops (`reshape`/`transpose`/
+      `concat`/`slice`/`gather`/`quantizeLinear`/`dequantizeLinear`) untouched as a smaller-expected-
+      gain follow-up. **Decision:** where the existing code nested `for(n) for(c)`/`for(n) for(o)`,
+      flattened to one `N*C`/`N*O` range first — wrapping just the outer `n` loop would give zero
+      parallelism whenever `N == 1` (the common inference case). Grain sizes per op category are
+      initial heuristics (chosen so today's small unit-test shapes stay on `parallelFor`'s serial
+      fast-path — confirmed via a full `ctest` run, all 137 tests pass unchanged); real tuning is
+      Phase 6 benchmark work. **Platform guard:** on Emscripten without pthreads enabled (the
+      default — `cmake/wasm.cmake` doesn't pass `-pthread`/`-sUSE_PTHREADS=1`), `parallelFor`
+      degrades to calling `body` inline and `ThreadPool` is never linked in at all
+      (`CAMPELLO_NN_CPU_THREADING_ENABLED` in `thread_pool.hpp`) — every other platform gets the
+      real pool. New `tests/universal/test_cpu_threading.cpp`: existing tests all use small shapes
+      that never leave `parallelFor`'s serial path, so these add shapes sized above each grain
+      threshold (300k-element `add`, batched 64×64×64 `matmul`, 256-row `layerNorm`, `N=1` `conv2d`/
+      `avgPool2d` to specifically prove the N\*C/N\*O flattening) with independently-computed
+      expected values, to actually exercise and verify the multi-threaded path. Informal benchmark
+      (512×512×512 matmul, scratch program, not checked in): 63ms threaded vs. 222ms naive-serial on
+      a 6-core dev machine (~3.5x), checksums matching — real speedup confirmed, not just "doesn't
+      crash."
+- [x] **SIMD the hot inner loops.** Resolved the earlier-deferred AVX2-vs-NEON verification gap with
+      a portable SIMD library (**xsimd**, FetchContent'd, `GIT_TAG 14.2.0`) instead of hand-rolled
+      per-ISA intrinsics — one implementation, not two. New `src/cpu/simd.hpp`: `FloatBatch =
+      xsimd::batch<float>` and `kSimdWidth`. **ISA baseline decision:** no `-mavx2`/`-march=native` —
+      xsimd auto-detects from the compiler's default predefined macros, so with zero special flags it
+      safely targets SSE2 (x86_64) / NEON (AArch64), both mandatory baselines, everywhere; real AVX2
+      needs runtime CPU-feature dispatch to stay safe on non-AVX2 hardware, left as future work.
+      Vectorized (each as a vector loop + scalar remainder inside the existing `parallelFor` chunk
+      body from the threading round — the two compose with no interaction, since loads are
+      `load_unaligned`/`store_unaligned`, never `load_aligned`, so chunk boundaries don't need
+      SIMD-width alignment): `evalAdd`/`evalMul` fast path (made the `BinOp` lambdas generic —
+      `[](auto x, auto y){ return x + y; }` — so the same callable works on `float` and `FloatBatch`),
+      `evalGelu`/`evalSigmoid` (`xsimd::erf`/`xsimd::exp`), `evalRelu` (`xsimd::max`),
+      `evalLayerNorm`/`evalRmsNorm`/`evalInstanceNorm` (vectorized mean/variance reduction via an
+      accumulator batch + `xsimd::reduce_add`, then a vectorized normalize pass), `evalBatchNorm`
+      (no reduction needed — pure vectorized affine), and **`evalMatMul`/`evalGemm`** — a real loop
+      *reorder*, not a mechanical wrap: B is row-major `[K,N]`, so the old k-loop strided through
+      memory per (m,n) and wasn't vectorizable directly; instead, for each `k`, broadcast `a[m,k]`
+      and `xsimd::fma` it against a contiguous slice of B's row `k`, accumulating straight into the
+      output row (bit-identical summation order over `k`, just N-wide groups at a time — confirmed
+      by the existing `EXPECT_FLOAT_EQ`-based matmul/gemm tests still passing unchanged). `evalGemm`
+      additionally vectorizes the `alpha*sum+beta*c` epilogue across all three of `c`'s broadcast
+      shapes (scalar/row-vector/full-matrix), since `c`'s layout matches `out`'s row layout in every
+      case. **Not bit-identical** (tolerated by existing `EXPECT_NEAR`-based tests, confirmed by
+      reading them first): `gelu`/`sigmoid` (different transcendental approximation than libm) and
+      the three reduction-based norm ops (lane-grouped partial sums before a horizontal reduce,
+      reordering float summation). **Deliberately not vectorized this round** (separate, riskier
+      follow-ups): `evalConv2d` (padding/dilation/stride bounds-checking breaks the simple
+      contiguous-load pattern) and `evalSoftmax` (axis can be non-last, i.e. non-contiguous stride).
+      New `tests/universal/test_cpu_simd.cpp`: shapes deliberately *not* a multiple of `kSimdWidth`
+      for every vectorized op (to exercise the scalar-remainder tail) plus `gemm`'s three `c`-shape
+      variants — all passing, plus the full existing suite (73 tests total) unchanged.
+  - **Real discovery while benchmarking:** this project's documented build command (`CLAUDE.md`'s
+    `cmake -B build -DBUILD_TESTS=ON`, no `-DCMAKE_BUILD_TYPE`) leaves `CMAKE_BUILD_TYPE` empty —
+    unoptimized. Measured the vectorized matmul at **447ms/iter unoptimized vs. 222ms/iter for the
+    plain scalar version it replaced** (512×512×512, scratch benchmark) — xsimd's abstraction layers
+    don't get inlined away without optimization, making this round's change a real regression for
+    anyone following the documented build steps literally. Fixed in `CMakeLists.txt`: default
+    `CMAKE_BUILD_TYPE` to `Release` when the user/CI doesn't pick one explicitly (guarded by
+    `NOT CMAKE_CONFIGURATION_TYPES`, so multi-config generators like Xcode/Visual Studio are
+    untouched). With that fix, the same benchmark: **6.3ms/iter threaded+SIMD vs. 224ms/iter
+    naive-serial-scalar (~35x) on this 6-core dev machine**, checksums matching.
+- [ ] Benchmark before/after (ties into Phase 6's "Performance benchmarks" item) to confirm gains
+      before adding complexity — the informal checks above (threading round and this one) are smoke
+      tests, not a real harness; also worth re-measuring once a real harness exists, since both
+      informal numbers were single-machine, single-run readings, not averaged/statistically robust
+- [x] **AVX2+FMA3 runtime CPU-feature dispatch.** Unlike NEON, this dev machine's CPU (Intel Core
+      i5-8500B, Coffee Lake) genuinely supports AVX2+FMA3, so this round's new code path was built
+      *and run* end-to-end here, not compiled blind. Researched xsimd's actual documented dispatch
+      pattern from the real source/docs in `build/_deps/xsimd-src` (not assumed): write each kernel
+      as `template<class Arch> void evalXxxImpl(...)`, put the **definition** of the AVX2
+      instantiation in a separate translation unit compiled with `-mavx2 -mfma`, reference it from
+      everywhere else via `extern template` (compiling `xsimd::fma3<xsimd::avx2>` codegen in a TU
+      *not* built with those flags would be invalid). The runtime cpuid check (confirmed in
+      `xsimd/config/xsimd_cpuid.hpp`) is `xsimd::available_architectures().has(xsimd::fma3<xsimd::avx2>{})`
+      — `fma3<avx2>` is xsimd's combined "AVX2 + FMA3" arch tag, since they're technically separate
+      cpuid bits even though virtually every real AVX2 chip since Haswell has both. New
+      `src/cpu/simd_kernels.hpp`: the 9 vectorized kernel bodies from the prior SIMD round, moved
+      here and templated on `Arch` (mechanically the same logic, `Batch`/`width` instead of the
+      fixed `FloatBatch`/`kSimdWidth`) — plus named `AddOp`/`MulOp` functor structs replacing the
+      generic lambdas `evalAdd`/`evalMul` used to pass in (lambda closure types are anonymous and
+      can't appear in an `extern template` declaration across translation units, hence needing a
+      nameable type), `extern template` declarations for `xsimd::fma3<xsimd::avx2>` of all 9, and a
+      cached (function-local static, checked once not per-call) `cpuSupportsAvx2Fma()`. New
+      `src/cpu/simd_kernels_avx2.cpp`: explicit instantiation definitions for all 9, x86_64-only
+      (`CMakeLists.txt`: `-mavx2;-mfma` via `set_source_files_properties` on GCC/Clang, `/arch:AVX2`
+      on MSVC — **MSVC path unverified**, can't test that compiler from this machine, same
+      documented-but-unverified treatment already accepted for the DirectML backend). `ops.cpp`'s 9
+      wrapper functions (`evalAdd`, `evalGelu`, `evalMatMul`, etc.) became a 4-line dispatch each:
+      call the AVX2 instantiation if `cpuSupportsAvx2Fma()`, else `xsimd::default_arch` (mechanically
+      unchanged from the already-tested prior round). The detection macro
+      (`CAMPELLO_NN_CPU_AVX2_DISPATCH_ENABLED`) is derived directly from compiler-predefined
+      architecture macros in `simd_kernels.hpp` itself (`__x86_64__`/`_M_X64`/etc.), same pattern as
+      `thread_pool.hpp`'s `CAMPELLO_NN_CPU_THREADING_ENABLED` — no CMake `target_compile_definitions`
+      needed. **Verified, not just compiled:** full `ctest` suite (73 tests) passes on this AVX2-
+      capable machine, which is a genuine end-to-end run of the new path (`cpuSupportsAvx2Fma()`
+      confirmed `true` here via a standalone scratch check, AVX2 batch width confirmed 8 vs. the
+      default/SSE2 path's 4 when each is compiled with its real matching flags); a separate scratch
+      check called `evalMatMulImpl<xsimd::default_arch>` and `evalMatMulImpl<xsimd::fma3<xsimd::avx2>>`
+      directly on identical odd-sized (37×23×59) input and diffed every element — 0 mismatches across
+      2183 elements, confirming the two paths agree exactly, not just that neither crashes. Informal
+      benchmark (512×512×512 matmul, same scratch-program pattern as prior rounds): **4.26ms/iter
+      AVX2-dispatched vs. 6.3ms/iter from the SSE2-only round (~33% further improvement) vs.
+      217ms/iter naive-serial-scalar (~51x total)**, checksums matching.
+- [ ] AVX-512 runtime dispatch — same infrastructure, one more arch tier; not done, no AVX-512
+      hardware available to verify on
+- [ ] Vectorize `evalConv2d` and `evalSoftmax` — deferred above, see those notes for why each is
+      harder than the ops already done
+
 ---
 
 ## Phase 3 — Platform Accelerator Backends
