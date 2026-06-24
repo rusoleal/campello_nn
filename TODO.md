@@ -474,7 +474,60 @@ available to develop against.
       directly) rather than trusted from memory, but the code itself is
       unverified by compilation. First real build/test run is follow-up work.
 
-### 3c. Linux — oneDNN or Vulkan compute shaders
+### 3c/3d. Linux & Android — `campello_gpu` Vulkan compute backend
+**Decision (supersedes the earlier separate Linux/Android plans below):** instead of oneDNN
+(Linux) and NNAPI/LiteRT delegates (Android) — both vendor- or third-party-runtime-dependent, with
+inconsistent OEM/SDK coverage — build one shared GPU backend on top of the sibling
+`campello_gpu` library's Vulkan path, which is already "production ready" on **both** Linux and
+Android (per `campello_gpu/README.md`'s platform table). One `IR-node → compute-shader` mapping,
+written once, covers both platforms — collapsing what were two separate "most build-it-yourself"
+problems into one. This also keeps the project's existing philosophy (own backend per accelerator,
+verified against the real API, no third-party inference-runtime dependency) consistent with the
+MPSGraph/DirectML backends, rather than introducing a different kind of dependency (NNAPI driver,
+LiteRT delegate, oneDNN) only for these two platforms.
+
+**How real GPU NN runtimes actually execute (research, informs the shape of this backend):**
+production runtimes are a *sequence of kernel dispatches*, never one giant fused shader for a
+whole model — fusion only ever spans a handful of ops at a time (data dependencies, dynamic
+shapes, and register/shared-memory limits make a single mega-shader impractical regardless of
+vendor). Two real strategies exist:
+  - **Fixed precompiled-kernel library, dispatched per op** — DirectML (HLSL compute shaders
+    shipped inside the DLL, selected/parameterized by shape at compile time) and most NNAPI vendor
+    drivers / mobile NPU runtimes work this way. No runtime shader generation at all.
+  - **Compile-time fusion / codegen** — MPSGraph (and CoreML, TensorRT, XLA/TVM) pattern-match
+    subgraphs against known fusion templates and JIT-compile specialized kernels once at graph-
+    build time (still many fused *chunks*, not one shader for the network).
+  `campello_gpu`'s `ShaderModule` only accepts **precompiled native binaries** (SPIR-V for Vulkan,
+  `.metallib` for Metal — no runtime shader-source compilation API), which makes the
+  fixed-precompiled-kernel-per-op strategy both the realistic option and consistent with what
+  DirectML/NNAPI drivers already do — not a step down from how real runtimes work. This also
+  mirrors this repo's own DirectML backend's already-made "sequential per-node compiled operators,
+  not a fused graph" decision (see 3b above). Compile-time fusion (MPSGraph-style) would need a
+  GLSL/HLSL→SPIR-V compiler (e.g. `shaderc`) embedded as a new dependency to generate specialized
+  SPIR-V at `compileGraph()` time — a real option later, out of scope for v1.
+
+- [ ] One precompiled SPIR-V compute shader per `OpKind` (hand-written GLSL/HLSL, compiled to
+      SPIR-V at build time via `glslangValidator`/`dxc`/`shaderc`, embedded as binary resources —
+      same "verify against the real thing" discipline as `proto_reader.hpp`/the TFLite field IDs)
+- [ ] `Device`/`ComputePipeline`/`BindGroupLayout` setup per op kind (`campello_gpu`'s
+      `Device::createComputePipeline()` + `createBindGroupLayout()`/`createBindGroup()` for the
+      input/output/uniform buffer bindings each shader expects)
+- [ ] `compileGraph(GraphIR)`: walk the IR once, create one `ComputePipeline` + `BindGroup` per
+      node (mirrors the DirectML backend's per-node compiled-operator shape, see 3b)
+- [ ] `dispatch()`: one `ComputePassEncoder::setPipeline()`/`setBindGroup()`/`dispatchWorkgroups()`
+      per node on a shared `CommandEncoder`, `finish()` + `submit()`, fence wait — same
+      synchronous-dispatch convention as every other backend here
+- [ ] Tensor ↔ `campello_gpu::Buffer` bridging (`Device::createBuffer()`/`Buffer::upload()`/read-back)
+- [ ] `Context` backend wiring for Linux and Android (`src/pi/context.cpp`), replacing the
+      `android_backend.{hpp,cpp}` NNAPI path (keep `android_backend.hpp`'s doc-comment history of
+      why NNAPI was tried first, see below)
+- [ ] Parity tests against CPU reference, mirroring `tests/platform/test_mps_ops.cpp`'s shape, run
+      on real Linux/Android Vulkan hardware (may need per-device tolerance adjustments)
+
+<details>
+<summary>Superseded plans (kept for history)</summary>
+
+#### 3c (superseded). Linux — oneDNN or Vulkan compute shaders
 - [ ] Decide oneDNN vs. Vulkan-compute as the primary path (doc notes neither is an
       "official OS API" — pick one as primary, keep the other as a documented option)
 - [ ] IR-node → primitive/shader mapping for every op (this is the most build-it-yourself backend
@@ -484,13 +537,30 @@ available to develop against.
 - [ ] Dispatch + sync/fence wiring
 - [ ] Parity tests against CPU reference
 
-### 3d. Android — NNAPI successor / vendor delegate, fallback XNNPACK
+#### 3d (superseded). Android — NNAPI now, LiteRT delegates later
+**Decision (confirmed against the real docs, not memory):** NNAPI (`<android/NeuralNetworks.h>`)
+is deprecated as of Android 15, but still present and functional — the NDK page's own warning is
+"you can continue to use NNAPI... we expect the majority of devices in the future to use the CPU
+backend" (i.e. deprecation risk is *silent accel loss on future devices*, not a build break).
+`android_backend.{hpp,cpp}` targets NNAPI for v1 anyway, because NNAPI's
+`ANeuralNetworksModel`/`Compilation`/`Execution` C API is an IR-walk-and-compile API matching this
+repo's other backends' shape (`compileGraph(GraphIR)` → native graph object → `dispatch()`) almost
+exactly. The actually-current replacement, **LiteRT's GPU/NPU delegates**
+(`TfLiteGpuDelegateV2Create`, and a now-unified NPU delegate covering Qualcomm/MediaTek/Google
+Tensor), does *not* fit that shape — delegates attach to a `TfLiteInterpreter` loaded from a TFLite
+FlatBuffer model, so adopting them would mean writing a `GraphIR`→TFLite-flatbuffer exporter (the
+inverse of the existing TFLite *importer*, see `src/tflite/`) and dispatching through an interpreter
+instead of a hand-built native graph object — a real architecture change, not a drop-in swap.
+**Superseded:** rather than wait on that revisit, decided to skip NNAPI/LiteRT entirely in favor of
+the self-contained `campello_gpu` Vulkan backend above, which also happens to cover Linux for free.
 - [ ] `Context` backend wiring, with capability detection (treat as best-effort per the doc —
       OEM coverage is inconsistent)
-- [ ] IR-node → NNAPI-successor/vendor-delegate op mapping where available
-- [ ] XNNPACK fallback path for ops/devices the vendor delegate doesn't cover
+- [ ] IR-node → NNAPI op mapping where available
+- [ ] XNNPACK fallback path for ops/devices NNAPI doesn't cover
 - [ ] Tensor buffer bridging for both paths
 - [ ] Parity tests against CPU reference (may need per-device tolerance adjustments)
+
+</details>
 
 ### 3e. Web — passthrough to native browser WebNN
 - [ ] Thin shim mapping `GraphBuilder`/IR directly to the browser's `MLGraphBuilder` API
