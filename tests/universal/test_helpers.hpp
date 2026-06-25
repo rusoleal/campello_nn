@@ -17,6 +17,11 @@ inline std::shared_ptr<cnn::Context> makeGpuContext()
     return cnn::Context::create({cnn::DeviceType::Gpu});
 }
 
+inline std::shared_ptr<cnn::Context> makeGpuGenericContext()
+{
+    return cnn::Context::create({cnn::DeviceType::GpuGeneric});
+}
+
 inline std::vector<uint16_t> toHalf(const std::vector<float> &v)
 {
     std::vector<uint16_t> h(v.size());

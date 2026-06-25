@@ -3,6 +3,7 @@
 #include "context_data.hpp"
 #include "resource_data.hpp"
 #include "../cpu/cpu_backend.hpp"
+#include "../gpu/gpu_backend.hpp"
 #ifdef __APPLE__
 #include "../metal/mps_backend.hpp"
 #elif defined(_WIN32)
@@ -25,29 +26,45 @@ std::shared_ptr<Context> Context::create(const ContextDescriptor &desc)
 {
     std::unique_ptr<Backend> backend;
 
+    // DeviceType::GpuGeneric always routes to the campello_gpu-based backend,
+    // on every platform — independent of the platform-specific branches below,
+    // which only ever apply to Cpu/Gpu/Npu/Default. See that enum value's doc
+    // comment: this is an explicitly-selected addition for benchmarking
+    // against the native backends, not a replacement for them.
+    if (desc.deviceType == DeviceType::GpuGeneric)
+    {
+        backend = std::make_unique<GpuBackend>();
+    }
+    else
 #ifdef __APPLE__
     // MPSGraph's own placement pass (MPSGraphOptimizationLevel1, the framework
     // default) can already dispatch eligible ops to the GPU or ANE, so Gpu/Npu/
     // Default all route to the same MPSGraph backend; only Cpu stays on CpuBackend.
-    if (desc.deviceType == DeviceType::Cpu)
-        backend = std::make_unique<CpuBackend>();
-    else
-        backend = std::make_unique<MpsBackend>();
+    {
+        if (desc.deviceType == DeviceType::Cpu)
+            backend = std::make_unique<CpuBackend>();
+        else
+            backend = std::make_unique<MpsBackend>();
+    }
 #elif defined(_WIN32)
     // DirectML picks its own adapter (hardware preferred, WARP fallback) rather
     // than mapping Gpu/Npu/Default to distinct devices — same one-backend-covers-
     // every-non-Cpu-DeviceType shape as the MPSGraph branch above.
-    if (desc.deviceType == DeviceType::Cpu)
-        backend = std::make_unique<CpuBackend>();
-    else
-        backend = std::make_unique<DirectMlBackend>();
-#else
-    if (desc.deviceType != DeviceType::Cpu && desc.deviceType != DeviceType::Default)
     {
-        std::cerr << "campello_nn: no accelerator backend implemented yet for the requested "
-                     "DeviceType; falling back to Cpu.\n";
+        if (desc.deviceType == DeviceType::Cpu)
+            backend = std::make_unique<CpuBackend>();
+        else
+            backend = std::make_unique<DirectMlBackend>();
     }
-    backend = std::make_unique<CpuBackend>();
+#else
+    {
+        if (desc.deviceType != DeviceType::Cpu && desc.deviceType != DeviceType::Default)
+        {
+            std::cerr << "campello_nn: no accelerator backend implemented yet for the requested "
+                         "DeviceType; falling back to Cpu.\n";
+        }
+        backend = std::make_unique<CpuBackend>();
+    }
 #endif
 
     auto data = new ContextData{std::move(backend), desc.deviceType};

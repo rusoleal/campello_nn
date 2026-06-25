@@ -97,6 +97,32 @@ if(BUILD_INTEGRATION_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
+# GPU generic backend tests — DeviceType::GpuGeneric (src/gpu/gpu_backend.cpp).
+# Kept separate from BUILD_INTEGRATION_TESTS's if(APPLE)/elseif(WIN32) shape
+# above: unlike MPSGraph/DirectML, this backend is meant to build on every
+# platform campello_gpu supports, not gated by OS.
+# ---------------------------------------------------------------------------
+option(BUILD_GPU_GENERIC_TESTS "Build DeviceType::GpuGeneric (campello_gpu-based) backend tests" OFF)
+
+if(BUILD_GPU_GENERIC_TESTS)
+    add_executable(campello_nn_gpu_generic_tests
+        platform/test_gpu_generic_ops.cpp
+    )
+    target_include_directories(campello_nn_gpu_generic_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/inc
+    )
+    target_link_libraries(campello_nn_gpu_generic_tests
+        campello_nn
+        GTest::gtest_main
+    )
+    set_target_properties(campello_nn_gpu_generic_tests PROPERTIES
+        CXX_STANDARD 20
+    )
+    include(GoogleTest)
+    gtest_discover_tests(campello_nn_gpu_generic_tests)
+endif()
+
+# ---------------------------------------------------------------------------
 # Model tests — exercise real third-party models (YuNet/ONNX and BlazeFace/
 # TFLite, both face detectors) end-to-end via their respective importers, on
 # real decoded images. Pulls in campello_image (FetchContent) to decode the

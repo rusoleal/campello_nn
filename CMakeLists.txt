@@ -97,6 +97,57 @@ set(BUILD_TESTS ${_campello_nn_saved_build_tests} CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES ${_campello_nn_saved_build_examples} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
+# campello_gpu — sibling WebGPU-shaped cross-platform GPU library (Metal/
+# Vulkan/DirectX12), backing src/gpu/gpu_backend.{hpp,cpp}
+# (`DeviceType::GpuGeneric` — see that enum's doc comment). Unlike
+# `DeviceType::Gpu` (platform-native: MPSGraph on Apple, DirectML on Windows,
+# unimplemented elsewhere), this is the same backend on every platform,
+# selected explicitly for benchmarking against the native ones, not as their
+# replacement. campello_gpu's own `createComputePipeline`/`dispatchWorkgroups`
+# are genuinely implemented across all three of its native backends
+# (confirmed by reading its DirectX12 source directly, not just its —
+# slightly stale — `shader_module.hpp` doc comment), so this one integration
+# reaches macOS/iOS/Windows/Linux/Android. Not built for Emscripten (neither
+# campello_gpu's own wasm/WebGPU backend nor this integration is in scope
+# here). campello_gpu's own CMakeLists.txt declares the same
+# `BUILD_TESTS`/`BUILD_EXAMPLES`/`BUILD_INTEGRATION_TESTS` option names as
+# this project — and unlike the campello_image precedent in CLAUDE.md, this
+# collision genuinely isn't harmless: campello_gpu's own `tests/CMakeLists.txt`
+# references source files via `${CMAKE_SOURCE_DIR}` instead of
+# `${CMAKE_CURRENT_SOURCE_DIR}`, which resolves to *this* project's source
+# tree under FetchContent, not campello_gpu's own — configuring with
+# -DBUILD_TESTS=ON hard-fails with "Cannot find source file" (confirmed by
+# actually running it, same discovery process as the xsimd/doctest collision
+# above). Same save/restore fix, just for a different root cause.
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    set(_campello_nn_saved_build_tests2 "${BUILD_TESTS}")
+    set(_campello_nn_saved_build_examples2 "${BUILD_EXAMPLES}")
+    set(_campello_nn_saved_build_int_tests2 "${BUILD_INTEGRATION_TESTS}")
+    if(_campello_nn_saved_build_tests2 STREQUAL "")
+        set(_campello_nn_saved_build_tests2 OFF)
+    endif()
+    if(_campello_nn_saved_build_examples2 STREQUAL "")
+        set(_campello_nn_saved_build_examples2 OFF)
+    endif()
+    if(_campello_nn_saved_build_int_tests2 STREQUAL "")
+        set(_campello_nn_saved_build_int_tests2 OFF)
+    endif()
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_INTEGRATION_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        campello_gpu
+        GIT_REPOSITORY https://github.com/rusoleal/campello_gpu.git
+        GIT_TAG v0.13.2
+    )
+    FetchContent_MakeAvailable(campello_gpu)
+    set(BUILD_TESTS ${_campello_nn_saved_build_tests2} CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES ${_campello_nn_saved_build_examples2} CACHE BOOL "" FORCE)
+    set(BUILD_INTEGRATION_TESTS ${_campello_nn_saved_build_int_tests2} CACHE BOOL "" FORCE)
+endif()
+
+# ---------------------------------------------------------------------------
 # Core sources — graph IR, GraphBuilder, Context/Tensor/Graph/Fence, and the
 # CPU reference backend. Cross-platform; no accelerator SDK required.
 # Each platform .cmake file appends accelerator-backend sources (Phase 3 of
@@ -140,6 +191,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$" AND NOT CMAKE_SY
     endif()
 endif()
 
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    list(APPEND CAMPELLO_NN_CORE_SOURCES src/gpu/gpu_backend.cpp)
+endif()
+
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Android")
     include(cmake/android.cmake)
 elseif(${CMAKE_SYSTEM_NAME} STREQUAL "Darwin")
@@ -158,6 +213,10 @@ target_link_libraries(${PROJECT_NAME} FlatBuffers::FlatBuffers xsimd::xsimd)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND Threads_FOUND)
     target_link_libraries(${PROJECT_NAME} Threads::Threads)
+endif()
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    target_link_libraries(${PROJECT_NAME} campello_gpu::campello_gpu)
 endif()
 
 add_library(campello_nn::campello_nn ALIAS ${PROJECT_NAME})

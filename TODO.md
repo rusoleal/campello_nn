@@ -474,17 +474,24 @@ available to develop against.
       directly) rather than trusted from memory, but the code itself is
       unverified by compilation. First real build/test run is follow-up work.
 
-### 3c/3d. Linux & Android — `campello_gpu` Vulkan compute backend
-**Decision (supersedes the earlier separate Linux/Android plans below):** instead of oneDNN
-(Linux) and NNAPI/LiteRT delegates (Android) — both vendor- or third-party-runtime-dependent, with
-inconsistent OEM/SDK coverage — build one shared GPU backend on top of the sibling
-`campello_gpu` library's Vulkan path, which is already "production ready" on **both** Linux and
-Android (per `campello_gpu/README.md`'s platform table). One `IR-node → compute-shader` mapping,
-written once, covers both platforms — collapsing what were two separate "most build-it-yourself"
-problems into one. This also keeps the project's existing philosophy (own backend per accelerator,
+### 3c/3d. Generic GPU backend on `campello_gpu` (`DeviceType::GpuGeneric`)
+**Decision (supersedes the earlier separate Linux/Android plans below, and widens scope beyond
+them):** instead of oneDNN (Linux) and NNAPI/LiteRT delegates (Android) — both vendor- or
+third-party-runtime-dependent, with inconsistent OEM/SDK coverage — build one shared GPU backend
+on top of the sibling `campello_gpu` library. Originally scoped to just Linux/Android (where
+MPSGraph/DirectML have no equivalent), but widened on request: `campello_gpu`'s
+`createComputePipeline()`/`dispatchWorkgroups()` are genuinely implemented across **all three** of
+its native backends (confirmed by reading its DirectX12 source directly, not just its slightly
+stale `shader_module.hpp` doc comment) — Metal (macOS/iOS), Vulkan (Linux/Android), DirectX12
+(Windows) — so one integration reaches every platform. Added a new, additive
+`DeviceType::GpuGeneric` (`inc/campello_nn/constants/device_type.hpp`) rather than overloading
+`DeviceType::Gpu`: `Gpu` keeps routing to the platform-native backend (MPSGraph/DirectML) as the
+default; `GpuGeneric` is an explicitly-selected addition, for benchmarking the two against each
+other later (the actual goal: build this, then benchmark CPU vs. `GpuGeneric` vs. native `Gpu`) —
+not a replacement. This also keeps the project's existing philosophy (own backend per accelerator,
 verified against the real API, no third-party inference-runtime dependency) consistent with the
 MPSGraph/DirectML backends, rather than introducing a different kind of dependency (NNAPI driver,
-LiteRT delegate, oneDNN) only for these two platforms.
+LiteRT delegate, oneDNN) for the platforms that lacked a native backend.
 
 **How real GPU NN runtimes actually execute (research, informs the shape of this backend):**
 production runtimes are a *sequence of kernel dispatches*, never one giant fused shader for a
@@ -506,23 +513,96 @@ vendor). Two real strategies exist:
   GLSL/HLSL→SPIR-V compiler (e.g. `shaderc`) embedded as a new dependency to generate specialized
   SPIR-V at `compileGraph()` time — a real option later, out of scope for v1.
 
-- [ ] One precompiled SPIR-V compute shader per `OpKind` (hand-written GLSL/HLSL, compiled to
-      SPIR-V at build time via `glslangValidator`/`dxc`/`shaderc`, embedded as binary resources —
-      same "verify against the real thing" discipline as `proto_reader.hpp`/the TFLite field IDs)
-- [ ] `Device`/`ComputePipeline`/`BindGroupLayout` setup per op kind (`campello_gpu`'s
-      `Device::createComputePipeline()` + `createBindGroupLayout()`/`createBindGroup()` for the
-      input/output/uniform buffer bindings each shader expects)
-- [ ] `compileGraph(GraphIR)`: walk the IR once, create one `ComputePipeline` + `BindGroup` per
-      node (mirrors the DirectML backend's per-node compiled-operator shape, see 3b)
-- [ ] `dispatch()`: one `ComputePassEncoder::setPipeline()`/`setBindGroup()`/`dispatchWorkgroups()`
-      per node on a shared `CommandEncoder`, `finish()` + `submit()`, fence wait — same
-      synchronous-dispatch convention as every other backend here
-- [ ] Tensor ↔ `campello_gpu::Buffer` bridging (`Device::createBuffer()`/`Buffer::upload()`/read-back)
-- [ ] `Context` backend wiring for Linux and Android (`src/pi/context.cpp`), replacing the
-      `android_backend.{hpp,cpp}` NNAPI path (keep `android_backend.hpp`'s doc-comment history of
-      why NNAPI was tried first, see below)
-- [ ] Parity tests against CPU reference, mirroring `tests/platform/test_mps_ops.cpp`'s shape, run
-      on real Linux/Android Vulkan hardware (may need per-device tolerance adjustments)
+- [x] **Vertical slice implemented and verified on Metal: `relu`, exact-shape `add`, rank-2
+      unbatched `matmul`.** Everything else throws rather than guessing (matches this codebase's
+      "throw on unsupported variant" precedent, e.g. ONNX's Gemm-with-transpose). New
+      `src/gpu/gpu_backend.{hpp,cpp}` implements `Backend`: `createTensor`/`writeTensor`/
+      `readTensor` via `Buffer::upload()`/`download()`; `compileGraph()` builds one
+      `BindGroupLayout`/`PipelineLayout`/`ComputePipeline` per `OpKind` (cached, reused across
+      nodes of the same kind — same precedent as MPSGraph/DirectML's "build once") plus per-node
+      output/params buffers; `dispatch()` rebuilds each real op's `BindGroup` fresh every call
+      (campello_gpu's `BindGroup` is immutable once created, WebGPU-style, unlike D3D12's
+      rebindable descriptor tables DirectML's `resolveBuffer()` exploits — deliberately not
+      optimized away for provably-static subgraphs in this round). New
+      `src/gpu/shaders/{relu,add,matmul}.{comp,metal,hlsl}` — hand-written GLSL/MSL/HLSL per op
+      (not a single cross-compiled source: `campello_gpu`'s `ShaderModule` only accepts
+      **precompiled** native binaries, confirmed in the 3c/3d research below), with the compiled
+      `.metallib`/`.spv` bytes embedded as generated C++ byte-array headers
+      (`src/gpu/shaders/*_metallib.hpp`/`*_spv.hpp`) rather than loaded from a file path at
+      runtime — avoids the "where do I find this file" problem on Android (no real filesystem for
+      assets) or any other deployment target, same reasoning `campello_gpu`'s own precompiled-shader
+      design already follows. **Binding convention** (all 3 ops): storage buffers at binding
+      `0..N-1` (inputs then output), one uniform params buffer at binding `N` (element count for
+      `relu`/`add`; `M`/`K`/`N` for `matmul`) — kept uniform across ops rather than special-casing
+      which ones "need" params. **Dispatch model:** one workgroup per output element (not one
+      thread per element) — discovered while verifying that `campello_gpu`'s Metal
+      `ComputePassEncoder::dispatchWorkgroups()` always uses the pipeline's
+      `threadExecutionWidth()` as the per-group thread count, ignoring whatever the shader source
+      declares, with no public accessor to query that value before dispatch — so every shader gates
+      to thread-0-within-group (`relu.metal`/`add.metal`/`matmul.metal`) to stay correct regardless
+      of that unqueryable value, trading GPU utilization for correctness; the Vulkan/HLSL shaders
+      use `local_size_x=1`/`[numthreads(1,1,1)]` so they genuinely have one thread per group and
+      don't need the gate. New `DeviceType::GpuGeneric` wired into `Context::create()`
+      (`src/pi/context.cpp`) ahead of the existing per-platform branches, on every platform.
+  - **Two real bugs found in `campello_gpu` itself while verifying end-to-end on Metal** (not
+    assumed — found by writing a minimal standalone reproduction against `campello_gpu` directly,
+    bypassing this backend entirely, after every `GpuGenericOps` test initially read back all-zero
+    output despite no errors anywhere, including with `MTL_DEBUG_LAYER=1`/`MTL_SHADER_VALIDATION=1`
+    enabled):
+    1. **The actual cause:** `Device::createFence()`'s Metal `MetalFenceData::signaled` defaults to
+       `true` ("start signaled so first frame doesn't block" — a comment describing a
+       ring-buffer-of-fences *rendering* pattern, not this backend's one-shot
+       create-fence→submit→wait usage, which is also `campello_gpu`'s own documented "typical
+       usage" example in `fence.hpp`). So `Fence::wait()` on a freshly created fence returns `true`
+       immediately, without ever waiting for the submission it was passed to — every read happened
+       before the GPU had necessarily even started, let alone finished. **Worked around**, not
+       patched upstream: `GpuBackend::dispatch()` doesn't use a `campello_gpu::Fence` at all —
+       submits via the 1-arg `Device::submit()` and calls `Device::waitForIdle()` synchronously
+       before returning, then hands back an always-pre-signaled `GpuFence` (same shape as
+       `CpuFence`) — matching this codebase's own established "synchronous dispatch, pre-signaled
+       fence" convention (CPU/MPSGraph/DirectML all already work this way), so no architectural
+       change, just sidestepping the broken per-fence-object semantics.
+    2. **A separate, latent issue, not the proximate cause but real and confirmed by reading the
+       source:** `Buffer::download()`'s Metal implementation does a raw `memcpy` from
+       `buffer->contents()` with no `synchronizeResource:` call first — invalid/stale for a buffer
+       in `MTLResourceStorageModeManaged` (Apple's docs require an explicit GPU-side sync blit
+       before a CPU read can see a prior GPU write in that mode). `Device::createBuffer()` only
+       picks the always-coherent `MTLResourceStorageModeShared` instead when `BufferUsage::mapRead`
+       or `mapWrite` is set — neither of which this backend would otherwise have any reason to
+       request (it never calls a mapping API). Worked around the same way: `tensorBufferUsage()`
+       (`src/gpu/gpu_backend.cpp`) includes `mapRead|mapWrite` specifically to force Shared mode on
+       every tensor/output buffer, sidestepping the gap entirely. Confirmed harmless on Vulkan:
+       its `Device::createBuffer()` always allocates `HOST_VISIBLE|HOST_COHERENT` memory regardless
+       of usage flags (its own `mapRead`/`mapWrite` checks are dead/commented-out code there).
+  - **Verified, not just compiled:** full `ctest` suite (77 tests: 73 prior + 4 new) passes on this
+    Metal-capable machine — `Relu`/`AddExactShape`/`MatMul` individually, plus a **chained**
+    `Relu`→`Add` graph specifically added to test whether `campello_gpu` auto-tracks resource
+    hazards between two dispatches in the same compute pass (no explicit barrier call exists in
+    `ComputePassEncoder`'s API to confirm this otherwise) — it does, on Metal.
+  - **Vulkan:** GLSL→SPIR-V compilation verified (`glslangValidator`, installed via
+    `brew install glslang` for this), but **not execution** — no Vulkan ICD/MoltenVK on this
+    machine. **DirectX12:** `.hlsl` sources written against real D3D12/HLSL semantics but entirely
+    unverified — no Windows toolchain available — same documented-but-unverified treatment already
+    accepted for the DirectML backend.
+- [ ] Full op coverage (the other ~20 `OpKind`s) — this round was deliberately a 3-op vertical
+      slice to prove the pipeline (buffers/shaders/bind groups/dispatch/hazard-tracking) end to end
+      before scaling up
+- [ ] `add`'s broadcast case and `matmul`'s batched case — both throw today, same "vertical slice"
+      scoping as above
+- [ ] The actual benchmark this backend was built for: CPU vs. `GpuGeneric` vs. native `Gpu`
+      (MPSGraph/DirectML) on the same machine, once op coverage is broad enough to run a real
+      shared graph across all three — not meaningful yet with only 3 ops implemented
+- [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
+      Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
+      compile-only-or-less, as noted above
+- [ ] `Context` backend wiring replaces nothing for Android — `android_backend.{hpp,cpp}`'s NNAPI
+      path stays as documented history (no `.cpp` was ever written for it), separate from this
+      backend's own `DeviceType::GpuGeneric` selection
+- [ ] CI coverage for the Vulkan/DirectX12 paths — GitHub-hosted runners have no GPU; DirectML's
+      WARP-software-adapter trick has a Vulkan equivalent in Mesa's `llvmpipe`, worth investigating,
+      not solved now
+- [ ] `dispatch()`'s "rebuild every real op's `BindGroup` every call" is correctness-first, not
+      perf-first (see above) — worth optimizing once there's a benchmark to justify it
 
 <details>
 <summary>Superseded plans (kept for history)</summary>

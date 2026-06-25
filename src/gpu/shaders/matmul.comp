@@ -1,0 +1,25 @@
+#version 450
+
+// Vulkan (GLSL). Rank-2, unbatched matmul only — see gpu_backend.cpp's
+// evalMatMul for why batched matmul throws rather than guessing in this
+// round. One workgroup per output element (m,n); each does the full K-sum
+// itself, same naive/no-tiling model as the CPU reference kernel — this
+// round proves the pipeline is correct, not that it's fast.
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
+layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 3) uniform Params { uint m; uint k; uint n; uint pad0; } params;
+
+void main()
+{
+    uint n = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    if (m >= params.m || n >= params.n)
+        return;
+    float sum = 0.0;
+    for (uint i = 0u; i < params.k; i++)
+        sum += aBuf.data[m * params.k + i] * bBuf.data[i * params.n + n];
+    outputBuf.data[m * params.n + n] = sum;
+}

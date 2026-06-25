@@ -1,0 +1,23 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per output element (local_size_x=1, so there's
+// genuinely exactly one thread per group on this backend) — same model as
+// relu.metal, kept consistent across all three shading languages even though
+// only Metal's campello_gpu wrapper actually forces this (it derives the
+// per-group thread count from the pipeline's threadExecutionWidth(), not from
+// this shader, with no public accessor to query that value — see
+// gpu_backend.cpp). Trades GPU utilization for being correct regardless of
+// that unqueryable value; revisit once doing real perf tuning.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params { uint count; uint pad0; uint pad1; uint pad2; } params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+    outputBuf.data[idx] = max(inputBuf.data[idx], 0.0);
+}
