@@ -1,8 +1,13 @@
 // Benchmarks campello_nn backends (Cpu, GpuGeneric, and platform-native Gpu)
-// on a synthetic transformer block: matmul -> add -> gelu -> layerNorm.
+// on two workloads:
+//   1. Synthetic transformer block: matmul -> add -> gelu -> layerNorm
+//   2. Real model: YuNet face detection (ONNX import + image decode/resize)
 //
 // Build with -DBUILD_BENCHMARKS=ON, then run:
 //   ./build/benchmarks/campello_nn_benchmark [batch] [hidden]
+//
+// The YuNet workload is included when CAMPELLO_NN_TEST_FIXTURES_DIR is defined
+// (i.e., when campello_image is available).
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +22,11 @@
 
 #include <campello_nn/context.hpp>
 #include <campello_nn/graph_builder.hpp>
+
+#ifdef CAMPELLO_NN_TEST_FIXTURES_DIR
+#include <campello_image/image.hpp>
+#include <campello_nn/onnx_importer.hpp>
+#endif
 
 namespace cnn = systems::leal::campello_nn;
 
@@ -49,12 +59,52 @@ namespace
         return s;
     }
 
-    void printStats(const char *label, const Stats &s)
+    const char *deviceTypeName(cnn::DeviceType type)
     {
-        std::printf("%-18s %8.3f ms %8.3f ms %8.3f ms %8.3f ms\n",
-                    label, s.min, s.median, s.mean, s.max);
+        switch (type)
+        {
+        case cnn::DeviceType::Cpu:
+            return "Cpu";
+        case cnn::DeviceType::Gpu:
+            return "Gpu (MPSGraph)";
+        case cnn::DeviceType::GpuGeneric:
+            return "GpuGeneric";
+        default:
+            return "Unknown";
+        }
     }
 
+    struct BackendResult
+    {
+        cnn::DeviceType type;
+        Stats stats;
+        double maxAbsDiff = 0.0;
+        bool available = false;
+    };
+
+    // -------------------------------------------------------------------------
+    // Timer helpers
+    // -------------------------------------------------------------------------
+    Stats timeIterations(int warmUp, int timed, const std::function<void()> &fn)
+    {
+        for (int i = 0; i < warmUp; ++i)
+            fn();
+
+        std::vector<double> times;
+        times.reserve(timed);
+        for (int i = 0; i < timed; ++i)
+        {
+            auto start = Clock::now();
+            fn();
+            auto end = Clock::now();
+            times.push_back(DurationMs(end - start).count());
+        }
+        return computeStats(times);
+    }
+
+    // -------------------------------------------------------------------------
+    // Workload 1: synthetic transformer block
+    // -------------------------------------------------------------------------
     std::vector<float> makeRandomBuffer(size_t count, uint32_t seed)
     {
         std::mt19937 rng(seed);
@@ -75,7 +125,6 @@ namespace
         std::shared_ptr<cnn::Tensor> tscale;
         std::shared_ptr<cnn::Tensor> tlnBias;
         std::shared_ptr<cnn::Tensor> tout;
-        std::vector<float> outputHost;
     };
 
     TransformerGraph buildTransformerGraph(std::shared_ptr<cnn::Context> context,
@@ -115,11 +164,10 @@ namespace
         g.tscale->write(scaleV.data(), scaleV.size() * sizeof(float));
         g.tlnBias->write(lnBiasV.data(), lnBiasV.size() * sizeof(float));
 
-        g.outputHost.resize(static_cast<size_t>(batch * hidden));
         return g;
     }
 
-    bool runOnce(TransformerGraph &g)
+    void runTransformerBlockOnce(TransformerGraph &g)
     {
         auto fence = g.context->dispatch(
             *g.graph,
@@ -127,97 +175,287 @@ namespace
              {"scale", g.tscale}, {"lnBias", g.tlnBias}},
             {{"out", g.tout}});
         fence->wait();
-        g.tout->read(g.outputHost.data(), g.outputHost.size() * sizeof(float));
-        return true;
     }
 
-    Stats benchmarkBackend(std::shared_ptr<cnn::Context> context,
-                           int64_t batch, int64_t hidden,
-                           const std::vector<float> *referenceOutput,
-                           double *outAbsMaxDiff)
+    std::vector<float> readTransformerOutput(TransformerGraph &g)
     {
-        TransformerGraph g = buildTransformerGraph(context, batch, hidden);
-
-        // Warm-up.
-        for (int i = 0; i < 3; ++i)
-            if (!runOnce(g))
-                return {};
-
-        const int kTimedIterations = 10;
-        std::vector<double> times;
-        times.reserve(kTimedIterations);
-
-        for (int i = 0; i < kTimedIterations; ++i)
-        {
-            auto start = Clock::now();
-            if (!runOnce(g))
-                return {};
-            auto end = Clock::now();
-            times.push_back(DurationMs(end - start).count());
-        }
-
-        if (referenceOutput && outAbsMaxDiff)
-        {
-            double maxDiff = 0.0;
-            for (size_t i = 0; i < g.outputHost.size(); ++i)
-                maxDiff = std::max(maxDiff, static_cast<double>(
-                    std::abs(g.outputHost[i] - (*referenceOutput)[i])));
-            *outAbsMaxDiff = maxDiff;
-        }
-
-        if (referenceOutput == nullptr)
-        {
-            // This is the reference run; we can't mutate the caller's pointer
-            // through the const pointer, but the caller passes nullptr for
-            // reference and uses the returned graph's output separately.
-        }
-
-        return computeStats(times);
+        std::vector<float> out(static_cast<size_t>(g.tout->shape()[0] *
+                                                     g.tout->shape()[1]));
+        g.tout->read(out.data(), out.size() * sizeof(float));
+        return out;
     }
 
-    const char *deviceTypeName(cnn::DeviceType type)
+    void benchmarkTransformerBlock(int64_t batch, int64_t hidden)
     {
-        switch (type)
+        std::printf("\n=== Transformer block (matmul + add + gelu + layerNorm) ===\n");
+        std::printf("  Input shape: [%lld, %lld]  Weight shape: [%lld, %lld]\n",
+                    batch, hidden, hidden, hidden);
+        std::printf("  Warm-up: 3, Timed iterations: 10\n\n");
+
+        // CPU reference: timed run + captured output.
+        std::vector<float> referenceOutput;
+        Stats cpuStats;
         {
-        case cnn::DeviceType::Cpu:
-            return "Cpu";
-        case cnn::DeviceType::Gpu:
-            return "Gpu (MPSGraph)";
-        case cnn::DeviceType::GpuGeneric:
-            return "GpuGeneric";
-        default:
-            return "Unknown";
+            auto context = cnn::Context::create({cnn::DeviceType::Cpu});
+            auto g = buildTransformerGraph(context, batch, hidden);
+            cpuStats = timeIterations(3, 10, [&]()
+                                      {
+                                          runTransformerBlockOnce(g);
+                                          referenceOutput = readTransformerOutput(g);
+                                      });
+        }
+
+        std::vector<BackendResult> results;
+        results.push_back({cnn::DeviceType::Cpu, cpuStats, 0.0, true});
+
+        auto tryGpuGeneric = [&]() -> BackendResult
+        {
+            BackendResult r{cnn::DeviceType::GpuGeneric, {}, 0.0, false};
+            try
+            {
+                auto context = cnn::Context::create({cnn::DeviceType::GpuGeneric});
+                auto g = buildTransformerGraph(context, batch, hidden);
+                r.stats = timeIterations(3, 10, [&]()
+                                         { runTransformerBlockOnce(g); });
+                auto out = readTransformerOutput(g);
+                r.maxAbsDiff = 0.0;
+                for (size_t i = 0; i < out.size(); ++i)
+                    r.maxAbsDiff = std::max(r.maxAbsDiff,
+                                            static_cast<double>(std::abs(out[i] - referenceOutput[i])));
+                r.available = true;
+            }
+            catch (const std::exception &e)
+            {
+                std::fprintf(stderr, "GpuGeneric unavailable: %s\n", e.what());
+            }
+            return r;
+        };
+        results.push_back(tryGpuGeneric());
+
+#ifdef __APPLE__
+        auto tryGpu = [&]() -> BackendResult
+        {
+            BackendResult r{cnn::DeviceType::Gpu, {}, 0.0, false};
+            try
+            {
+                auto context = cnn::Context::create({cnn::DeviceType::Gpu});
+                auto g = buildTransformerGraph(context, batch, hidden);
+                r.stats = timeIterations(3, 10, [&]()
+                                         { runTransformerBlockOnce(g); });
+                auto out = readTransformerOutput(g);
+                r.maxAbsDiff = 0.0;
+                for (size_t i = 0; i < out.size(); ++i)
+                    r.maxAbsDiff = std::max(r.maxAbsDiff,
+                                            static_cast<double>(std::abs(out[i] - referenceOutput[i])));
+                r.available = true;
+            }
+            catch (const std::exception &e)
+            {
+                std::fprintf(stderr, "Gpu unavailable: %s\n", e.what());
+            }
+            return r;
+        }();
+        results.push_back(tryGpu);
+#endif
+
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "Backend", "min", "median", "mean", "max", "maxAbsDiff");
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "-------", "---", "------", "----", "---", "------------");
+        for (const auto &r : results)
+        {
+            if (!r.available)
+            {
+                std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                            deviceTypeName(r.type), "N/A", "N/A", "N/A", "N/A", "N/A");
+                continue;
+            }
+            std::printf("%-18s %9.3f ms %9.3f ms %9.3f ms %9.3f ms %11.3e\n",
+                        deviceTypeName(r.type),
+                        r.stats.min, r.stats.median, r.stats.mean, r.stats.max,
+                        r.maxAbsDiff);
+        }
+
+        for (const auto &r : results)
+        {
+            if (!r.available)
+                continue;
+            double maxVal = 0.0;
+            for (float v : referenceOutput)
+                maxVal = std::max(maxVal, static_cast<double>(std::abs(v)));
+            bool close = r.maxAbsDiff <= 1e-4 || (maxVal > 0.0 && r.maxAbsDiff / maxVal <= 1e-4);
+            if (!close)
+            {
+                std::fprintf(stderr,
+                             "ERROR: backend %s deviates from Cpu reference "
+                             "(maxAbsDiff=%.3e, maxVal=%.3e)\n",
+                             deviceTypeName(r.type), r.maxAbsDiff, maxVal);
+            }
         }
     }
 
-    struct BackendResult
-    {
-        cnn::DeviceType type;
-        Stats stats;
-        double maxAbsDiff = 0.0;
-        bool available = false;
-    };
+#ifdef CAMPELLO_NN_TEST_FIXTURES_DIR
+    // -------------------------------------------------------------------------
+    // Workload 2: YuNet face detection end-to-end
+    // -------------------------------------------------------------------------
+    namespace cimg = systems::leal::campello_image;
 
-    BackendResult tryBenchmarkBackend(cnn::DeviceType type,
-                                      int64_t batch, int64_t hidden,
-                                      const std::vector<float> &referenceOutput)
+    std::vector<float> loadAndPreprocessImage(std::shared_ptr<cnn::Context> context,
+                                              const std::string &path, int64_t targetSize)
     {
-        BackendResult r;
-        r.type = type;
-        try
+        auto img = cimg::Image::fromFile(path.c_str());
+        if (!img)
+            throw std::runtime_error("benchmark: failed to decode image '" + path + "'");
+        int64_t W = img->getWidth(), H = img->getHeight();
+        const uint8_t *rgba = (const uint8_t *)img->getData();
+
+        std::vector<float> bgr(static_cast<size_t>(3 * H * W));
+        for (int64_t y = 0; y < H; y++)
         {
-            auto context = cnn::Context::create({type});
-            r.stats = benchmarkBackend(context, batch, hidden,
-                                       &referenceOutput, &r.maxAbsDiff);
-            r.available = true;
+            for (int64_t x = 0; x < W; x++)
+            {
+                const uint8_t *px = rgba + static_cast<size_t>(y * W + x) * 4;
+                size_t idx = static_cast<size_t>(y * W + x);
+                bgr[(0 * H * W) + idx] = px[2]; // B
+                bgr[(1 * H * W) + idx] = px[1]; // G
+                bgr[(2 * H * W) + idx] = px[0]; // R
+            }
         }
-        catch (const std::exception &e)
-        {
-            std::fprintf(stderr, "Backend %s unavailable: %s\n",
-                         deviceTypeName(type), e.what());
-        }
-        return r;
+
+        cnn::GraphBuilder builder(context);
+        auto x = builder.input("x", {cnn::DataType::Float32, {1, 3, H, W}});
+        cnn::ResizeDescriptor desc;
+        desc.outputHeight = targetSize;
+        desc.outputWidth = targetSize;
+        desc.mode = cnn::ResizeMode::Bilinear;
+        auto graph = builder.build({{"out", builder.resize(x, desc)}});
+
+        auto tin = context->createTensor({cnn::DataType::Float32, {1, 3, H, W}, false, true});
+        auto tout = context->createTensor({cnn::DataType::Float32,
+                                           {1, 3, targetSize, targetSize}, true, false});
+        tin->write(bgr.data(), bgr.size() * sizeof(float));
+        auto fence = context->dispatch(*graph, {{"x", tin}}, {{"out", tout}});
+        fence->wait();
+
+        std::vector<float> result(static_cast<size_t>(3 * targetSize * targetSize));
+        tout->read(result.data(), result.size() * sizeof(float));
+        return result;
     }
+
+    float maxFaceConfidence(std::shared_ptr<cnn::Context> context,
+                            cnn::OnnxImportResult &model,
+                            const std::vector<float> &inputData)
+    {
+        auto inTensor = context->createTensor(model.inputs.at("input"));
+        inTensor->write(inputData.data(), inputData.size() * sizeof(float));
+
+        std::unordered_map<std::string, std::shared_ptr<cnn::Tensor>> outputs;
+        for (auto &kv : model.outputs)
+            outputs[kv.first] = context->createTensor(kv.second);
+
+        auto fence = context->dispatch(*model.graph, {{"input", inTensor}}, outputs);
+        fence->wait();
+
+        float maxScore = 0.f;
+        for (const char *scale : {"8", "16", "32"})
+        {
+            std::string clsName = std::string("cls_") + scale;
+            std::string objName = std::string("obj_") + scale;
+            size_t n = 1;
+            for (auto d : model.outputs.at(clsName).shape)
+                n *= static_cast<size_t>(d);
+            std::vector<float> cls(n), obj(n);
+            outputs[clsName]->read(cls.data(), n * sizeof(float));
+            outputs[objName]->read(obj.data(), n * sizeof(float));
+            for (size_t i = 0; i < n; i++)
+                maxScore = std::max(maxScore, cls[i] * obj[i]);
+        }
+        return maxScore;
+    }
+
+    void benchmarkYuNet()
+    {
+        std::printf("\n=== YuNet face detection (320x320 ONNX) ===\n");
+        std::printf("  Warm-up: 3, Timed iterations: 10\n\n");
+
+        std::string fixturesDir = CAMPELLO_NN_TEST_FIXTURES_DIR;
+
+        // Preprocess images once on CPU (not part of the model timing).
+        std::vector<float> faceInput;
+        std::vector<float> noFaceInput;
+        {
+            auto cpuContext = cnn::Context::create({cnn::DeviceType::Cpu});
+            faceInput = loadAndPreprocessImage(cpuContext, fixturesDir + "/images/face.jpg", 320);
+            noFaceInput = loadAndPreprocessImage(cpuContext, fixturesDir + "/images/no_face.jpg", 320);
+        }
+
+        // Compute CPU reference confidence scores once.
+        float faceRef = 0.f;
+        float noFaceRef = 0.f;
+        {
+            auto cpuContext = cnn::Context::create({cnn::DeviceType::Cpu});
+            auto model = cnn::importOnnxFromFile(cpuContext, fixturesDir + "/yunet_n_320_320.onnx");
+            faceRef = maxFaceConfidence(cpuContext, model, faceInput);
+            noFaceRef = maxFaceConfidence(cpuContext, model, noFaceInput);
+            std::printf("  CPU reference confidence: face=%.4f, no_face=%.4f\n\n",
+                        faceRef, noFaceRef);
+        }
+
+        auto benchmarkBackendYuNet = [&](cnn::DeviceType type,
+                                         float faceRef, float noFaceRef) -> BackendResult
+        {
+            BackendResult r{type, {}, 0.0, false};
+            try
+            {
+                auto context = cnn::Context::create({type});
+                auto model = cnn::importOnnxFromFile(context, fixturesDir + "/yunet_n_320_320.onnx");
+
+                r.stats = timeIterations(3, 10, [&]()
+                                         {
+                                             // Time one face + one no-face inference per iteration.
+                                             maxFaceConfidence(context, model, faceInput);
+                                             maxFaceConfidence(context, model, noFaceInput);
+                                         });
+
+                float faceOut = maxFaceConfidence(context, model, faceInput);
+                float noFaceOut = maxFaceConfidence(context, model, noFaceInput);
+                r.maxAbsDiff = std::max(static_cast<double>(std::abs(faceOut - faceRef)),
+                                        static_cast<double>(std::abs(noFaceOut - noFaceRef)));
+                r.available = true;
+            }
+            catch (const std::exception &e)
+            {
+                std::fprintf(stderr, "%s unavailable: %s\n", deviceTypeName(type), e.what());
+            }
+            return r;
+        };
+
+        std::vector<BackendResult> results;
+        results.push_back(benchmarkBackendYuNet(cnn::DeviceType::Cpu, faceRef, noFaceRef));
+        results.push_back(benchmarkBackendYuNet(cnn::DeviceType::GpuGeneric, faceRef, noFaceRef));
+#ifdef __APPLE__
+        results.push_back(benchmarkBackendYuNet(cnn::DeviceType::Gpu, faceRef, noFaceRef));
+#endif
+
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "Backend", "min", "median", "mean", "max", "maxScoreDiff");
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "-------", "---", "------", "----", "---", "------------");
+        for (const auto &r : results)
+        {
+            if (!r.available)
+            {
+                std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                            deviceTypeName(r.type), "N/A", "N/A", "N/A", "N/A", "N/A");
+                continue;
+            }
+            std::printf("%-18s %9.3f ms %9.3f ms %9.3f ms %9.3f ms %11.3e\n",
+                        deviceTypeName(r.type),
+                        r.stats.min, r.stats.median, r.stats.mean, r.stats.max,
+                        r.maxAbsDiff);
+        }
+    }
+#endif // CAMPELLO_NN_TEST_FIXTURES_DIR
 }
 
 int main(int argc, char **argv)
@@ -235,79 +473,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::printf("Benchmark: transformer block (matmul + add + gelu + layerNorm)\n");
-    std::printf("  Input shape: [%lld, %lld]  Weight shape: [%lld, %lld]\n",
-                batch, hidden, hidden, hidden);
-    std::printf("  Warm-up: 3, Timed iterations: 10\n\n");
+    benchmarkTransformerBlock(batch, hidden);
 
-    // Use CPU as the reference output for correctness comparison.
-    std::vector<float> referenceOutput;
-    Stats cpuStats;
-    {
-        std::printf("Running reference on Cpu...\n");
-        auto cpuContext = cnn::Context::create({cnn::DeviceType::Cpu});
-        auto g = buildTransformerGraph(cpuContext, batch, hidden);
-        for (int i = 0; i < 3; ++i)
-            runOnce(g);
-        {
-            auto start = Clock::now();
-            runOnce(g);
-            auto end = Clock::now();
-            cpuStats = computeStats({DurationMs(end - start).count()});
-        }
-        // Run the full timed set on CPU to get stable numbers and populate reference.
-        cpuStats = benchmarkBackend(cpuContext, batch, hidden, nullptr, nullptr);
-        referenceOutput = std::move(g.outputHost);
-    }
-
-    std::vector<BackendResult> results;
-    results.push_back({cnn::DeviceType::Cpu, cpuStats, 0.0, true});
-    results.push_back(tryBenchmarkBackend(cnn::DeviceType::GpuGeneric, batch, hidden, referenceOutput));
-
-#ifdef __APPLE__
-    results.push_back(tryBenchmarkBackend(cnn::DeviceType::Gpu, batch, hidden, referenceOutput));
+#ifdef CAMPELLO_NN_TEST_FIXTURES_DIR
+    benchmarkYuNet();
+#else
+    std::printf("\nYuNet workload skipped (campello_image not available).\n");
 #endif
 
-    std::printf("\n%-18s %10s  %10s  %10s  %10s  %12s\n",
-                "Backend", "min", "median", "mean", "max", "maxAbsDiff");
-    std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
-                "-------", "---", "------", "----", "---", "------------");
-    for (const auto &r : results)
-    {
-        if (!r.available)
-        {
-            std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
-                        deviceTypeName(r.type), "N/A", "N/A", "N/A", "N/A", "N/A");
-            continue;
-        }
-        std::printf("%-18s %9.3f ms %9.3f ms %9.3f ms %9.3f ms %11.3e\n",
-                    deviceTypeName(r.type),
-                    r.stats.min, r.stats.median, r.stats.mean, r.stats.max,
-                    r.maxAbsDiff);
-    }
-
-    bool allClose = true;
-    for (const auto &r : results)
-    {
-        if (!r.available)
-            continue;
-        // Tolerance: gelu/layerNorm are not bit-identical across backends, so
-        // use a loose relative tolerance. For fp32 this is ~1e-4 relative.
-        double maxVal = 0.0;
-        for (float v : referenceOutput)
-            maxVal = std::max(maxVal, static_cast<double>(std::abs(v)));
-        double relTol = 1e-4;
-        double absTol = 1e-4;
-        bool close = r.maxAbsDiff <= absTol || (maxVal > 0.0 && r.maxAbsDiff / maxVal <= relTol);
-        if (!close)
-        {
-            std::fprintf(stderr,
-                         "ERROR: backend %s deviates from Cpu reference "
-                         "(maxAbsDiff=%.3e, maxVal=%.3e)\n",
-                         deviceTypeName(r.type), r.maxAbsDiff, maxVal);
-            allClose = false;
-        }
-    }
-
-    return allClose ? 0 : 1;
+    return 0;
 }

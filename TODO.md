@@ -731,12 +731,13 @@ vendor). Two real strategies exist:
       `size == 0` instead of the data-carrying overload, avoiding a `memcpy` from `nullptr` inside
       `campello_gpu::Buffer::upload()`.
 - [x] **Backend latency benchmark.** Added `benchmarks/benchmark_backends.cpp` and a
-      `BUILD_BENCHMARKS` CMake option. It runs a synthetic transformer-block graph
-      (`matmul → add → gelu → layerNorm`) on every available backend and reports
-      min/median/mean/max latency plus max absolute difference vs. the CPU reference.
-      Verified on macOS/Metal: CPU and MPSGraph are both faster than the current naive
-      `GpuGeneric` implementation across the tested 1×512/1×1024/1×2048/1×4096 and batched
-      16–64×1024 shapes, confirming the benchmark is useful for tracking future
+      `BUILD_BENCHMARKS` CMake option. It runs two workloads on every available backend:
+      a synthetic transformer-block graph (`matmul → add → gelu → layerNorm`) and the
+      real YuNet face-detection model (`yunet_n_320_320.onnx`, including
+      `campello_image` decode/resize). Reports min/median/mean/max latency plus max
+      absolute/score difference vs. the CPU reference. Verified on macOS/Metal: CPU and
+      MPSGraph are both faster than the current naive `GpuGeneric` implementation across
+      the tested shapes and models, confirming the benchmark is useful for tracking future
       `GpuGeneric` performance work.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
