@@ -1,0 +1,42 @@
+#version 450
+
+// Vulkan (GLSL). Same one-workgroup-per-element model; see relu.comp's comment.
+//
+// GLSL has no built-in erf() — confirmed neither does Metal's metal_stdlib
+// (checked the actual installed Metal toolchain headers directly: no `erf`
+// declared anywhere under metal/, contrary to an initial assumption while
+// writing this). gelu.metal and gelu.hlsl use this exact same
+// Abramowitz & Stegun 7.1.26 polynomial approximation (max absolute error
+// ~1.5e-7) for consistency across all three. Not bit-exact with libm's
+// erff()/xsimd's erf() (the CPU backend's two approximations, which also
+// disagree with each other) — same kind of small, already-accepted
+// cross-backend numerical difference noted in TODO.md's SIMD round.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params { uint count; uint pad0; uint pad1; uint pad2; } params;
+
+float erfApprox(float x)
+{
+    float s = x < 0.0 ? -1.0 : 1.0;
+    float ax = abs(x);
+    const float a1 = 0.254829592;
+    const float a2 = -0.284496736;
+    const float a3 = 1.421413741;
+    const float a4 = -1.453152027;
+    const float a5 = 1.061405429;
+    const float p = 0.3275911;
+    float t = 1.0 / (1.0 + p * ax);
+    float y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-ax * ax);
+    return s * y;
+}
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+    float v = inputBuf.data[idx];
+    outputBuf.data[idx] = 0.5 * v * (1.0 + erfApprox(v * 0.70710678118654752));
+}

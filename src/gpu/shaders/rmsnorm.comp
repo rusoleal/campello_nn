@@ -1,0 +1,28 @@
+#version 450
+
+// Vulkan (GLSL). Same row-per-workgroup dispatch model as layernorm.comp —
+// see that file's comment. Formula matches src/cpu/ops.cpp's evalRmsNorm.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer ScaleBuf { float data[]; } scaleBuf;
+layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 3) uniform Params { uint lastDim; float eps; uint pad1; uint pad2; } params;
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    uint base = row * params.lastDim;
+
+    float meanSquare = 0.0;
+    for (uint k = 0u; k < params.lastDim; k++)
+    {
+        float v = xBuf.data[base + k];
+        meanSquare += v * v;
+    }
+    meanSquare /= float(params.lastDim);
+    float invRms = 1.0 / sqrt(meanSquare + params.eps);
+
+    for (uint k = 0u; k < params.lastDim; k++)
+        outputBuf.data[base + k] = xBuf.data[base + k] * invRms * scaleBuf.data[k];
+}

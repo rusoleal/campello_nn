@@ -1,0 +1,99 @@
+#version 450
+
+// Vulkan (GLSL). Generic NumPy/ONNX-style broadcasting for elementwise
+// binary ops. `mode` selects the operation (0 = add, 1 = mul). One workgroup
+// per output element. The output multi-index is unraveled using the output
+// shape; each operand contributes either its own coordinate or repeats via a
+// size-1 (broadcast) dimension, encoded by a zero stride.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
+layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 3) uniform Params
+{
+    uint count;
+    uint rank;
+    uint mode;
+    uint pad0;
+    uint shape0, shape1, shape2, shape3, shape4, shape5, shape6, shape7;
+    uint strideA0, strideA1, strideA2, strideA3, strideA4, strideA5, strideA6, strideA7;
+    uint strideB0, strideB1, strideB2, strideB3, strideB4, strideB5, strideB6, strideB7;
+} params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+
+    uint remaining = idx;
+    uint aIdx = 0u;
+    uint bIdx = 0u;
+
+    // Unravel the flat output index into per-dim coordinates and accumulate
+    // each operand's flat index using its precomputed broadcast strides.
+    // Dimensions beyond params.rank have shape 1 and stride 0, so they are
+    // skipped. The loop runs from least-significant (last) dim to most-
+    // significant (first) to match row-major flat indexing.
+    if (params.rank > 7u)
+    {
+        uint coord = remaining % params.shape7;
+        remaining /= params.shape7;
+        aIdx += coord * params.strideA7;
+        bIdx += coord * params.strideB7;
+    }
+    if (params.rank > 6u)
+    {
+        uint coord = remaining % params.shape6;
+        remaining /= params.shape6;
+        aIdx += coord * params.strideA6;
+        bIdx += coord * params.strideB6;
+    }
+    if (params.rank > 5u)
+    {
+        uint coord = remaining % params.shape5;
+        remaining /= params.shape5;
+        aIdx += coord * params.strideA5;
+        bIdx += coord * params.strideB5;
+    }
+    if (params.rank > 4u)
+    {
+        uint coord = remaining % params.shape4;
+        remaining /= params.shape4;
+        aIdx += coord * params.strideA4;
+        bIdx += coord * params.strideB4;
+    }
+    if (params.rank > 3u)
+    {
+        uint coord = remaining % params.shape3;
+        remaining /= params.shape3;
+        aIdx += coord * params.strideA3;
+        bIdx += coord * params.strideB3;
+    }
+    if (params.rank > 2u)
+    {
+        uint coord = remaining % params.shape2;
+        remaining /= params.shape2;
+        aIdx += coord * params.strideA2;
+        bIdx += coord * params.strideB2;
+    }
+    if (params.rank > 1u)
+    {
+        uint coord = remaining % params.shape1;
+        remaining /= params.shape1;
+        aIdx += coord * params.strideA1;
+        bIdx += coord * params.strideB1;
+    }
+    if (params.rank > 0u)
+    {
+        uint coord = remaining % params.shape0;
+        remaining /= params.shape0;
+        aIdx += coord * params.strideA0;
+        bIdx += coord * params.strideB0;
+    }
+
+    float a = aBuf.data[aIdx];
+    float b = bBuf.data[bIdx];
+    outputBuf.data[idx] = params.mode == 0u ? a + b : a * b;
+}

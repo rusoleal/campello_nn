@@ -1,0 +1,31 @@
+#version 450
+
+// Vulkan (GLSL). Unlike instanceNorm (and unlike conv2d/pool2d/resize),
+// batchNorm needs no spatial windowing or per-(n,c)-plane reduction at
+// all — mean/variance are *given* (inference-mode running stats), not
+// computed from x — so this reuses the plain one-workgroup-per-output-
+// element model the original elementwise ops (relu.comp etc.) use, just
+// deriving each element's channel index from its flat position
+// (`c = (idx / spatial) % C`) to look up that channel's mean/variance/
+// scale/bias. Matches the CPU backend's evalBatchNormImpl
+// (src/cpu/simd_kernels.hpp) formula exactly:
+// `out = (x - mean) * rsqrt(variance + eps) * scale + bias`.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer MeanBuf { float data[]; } meanBuf;
+layout(std430, binding = 2) readonly buffer VarBuf { float data[]; } varBuf;
+layout(std430, binding = 3) readonly buffer ScaleBuf { float data[]; } scaleBuf;
+layout(std430, binding = 4) readonly buffer BiasBuf { float data[]; } biasBuf;
+layout(std430, binding = 5) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 6) uniform Params { uint count; uint C; uint spatial; float eps; } params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+    uint c = (idx / params.spatial) % params.C;
+    float invStd = 1.0 / sqrt(varBuf.data[c] + params.eps);
+    outputBuf.data[idx] = (xBuf.data[idx] - meanBuf.data[c]) * invStd * scaleBuf.data[c] + biasBuf.data[c];
+}

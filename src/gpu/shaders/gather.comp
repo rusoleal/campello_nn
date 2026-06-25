@@ -1,0 +1,32 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per output element. Same outer/axisSize/
+// innerSize decomposition as the CPU backend's evalGather (src/cpu/ops.cpp):
+// `outerSize` = product of `data`'s dims before the gather axis, `axisSize`
+// = `data`'s size along that axis, `innerSize` = product of dims after it,
+// `numIndices` = total element count of the `indices` operand. `indices` is
+// bound as a raw uint buffer regardless of its declared Int32/Uint32
+// campello_nn DataType — bit-identical for the non-negative indices this op
+// (and the CPU backend, which never range-checks for negative values either)
+// actually supports.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer DataBuf { float data[]; } dataBuf;
+layout(std430, binding = 1) readonly buffer IndicesBuf { uint data[]; } indicesBuf;
+layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 3) uniform Params { uint outerSize; uint axisSize; uint innerSize; uint numIndices; } params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    uint count = params.outerSize * params.numIndices * params.innerSize;
+    if (idx >= count)
+        return;
+    uint inner = idx % params.innerSize;
+    uint t = idx / params.innerSize;
+    uint ii = t % params.numIndices;
+    uint outer = t / params.numIndices;
+    uint gatheredIdx = indicesBuf.data[ii];
+    uint src = (outer * params.axisSize + gatheredIdx) * params.innerSize + inner;
+    outputBuf.data[idx] = dataBuf.data[src];
+}

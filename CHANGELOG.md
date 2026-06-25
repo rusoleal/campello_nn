@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `GpuBackend::compileGraph()` no longer passes a null pointer to `campello_gpu`'s data-carrying
+  `createBuffer()` overload for zero-byte constants (dead ONNX initializers). This caused a crash
+  during import of real models such as YuNet on `DeviceType::GpuGeneric`.
+
+### Added
+- `tests/platform/test_gpu_generic_models.cpp`: end-to-end YuNet face-detection test running on the
+  generic `campello_gpu` backend (`DeviceType::GpuGeneric`), mirroring the existing CPU/MPSGraph
+  model tests.
+
 ---
 
 ## [0.2.0] - 2026-06-23

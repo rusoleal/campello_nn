@@ -1,0 +1,52 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per output element, same model as relu.comp.
+// Generic arbitrary-rank permute, capped at MAX_RANK=8 (gpu_backend.cpp
+// throws rather than guessing past that — matches this codebase's "throw on
+// unsupported variant" precedent). `divisor[d]` is the *output* shape's
+// row-major stride for dim d (used to decode the flat output index into a
+// per-dim index via repeated div/mod); `gatherStride[d]` is the
+// corresponding multiplier into the *input*'s flat space
+// (`inStrides[perm[d]]`, precomputed on the CPU side in gpu_backend.cpp).
+//
+// Params uses flat named scalar fields (divisor0..7/gather0..7) instead of
+// real GLSL arrays, deliberately: GLSL std140 (and HLSL cbuffers) pad every
+// array element inside a uniform block up to 16 bytes, but Metal's
+// `constant` address space structs use natural 4-byte packing for arrays
+// instead — a real array here would need a different byte layout per
+// backend to stay correct. Flat scalar fields pack identically (tightly,
+// 4 bytes each) in all three, same precedent as ParamsNorm/ParamsElementwise
+// in gpu_backend.cpp, just with more of them.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params
+{
+    uint rank;
+    uint count;
+    uint divisor0, divisor1, divisor2, divisor3, divisor4, divisor5, divisor6, divisor7;
+    uint gather0, gather1, gather2, gather3, gather4, gather5, gather6, gather7;
+} params;
+
+void main()
+{
+    uint outIdx = gl_WorkGroupID.x;
+    if (outIdx >= params.count)
+        return;
+
+    uint divisor[8] = uint[8](params.divisor0, params.divisor1, params.divisor2, params.divisor3,
+                               params.divisor4, params.divisor5, params.divisor6, params.divisor7);
+    uint gatherStride[8] = uint[8](params.gather0, params.gather1, params.gather2, params.gather3,
+                                    params.gather4, params.gather5, params.gather6, params.gather7);
+
+    uint remaining = outIdx;
+    uint srcOffset = 0u;
+    for (uint d = 0u; d < params.rank; d++)
+    {
+        uint idx = remaining / divisor[d];
+        remaining -= idx * divisor[d];
+        srcOffset += idx * gatherStride[d];
+    }
+    outputBuf.data[outIdx] = inputBuf.data[srcOffset];
+}

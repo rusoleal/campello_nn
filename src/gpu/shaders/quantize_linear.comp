@@ -1,0 +1,29 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+
+// Vulkan (GLSL). Float32 → Int8 per-tensor quantization.
+// One workgroup per output element; `local_size_x = 1` so the dispatch count
+// is exactly the element count. Uses `GL_EXT_shader_8bit_storage` so the
+// output storage buffer can be declared as `int8_t[]` and addressed by byte.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inBuf;
+layout(std430, binding = 1) buffer OutBuf { int8_t data[]; } outBuf;
+layout(binding = 2) uniform Params
+{
+    uint count;
+    float scale;
+    int zeroPoint;
+    uint pad0;
+} params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+    float x = inBuf.data[idx];
+    int q = int(round(x / params.scale)) + params.zeroPoint;
+    q = clamp(q, -128, 127);
+    outBuf.data[idx] = int8_t(q);
+}

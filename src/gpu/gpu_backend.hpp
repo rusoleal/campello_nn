@@ -18,9 +18,7 @@ namespace systems::leal::campello_nn
      * __APPLE__`/`_WIN32`/else, picking `.metallib`/DirectX-bytecode/`.spv` byte
      * arrays — see `src/gpu/shaders/`).
      *
-     * **Vertical slice (see TODO.md):** only `Relu`, exact-shape `Add` (no
-     * broadcast), and rank-2 unbatched `MatMul` are implemented — every other
-     * `OpKind` throws rather than guessing. `DeviceType::GpuGeneric` is an
+     * Coverage is documented in `TODO.md` Phase 3c/3d. `DeviceType::GpuGeneric` is an
      * explicitly-selected addition for benchmarking against the platform-native
      * `DeviceType::Gpu` backends (MPSGraph/DirectML), not a replacement for them.
      */

@@ -514,7 +514,9 @@ vendor). Two real strategies exist:
   SPIR-V at `compileGraph()` time — a real option later, out of scope for v1.
 
 - [x] **Vertical slice implemented and verified on Metal: `relu`, exact-shape `add`, rank-2
-      unbatched `matmul`.** Everything else throws rather than guessing (matches this codebase's
+      unbatched `matmul`; later expanded to also cover exact-shape `mul`, `sigmoid`, `gelu`,
+      `layerNorm`, `rmsNorm`** (9 `OpKind`s total — see the dedicated entry below for the
+      expansion). Everything else throws rather than guessing (matches this codebase's
       "throw on unsupported variant" precedent, e.g. ONNX's Gemm-with-transpose). New
       `src/gpu/gpu_backend.{hpp,cpp}` implements `Backend`: `createTensor`/`writeTensor`/
       `readTensor` via `Buffer::upload()`/`download()`; `compileGraph()` builds one
@@ -594,11 +596,141 @@ vendor). Two real strategies exist:
     machine. **DirectX12:** `.hlsl` sources written against real D3D12/HLSL semantics but entirely
     unverified — no Windows toolchain available — same documented-but-unverified treatment already
     accepted for the DirectML backend.
-- [ ] Full op coverage (the other ~20 `OpKind`s) — this round was deliberately a 3-op vertical
-      slice to prove the pipeline (buffers/shaders/bind groups/dispatch/hazard-tracking) end to end
-      before scaling up
-- [ ] `add`'s broadcast case and `matmul`'s batched case — both throw today, same "vertical slice"
-      scoping as above
+- [x] **Coverage expanded from the 3-op vertical slice to 9 `OpKind`s: `mul` (exact-shape),
+      `sigmoid`, `gelu`, `layerNorm`, `rmsNorm`** (plus the original `Relu`/`Add`/`MatMul`/
+      `Input`/`Constant`). New `src/gpu/shaders/{mul,sigmoid,gelu,layernorm,rmsnorm}.{comp,metal,
+      hlsl}`, embedded the same `*_metallib.hpp`/`*_spv.hpp` generated-header way as the original
+      three. **`mul`/`sigmoid`/`gelu`** reuse the existing one-workgroup-per-element dispatch model
+      exactly (`ParamsElementwise{count}` at the last binding) — no new dispatch shape needed.
+      **`layerNorm`/`rmsNorm`** needed a new dispatch model instead, since both reduce over the
+      whole last dimension before producing any output: one workgroup per output *row*
+      (`dispatchX = outerTotal = numElements(shape) / lastDim`), with the single active thread
+      (still `local_size_x=1`/thread-0-gated, same correctness-over-utilization tradeoff as the
+      original three shaders) looping over `lastDim` internally — mean/variance first pass, then a
+      second pass writing the normalized row (`layernorm.comp`/`rmsnorm.comp`); formulas verified to
+      match `src/cpu/ops.cpp`'s `evalLayerNorm`/`evalRmsNorm` exactly. New shared `ParamsNorm{lastDim,
+      eps, pad1, pad2}` uniform struct (`gpu_backend.cpp`) — mixed `uint32_t`/`float` is fine at this
+      size since a flat sequence of 4-byte scalars packs identically under GLSL std140, HLSL
+      cbuffer, and MSL constant-struct rules (no vec2/vec3 alignment surprises to worry about).
+      `eps`/`lastDim` come from `Node::floatAttr0`/`shape.back()` already on the IR node — no new
+      `Node` fields needed. **`gelu`'s `erf`:** neither GLSL nor Metal's `metal_stdlib` has a
+      built-in `erf()` (checked the real installed Metal toolchain headers directly, not assumed) —
+      `gelu.comp`/`gelu.metal`/`gelu.hlsl` all use the identical Abramowitz & Stegun 7.1.26
+      polynomial approximation (max absolute error ~1.5e-7) for cross-backend consistency; not
+      bit-exact with libm's `erff()`/xsimd's `erf()` (the CPU backend's own two, already-disagreeing
+      approximations), hence the new tests' `EXPECT_NEAR` rather than `EXPECT_FLOAT_EQ`. Five new
+      `GpuGenericOps` tests (`MulExactShape`/`Sigmoid`/`Gelu`/`LayerNorm`/`RmsNorm`) plus a sixth,
+      `ChainedGeluThenAdd`, added specifically to re-confirm the hazard-tracking question (see the
+      bugs writeup above) holds for a row-reduction op feeding an elementwise one, not just the
+      original `Relu`→`Add` elementwise-into-elementwise case — **verified, full suite now 83 tests
+      (73 prior + 10 new — `ChainedReluThenAdd` already existed) passing on this Metal-capable
+      machine.** Vulkan/DirectX12 status unchanged from the original three ops: GLSL compiles via
+      `glslangValidator`, `.hlsl` is written but unverified, neither executed on real hardware here.
+- [x] **Shape/data-movement ops added: `Reshape`, `Transpose`, `Slice`, `Concat`, `Gather`** (14
+      `OpKind`s total now). Chosen as the next batch over vision/transformer ops specifically
+      because they're prerequisites for any real *imported* (ONNX/TFLite) graph to run end-to-end
+      on `GpuGeneric` at all — those import paths emit `Reshape`/`Transpose` routinely (NCHW/NHWC
+      boundary conversion, `Conv` bias reshaping, etc.) even for graphs that are otherwise pure
+      elementwise/matmul. **`Reshape`** is a zero-cost alias, no shader at all — same precedent as
+      the DirectML backend's `resolveBuffer()`: `compileGraph()` allocates nothing for it, and
+      `dispatch()` resolves it by pointing `resolved[i]` straight at its source node's already-
+      resolved buffer (no recursion needed here, unlike DirectML's lazy `resolveBuffer()`, since
+      this backend's `resolved[]` array is filled in IR dependency order — a `Reshape`'s source is
+      always already resolved by the time the loop reaches it). **`Transpose`/`Slice`** needed a
+      genuinely new, generic per-dim remap (arbitrary permutation/multi-axis slicing don't collapse
+      to a simple loop shape the way the previous round's ops did): new `ParamsTranspose`/
+      `ParamsSlice` structs in `gpu_backend.cpp` carry a precomputed row-major `divisor` (to decode
+      a flat index into a per-dim index via repeated div/mod) and a `gatherStride`/`multiplier`
+      (the corresponding offset into the source buffer) for each of up to `kMaxRank=8` dimensions —
+      capped and throwing past that rather than guessing, same precedent as everywhere else in this
+      codebase. **Deliberately flat named scalar fields (`divisor0`..`divisor7`, etc.), not real
+      GLSL/HLSL arrays:** GLSL std140 and HLSL cbuffers both pad every array element inside a
+      uniform block up to 16 bytes, but Metal's `constant` address-space structs use natural 4-byte
+      packing for arrays instead — a real array would need a different byte layout per backend to
+      stay byte-compatible with one shared C++ host struct. Flat scalar fields side-step the
+      question entirely (confirmed already safe by `ParamsNorm`/`ParamsElementwise`'s existing
+      scalar-only fields; this just has more of them) — each shader copies the named fields into a
+      local array once at the top of `main()`/`computeMain()` for normal indexed-loop access.
+      **`Concat`** is the one op this round that didn't fit the existing "one `OpResources` +
+      one dispatch per node" model at all — unlike every other `OpKind`, its real input count
+      varies per call site, but `OpResources`/`BindGroupLayout` are built once per `OpKind` and
+      reused, assuming fixed arity. Solved by *not* trying to give it a variable-arity bind group:
+      `compileGraph()` instead emits one `ConcatPiece` per input (own `axisOffset`-bearing params
+      buffer, dispatch count = that input's own element count) that all dispatch against the
+      *same* 1-input `OpResources` (`Concat`'s `numInputsFor() == 1`) and the same shared output
+      buffer — `dispatch()` special-cases `OpKind::Concat` to loop over those pieces with N
+      `setBindGroup`+`dispatchWorkgroups` calls instead of one. The per-piece math itself collapses
+      to a 3-scalar outer/axis/inner split (`ParamsConcat`), not a full per-dim remap, since within
+      one input's copy no other dimension changes size or order — same decomposition
+      `evalConcat`/`evalGather` in `src/cpu/ops.cpp` are already logically equivalent to.
+      **`Gather`** reuses that same outer/axisSize/innerSize split (`ParamsGather`) and fits the
+      existing fixed-2-input dispatch model untouched; `indices` (Int32 or Uint32 per "Dtype
+      Support" above) is bound as a raw `uint` storage buffer in the shader regardless of which —
+      bit-identical for the non-negative indices this op (and the CPU backend, which never
+      range-checks for negative values either) actually supports. `Concat`/`Gather`'s axis is read
+      directly from `node.axis` with no negative-axis normalization needed in this backend, since
+      `GraphBuilder::concat()`/`GraphBuilder::gather()` (`graph_builder.cpp`) already resolve it to
+      a non-negative index before the node ever reaches a backend. New
+      `src/gpu/shaders/{transpose,slice,concat,gather}.{comp,metal,hlsl}`, compiled/embedded the
+      same way as every previous round (`glslangValidator`/`xcrun metal`+`metallib`, byte arrays in
+      generated `*_spv.hpp`/`*_metallib.hpp` headers). **Verified:** 6 new `GpuGenericOps` tests
+      (`ReshapeThenAdd` — chained specifically to confirm alias resolution, not just compiling;
+      `TransposeRank3` — a true 3-axis permutation, not just a rank-2 swap; `Slice2D` — slices two
+      dimensions at once, not just one axis on a rank-1 tensor; `ConcatThreeInputs` — exercises the
+      `concatPieces` loop past the trivial 2-piece case; `Gather`/`GatherUint32Indices`), full suite
+      now 89 tests (83 prior + 6 new) passing on this Metal-capable machine. Vulkan/DirectX12
+      status unchanged: GLSL compiles via `glslangValidator`, `.hlsl` is written but unverified,
+      neither executed on real hardware here.
+- [x] **`Softmax` and `Gemm` added** (16 `OpKind`s total now) — completes the original
+      transformer-block op set on `GpuGeneric` (everything else it needs — `Add`/`Mul`/`Gelu`/
+      `LayerNorm`/`RmsNorm`/`MatMul`/`Reshape`/`Transpose`/`Slice`/`Concat`/`Gather` — was already
+      implemented by the two previous rounds). **`Gemm`** is a direct extension of the existing
+      `matmul.comp`'s one-workgroup-per-(m,n)-output-element model: same naive K-loop, plus
+      `alpha`/`beta`/bias-`C` folded into the same dispatch (`out = alpha*(A@B) + beta*C`, `C`
+      broadcasting by its own element count — `cElems==1`/`==n`/`==m*n`, exactly mirroring the CPU
+      backend's `evalGemmImpl` in `src/cpu/simd_kernels.hpp`) rather than composing three separate
+      dispatches (matmul, then scale, then broadcast-add) the way the MPSGraph backend composes it
+      from primitive graph ops — one fused kernel was simpler here since this backend has no
+      graph-level op fusion to lean on anyway. `GraphBuilder::gemm()` (`graph_builder.cpp`) already
+      rejects anything but rank-2 `a`/`b` with no transA/transB, so nothing further to validate in
+      `compileGraph()`. **`Softmax`** needed a genuinely new dispatch shape: one workgroup per
+      output *row* like `layernorm.comp`/`rmsnorm.comp`, but unlike those two — whose reduction
+      axis is always the tensor's last dimension — softmax's axis can be *any* dimension
+      (`GraphBuilder::softmax()` accepts and resolves a negative axis to any non-negative index, no
+      "must be last" restriction). Reused `transpose.comp`/`slice.comp`'s generic per-dim-decode
+      machinery (flat named `divisor`/`origStride` scalar fields, capped at `kMaxRank=8`, same
+      reasoning as those two for why not real arrays) to unravel a row index into the per-dim
+      offset of every dimension *except* the axis being reduced over, then runs the same
+      numerically-stable three-pass body (max, exp+sum, normalize) as the CPU backend's
+      `evalSoftmax`. **Verified:** 4 new `GpuGenericOps` tests (`Gemm`/`GemmBroadcastCRow` —
+      the latter specifically exercising the `cElems==n` branch the former's full-`[M,N]` `C`
+      doesn't touch; `SoftmaxLastAxis`/`SoftmaxNonLastAxis` — the latter softmaxing over axis 0 of
+      a rank-3 tensor specifically to exercise the generic outer-decode, since a last-axis-only
+      test can't catch a bug in skipping a non-last dimension), full suite now 93 tests (89 prior +
+      4 new) passing on this Metal-capable machine. Vulkan/DirectX12 status unchanged: GLSL
+      compiles via `glslangValidator`, `.hlsl` is written but unverified, neither executed on real
+      hardware here.
+- [x] Vision/normalization ops on `GpuGeneric`: `Conv2d`, `MaxPool2d`, `AvgPool2d`, `Resize`,
+      `BatchNorm`, `InstanceNorm` — shader sources already existed; generated embedded SPIR-V/
+      Metal byte arrays and wired them into `gpu_backend.cpp`; parity tests pass on Metal.
+- [x] Quantization ops on `GpuGeneric`: `QuantizeLinear`, `DequantizeLinear` — added GLSL/Metal
+      byte-addressed shaders (HLSL written but unverified, same status as the rest of the DirectX
+      path), wired into `gpu_backend.cpp`, and verified with round-trip and `QuantizedMatmul` tests
+      on Metal.
+- [x] **`add`/`mul` broadcasting and batched `matmul` on `GpuGeneric`.** New
+      `src/gpu/shaders/broadcast_binary.{comp,metal,hlsl}` implements NumPy/ONNX-style broadcasting
+      for `add` and `mul` (shapes aligned from the right, size-1 dims broadcast) via a single shared
+      kernel parameterized by rank/output shape and the two operands' strides; `matmul` now accepts
+      matching batch dimensions and dispatches `batchCount` as `dispatchZ`. Tests:
+      `GpuGenericOps.AddBroadcast`/`MulBroadcast`/`MatMulBatched` pass on Metal.
+- [x] **End-to-end real-model test on `GpuGeneric`.** `tests/platform/test_gpu_generic_models.cpp`
+      imports YuNet (`yunet_n_320_320.onnx`) and runs the same face-vs-no-face confidence check as
+      the CPU/MPSGraph model tests, using `campello_image` to decode/resize the real fixtures. Passes
+      on Metal. Required a fix for zero-byte ONNX initializers: `GpuBackend::compileGraph()`'s
+      `Constant` node path now uses the no-initial-data `createBuffer(size, usage)` overload when
+      `size == 0` instead of the data-carrying overload, avoiding a `memcpy` from `nullptr` inside
+      `campello_gpu::Buffer::upload()`.
+- [ ] The actual benchmark this backend was built for: CPU vs. `GpuGeneric` vs. native `Gpu`
 - [ ] The actual benchmark this backend was built for: CPU vs. `GpuGeneric` vs. native `Gpu`
       (MPSGraph/DirectML) on the same machine, once op coverage is broad enough to run a real
       shared graph across all three — not meaningful yet with only 3 ops implemented

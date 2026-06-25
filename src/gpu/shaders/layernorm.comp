@@ -1,0 +1,40 @@
+#version 450
+
+// Vulkan (GLSL). New dispatch model vs. the elementwise ops: one workgroup
+// per output *row* (dispatchX = outerTotal, the number of rows), not per
+// element — the single active thread (still local_size_x=1, genuinely one
+// thread per group on this backend) loops over lastDim internally: first
+// pass computes mean/variance, second pass writes the normalized row.
+// Formula matches src/cpu/ops.cpp's evalLayerNorm exactly. No bounds check on
+// `row` needed (unlike matmul.comp's defensive one) — dispatchX is always set
+// to exactly outerTotal in gpu_backend.cpp, no over-dispatch possible here.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer ScaleBuf { float data[]; } scaleBuf;
+layout(std430, binding = 2) readonly buffer BiasBuf { float data[]; } biasBuf;
+layout(std430, binding = 3) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 4) uniform Params { uint lastDim; float eps; uint pad1; uint pad2; } params;
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    uint base = row * params.lastDim;
+
+    float mean = 0.0;
+    for (uint k = 0u; k < params.lastDim; k++)
+        mean += xBuf.data[base + k];
+    mean /= float(params.lastDim);
+
+    float var = 0.0;
+    for (uint k = 0u; k < params.lastDim; k++)
+    {
+        float d = xBuf.data[base + k] - mean;
+        var += d * d;
+    }
+    var /= float(params.lastDim);
+    float invStd = 1.0 / sqrt(var + params.eps);
+
+    for (uint k = 0u; k < params.lastDim; k++)
+        outputBuf.data[base + k] = (xBuf.data[base + k] - mean) * invStd * scaleBuf.data[k] + biasBuf.data[k];
+}

@@ -1,0 +1,62 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per output *row* (dispatchX = outerTotal, the
+// element count of `x`'s shape with the softmax axis removed) — same
+// row-per-workgroup model as layernorm.comp/rmsnorm.comp, but unlike those
+// two, softmax's reduction axis isn't necessarily the *last* dimension, so
+// computing a row's flat base offset needs the same generic per-dim decode
+// transpose.comp/slice.comp use (see transpose.comp's comment for why
+// Params uses flat named fields instead of real arrays): `divisor[d]` is
+// the row-major stride of the *outer* shape (x's shape with the axis
+// dimension removed) used to unravel the workgroup's row index, and
+// `origStride[d]` is the corresponding original stride (from x's own full
+// shape) for that same dimension, skipping over the axis dimension
+// entirely. Three-pass body (max, exp+sum, normalize) matches the CPU
+// backend's evalSoftmax (src/cpu/ops.cpp) exactly, including the
+// numerically-stable max-subtraction.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params
+{
+    uint outerRank, axisSize, axisStride, outerTotal;
+    uint divisor0, divisor1, divisor2, divisor3, divisor4, divisor5, divisor6, divisor7;
+    uint origStride0, origStride1, origStride2, origStride3, origStride4, origStride5, origStride6, origStride7;
+} params;
+
+void main()
+{
+    uint outerIdx = gl_WorkGroupID.x;
+    if (outerIdx >= params.outerTotal)
+        return;
+
+    uint divisor[8] = uint[8](params.divisor0, params.divisor1, params.divisor2, params.divisor3,
+                               params.divisor4, params.divisor5, params.divisor6, params.divisor7);
+    uint origStride[8] = uint[8](params.origStride0, params.origStride1, params.origStride2, params.origStride3,
+                                  params.origStride4, params.origStride5, params.origStride6, params.origStride7);
+
+    uint remaining = outerIdx;
+    uint base = 0u;
+    for (uint d = 0u; d < params.outerRank; d++)
+    {
+        uint idx = remaining / divisor[d];
+        remaining -= idx * divisor[d];
+        base += idx * origStride[d];
+    }
+
+    float maxV = inputBuf.data[base];
+    for (uint k = 1u; k < params.axisSize; k++)
+        maxV = max(maxV, inputBuf.data[base + k * params.axisStride]);
+
+    float sum = 0.0;
+    for (uint k = 0u; k < params.axisSize; k++)
+    {
+        float e = exp(inputBuf.data[base + k * params.axisStride] - maxV);
+        outputBuf.data[base + k * params.axisStride] = e;
+        sum += e;
+    }
+
+    for (uint k = 0u; k < params.axisSize; k++)
+        outputBuf.data[base + k * params.axisStride] /= sum;
+}

@@ -1,0 +1,37 @@
+#version 450
+
+// Vulkan (GLSL). Same rank-2/unbatched/naive-K-loop scope and
+// one-workgroup-per-(m,n)-output-element model as matmul.comp, extended
+// with `alpha`/`beta`/bias-`C` exactly like the CPU backend's evalGemmImpl
+// (src/cpu/simd_kernels.hpp): `out = alpha * (A @ B) + beta * C`, with `C`
+// broadcasting per its own element count — `cElems == 1` (scalar), `==n`
+// (one row, broadcast over m), or the full `m*n` (no broadcast). No
+// transA/transB (GraphBuilder::gemm() never accepts them — see CLAUDE.md;
+// a caller wanting that composes an explicit transpose() first).
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
+layout(std430, binding = 2) readonly buffer CBuf { float data[]; } cBuf;
+layout(std430, binding = 3) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 4) uniform Params
+{
+    uint m, k, n, cElems;
+    float alpha, beta;
+    uint pad0, pad1;
+} params;
+
+void main()
+{
+    uint n = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    if (m >= params.m || n >= params.n)
+        return;
+    float sum = 0.0;
+    for (uint i = 0u; i < params.k; i++)
+        sum += aBuf.data[m * params.k + i] * bBuf.data[i * params.n + n];
+    float cv = params.cElems == 1u ? cBuf.data[0]
+               : params.cElems == params.n ? cBuf.data[n]
+                                            : cBuf.data[m * params.n + n];
+    outputBuf.data[m * params.n + n] = params.alpha * sum + params.beta * cv;
+}

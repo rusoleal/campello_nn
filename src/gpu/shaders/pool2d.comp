@@ -1,0 +1,54 @@
+#version 450
+
+// Vulkan (GLSL). Shared by both OpKind::MaxPool2d and OpKind::AvgPool2d —
+// same precedent as the CPU backend's evalPool2d (src/cpu/ops.cpp), which
+// is one function taking an `isMax` bool rather than two near-duplicates.
+// gpu_backend.cpp loads this same compiled shader for both OpKinds (see
+// shaderBytesFor()) and just sets `params.isMax` differently; they still
+// get their own cached OpResources/pipeline objects (keyed by OpKind), so
+// no behavior is shared at the pipeline-object level, only the shader
+// bytes. One workgroup per output element (ow, oh, n*C+c) — dispatchX=outW,
+// dispatchY=outH, dispatchZ=N*C — same per-element model and signed
+// coordinate math as conv2d.comp (no dilation or groups here, pooling has
+// neither).
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params
+{
+    uint H, W, outH, outW;
+    uint kernelHeight, kernelWidth, strideX, strideY, paddingLeft, paddingTop;
+    uint isMax;
+} params;
+
+void main()
+{
+    uint ow = gl_WorkGroupID.x;
+    uint oh = gl_WorkGroupID.y;
+    uint nc = gl_WorkGroupID.z;
+
+    // No portable GLSL infinity literal — `1.0/0.0` is undefined for
+    // compile-time constant folding per spec, so build -infinity from its
+    // IEEE-754 bit pattern instead (same trick used in pool2d.hlsl, which
+    // has the same problem; Metal's metal_stdlib does provide `-INFINITY`).
+    float acc = params.isMax != 0u ? uintBitsToFloat(0xFF800000u) : 0.0;
+    int count = 0;
+    for (uint kh = 0u; kh < params.kernelHeight; kh++)
+    {
+        int ih = int(oh * params.strideY) - int(params.paddingTop) + int(kh);
+        if (ih < 0 || ih >= int(params.H))
+            continue;
+        for (uint kw = 0u; kw < params.kernelWidth; kw++)
+        {
+            int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw);
+            if (iw < 0 || iw >= int(params.W))
+                continue;
+            float v = inputBuf.data[nc * params.H * params.W + uint(ih) * params.W + uint(iw)];
+            acc = params.isMax != 0u ? max(acc, v) : acc + v;
+            count++;
+        }
+    }
+    outputBuf.data[(nc * params.outH + oh) * params.outW + ow] =
+        params.isMax != 0u ? acc : (count > 0 ? acc / float(count) : 0.0);
+}

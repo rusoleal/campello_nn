@@ -105,15 +105,25 @@ endif()
 option(BUILD_GPU_GENERIC_TESTS "Build DeviceType::GpuGeneric (campello_gpu-based) backend tests" OFF)
 
 if(BUILD_GPU_GENERIC_TESTS)
-    add_executable(campello_nn_gpu_generic_tests
-        platform/test_gpu_generic_ops.cpp
-    )
+    set(GPU_GENERIC_TEST_SOURCES platform/test_gpu_generic_ops.cpp)
+    set(GPU_GENERIC_TEST_LIBS campello_nn GTest::gtest_main)
+
+    # Real-model end-to-end tests need campello_image (same dependency as
+    # BUILD_MODEL_TESTS). Share the already-fetched target when available.
+    if(BUILD_MODEL_TESTS)
+        list(APPEND GPU_GENERIC_TEST_SOURCES platform/test_gpu_generic_models.cpp)
+        list(APPEND GPU_GENERIC_TEST_LIBS campello_image)
+    endif()
+
+    add_executable(campello_nn_gpu_generic_tests ${GPU_GENERIC_TEST_SOURCES})
     target_include_directories(campello_nn_gpu_generic_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/inc
     )
+    target_compile_definitions(campello_nn_gpu_generic_tests PRIVATE
+        CAMPELLO_NN_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+    )
     target_link_libraries(campello_nn_gpu_generic_tests
-        campello_nn
-        GTest::gtest_main
+        ${GPU_GENERIC_TEST_LIBS}
     )
     set_target_properties(campello_nn_gpu_generic_tests PROPERTIES
         CXX_STANDARD 20

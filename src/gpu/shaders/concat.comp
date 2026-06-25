@@ -1,0 +1,42 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per *input* element (not per output element —
+// gpu_backend.cpp dispatches this kernel once per concat input, each
+// dispatch copying that one input's whole contents into its axis-offset
+// slice of the shared output buffer; see that file's CompiledNode::
+// concatPieces). This collapses the general per-dim remap transpose.comp/
+// slice.comp need down to a 3-scalar outer/axis/inner split, the same
+// decomposition the CPU backend's evalConcat is logically equivalent to:
+// every dim before the concat axis collapses into `outer`, every dim after
+// it into `inner`, since within a single input's copy nothing reorders or
+// resizes any other dimension. `axisSizeIn` is this input's own size along
+// the concat axis (its dispatch domain); `axisSizeOut` is the *output*'s
+// (larger) size along that axis, needed to compute the right stride into
+// the output; `axisOffset` is how far along the axis this particular input
+// starts writing.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params
+{
+    uint count;
+    uint axisSizeIn;
+    uint axisSizeOut;
+    uint innerSize;
+    uint axisOffset;
+    uint pad0, pad1, pad2;
+} params;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x;
+    if (idx >= params.count)
+        return;
+    uint inner = idx % params.innerSize;
+    uint t = idx / params.innerSize;
+    uint axisIdx = t % params.axisSizeIn;
+    uint outer = t / params.axisSizeIn;
+    uint dst = (outer * params.axisSizeOut + (axisIdx + params.axisOffset)) * params.innerSize + inner;
+    outputBuf.data[dst] = inputBuf.data[idx];
+}

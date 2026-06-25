@@ -1,0 +1,43 @@
+#version 450
+
+// Vulkan (GLSL). One workgroup per (n,c) plane (dispatchX = N*C), same
+// row-per-workgroup two-pass model as layernorm.comp/rmsnorm.comp, but the
+// "row" here is one spatial plane (H*W elements) and the per-row affine
+// scale/bias are indexed by *channel* (`c = row % C`), not by within-row
+// position — unlike layerNorm, where scale/bias have one entry per
+// within-row element. Mean/variance are computed from `x` itself (unlike
+// batchNorm's given running stats) — matches the CPU backend's
+// evalInstanceNormImpl (src/cpu/simd_kernels.hpp) exactly.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer ScaleBuf { float data[]; } scaleBuf;
+layout(std430, binding = 2) readonly buffer BiasBuf { float data[]; } biasBuf;
+layout(std430, binding = 3) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 4) uniform Params { uint spatial; uint C; float eps; uint pad0; } params;
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    uint c = row % params.C;
+    uint base = row * params.spatial;
+
+    float mean = 0.0;
+    for (uint k = 0u; k < params.spatial; k++)
+        mean += xBuf.data[base + k];
+    mean /= float(params.spatial);
+
+    float var = 0.0;
+    for (uint k = 0u; k < params.spatial; k++)
+    {
+        float d = xBuf.data[base + k] - mean;
+        var += d * d;
+    }
+    var /= float(params.spatial);
+    float invStd = 1.0 / sqrt(var + params.eps);
+
+    float s = scaleBuf.data[c];
+    float b = biasBuf.data[c];
+    for (uint k = 0u; k < params.spatial; k++)
+        outputBuf.data[base + k] = (xBuf.data[base + k] - mean) * invStd * s + b;
+}
