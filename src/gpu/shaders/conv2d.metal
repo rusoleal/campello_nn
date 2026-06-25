@@ -1,15 +1,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Metal. Same NCHW/grouped/dilated model as conv2d.comp — see that file's
-// comment. Thread-0 gate for the same reason as relu.metal (campello_gpu's
-// Metal dispatchWorkgroups() always uses the pipeline's
-// threadExecutionWidth() as the per-group thread count, not what this
-// shader declares).
+// Metal. Same NCHW/grouped/dilated model as conv2d.comp. 1D output tiling:
+// each workgroup computes TILE_WIDTH consecutive flattened output elements.
+// campello_gpu's Metal dispatch uses the pipeline's threadExecutionWidth as
+// the threadgroup size, so we gate to the first TILE_WIDTH threads.
+#define TILE_WIDTH 8
 
 struct Params
 {
-    uint O, C, H, W, Cg, KH, KW, outH, outW;
+    uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
 };
@@ -21,11 +21,19 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
 {
-    if (localId.x != 0)
+    if (localId.x >= TILE_WIDTH)
         return;
-    uint ow = groupId.x;
-    uint oh = groupId.y;
-    uint no = groupId.z;
+
+    uint totalOut = params.outH * params.outW;
+    uint totalOutputs = params.N * params.O * totalOut;
+    uint flatIdx = groupId.x * TILE_WIDTH + localId.x;
+    if (flatIdx >= totalOutputs)
+        return;
+
+    uint no = flatIdx / totalOut;
+    uint spatial = flatIdx % totalOut;
+    uint oh = spatial / params.outW;
+    uint ow = spatial % params.outW;
     uint n = no / params.O;
     uint o = no % params.O;
     uint group = o / params.outPerGroup;

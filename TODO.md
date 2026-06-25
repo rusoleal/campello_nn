@@ -744,6 +744,10 @@ vendor). Two real strategies exist:
       improved the transformer-block benchmark latency on macOS/Metal from ~3.7 ms to ~2.2 ms
       (~1.7×). YuNet latency was unchanged because that model is dominated by `conv2d`, not
       `matmul`; conv2d tiling is the next optimization to chase.
+- [x] **Second `GpuGeneric` performance optimization: 1D output-tiled conv2d.** Each workgroup
+      now computes 8 consecutive flattened output elements (n, o, oh, ow) instead of 1. This
+      dropped YuNet benchmark latency on macOS/Metal from ~3.4 s to ~0.86 s (~3.9×), making
+      `GpuGeneric` only ~1.1× slower than the CPU backend on that model (vs. ~4.4× before).
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above

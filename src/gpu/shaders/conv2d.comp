@@ -2,37 +2,37 @@
 
 // Vulkan (GLSL). NCHW input, OIHW (well, O/groups-per-output, "OCgKHKW")
 // weights, explicit padding/stride/dilation/groups — matches the CPU
-// backend's evalConv2d (src/cpu/ops.cpp) exactly, including that conv2d
-// itself carries no bias (bias is fused into a separate add() at import
-// time — see CLAUDE.md's ONNX-import notes). One workgroup per output
-// element (ow, oh, n*O+o) — dispatchX=outW, dispatchY=outH,
-// dispatchZ=N*O — with the single active thread doing the full
-// Cg*KH*KW accumulation itself, same naive/no-tiling model as the CPU
-// reference kernel (this round proves correctness, not speed, same as
-// every other op here). Coordinate math (`ih`/`iw`) is done in *signed*
-// integers — padding makes early output positions read from a
-// before-the-start input coordinate, which must underflow to negative,
-// not wrap around as an unsigned value.
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// backend's evalConv2d (src/cpu/ops.cpp) exactly.
+//
+// 1D output tiling: each workgroup computes TILE_WIDTH consecutive flattened
+// output elements (n, o, oh, ow), improving per-workgroup parallelism and
+// memory locality. The dispatch is 1D with bounds checks.
+#define TILE_WIDTH 8
+
+layout(local_size_x = TILE_WIDTH, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
 layout(std430, binding = 1) readonly buffer WBuf { float data[]; } wBuf;
 layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
 layout(binding = 3) uniform Params
 {
-    uint O, C, H, W, Cg, KH, KW, outH, outW;
+    uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
 } params;
 
 void main()
 {
-    // No bounds check needed — dispatchX/Y/Z are set to exactly
-    // outW/outH/(N*O) in gpu_backend.cpp, so no over-dispatch is possible
-    // here, same reasoning as layernorm.comp's row dispatch.
-    uint ow = gl_WorkGroupID.x;
-    uint oh = gl_WorkGroupID.y;
-    uint no = gl_WorkGroupID.z;
+    uint totalOut = params.outH * params.outW;
+    uint totalOutputs = params.N * params.O * totalOut;
+    uint flatIdx = gl_WorkGroupID.x * TILE_WIDTH + gl_LocalInvocationID.x;
+    if (flatIdx >= totalOutputs)
+        return;
+
+    uint no = flatIdx / totalOut;
+    uint spatial = flatIdx % totalOut;
+    uint oh = spatial / params.outW;
+    uint ow = spatial % params.outW;
     uint n = no / params.O;
     uint o = no % params.O;
     uint group = o / params.outPerGroup;

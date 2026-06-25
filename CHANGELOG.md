@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `GpuGeneric` matmul now uses 1D column tiling (8 columns per workgroup), improving the
-  transformer-block benchmark latency on macOS/Metal by ~1.7×. Conv2d remains the next
-  dominant bottleneck for vision models like YuNet.
+  transformer-block benchmark latency on macOS/Metal by ~1.7×.
+- `GpuGeneric` conv2d now uses 1D output tiling (8 flattened output elements per workgroup),
+  improving the YuNet benchmark latency on macOS/Metal by ~3.9×.
 
 ---
 

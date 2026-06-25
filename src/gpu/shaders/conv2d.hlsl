@@ -1,9 +1,10 @@
-// DirectX (HLSL). Written but unverified — see relu.hlsl's comment. Same
-// NCHW/grouped/dilated model as conv2d.comp.
+// DirectX (HLSL). Written but unverified — see relu.hlsl's comment.
+// NCHW/grouped/dilated conv2d with 1D output tiling. See conv2d.comp.
+#define TILE_WIDTH 8
 
 struct Params
 {
-    uint O, C, H, W, Cg, KH, KW, outH, outW;
+    uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
 };
@@ -13,12 +14,19 @@ StructuredBuffer<float> wBuf : register(t1);
 RWStructuredBuffer<float> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
-[numthreads(1, 1, 1)]
-void computeMain(uint3 groupId : SV_GroupID)
+[numthreads(TILE_WIDTH, 1, 1)]
+void computeMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID)
 {
-    uint ow = groupId.x;
-    uint oh = groupId.y;
-    uint no = groupId.z;
+    uint totalOut = params.outH * params.outW;
+    uint totalOutputs = params.N * params.O * totalOut;
+    uint flatIdx = groupId.x * TILE_WIDTH + localId.x;
+    if (flatIdx >= totalOutputs)
+        return;
+
+    uint no = flatIdx / totalOut;
+    uint spatial = flatIdx % totalOut;
+    uint oh = spatial / params.outW;
+    uint ow = spatial % params.outW;
     uint n = no / params.O;
     uint o = no % params.O;
     uint group = o / params.outPerGroup;

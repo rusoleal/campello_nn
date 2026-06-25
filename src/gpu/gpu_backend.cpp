@@ -242,7 +242,7 @@ namespace
     // Matches conv2d.comp's Params block field-for-field.
     struct ParamsConv
     {
-        uint32_t O, C, H, W, Cg, KH, KW, outH, outW;
+        uint32_t N, O, C, H, W, Cg, KH, KW, outH, outW;
         uint32_t strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
         uint32_t inPerGroup, outPerGroup;
     };
@@ -1158,7 +1158,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d output) failed");
-            ParamsConv params{O, C, H, W, Cg, KH, KW, outH, outW,
+            ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
                               (uint32_t)p.strideX, (uint32_t)p.strideY,
                               (uint32_t)p.dilationX, (uint32_t)p.dilationY,
                               (uint32_t)p.paddingLeft, (uint32_t)p.paddingTop,
@@ -1166,9 +1166,11 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.paramsBuffer = impl->device->createBuffer(sizeof(params), cgpu::BufferUsage::uniform, &params);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d params) failed");
-            cn.dispatchX = outW;
-            cn.dispatchY = outH;
-            cn.dispatchZ = (uint64_t)N * O;
+            constexpr uint32_t kConvTileWidth = 8;
+            uint64_t totalOutputs = (uint64_t)N * O * outH * outW;
+            cn.dispatchX = (totalOutputs + kConvTileWidth - 1) / kConvTileWidth;
+            cn.dispatchY = 1;
+            cn.dispatchZ = 1;
             continue;
         }
 
