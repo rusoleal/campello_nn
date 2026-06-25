@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/platform/test_gpu_generic_models.cpp`: end-to-end YuNet face-detection test running on the
   generic `campello_gpu` backend (`DeviceType::GpuGeneric`), mirroring the existing CPU/MPSGraph
   model tests.
+- `benchmarks/benchmark_backends.cpp` and `BUILD_BENCHMARKS` CMake option: compares latency of
+  `Cpu`, `GpuGeneric`, and native `Gpu` backends on the same transformer-block graph, reporting
+  min/median/mean/max and max absolute difference against the CPU reference.
 
 ---
 

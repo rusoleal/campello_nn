@@ -267,3 +267,12 @@ option(BUILD_EXAMPLES "Build example applications" OFF)
 if(BUILD_EXAMPLES)
     add_subdirectory(examples/cpu)
 endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+option(BUILD_BENCHMARKS "Build backend benchmark applications" OFF)
+
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()

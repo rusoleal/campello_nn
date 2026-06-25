@@ -730,10 +730,14 @@ vendor). Two real strategies exist:
       `Constant` node path now uses the no-initial-data `createBuffer(size, usage)` overload when
       `size == 0` instead of the data-carrying overload, avoiding a `memcpy` from `nullptr` inside
       `campello_gpu::Buffer::upload()`.
-- [ ] The actual benchmark this backend was built for: CPU vs. `GpuGeneric` vs. native `Gpu`
-- [ ] The actual benchmark this backend was built for: CPU vs. `GpuGeneric` vs. native `Gpu`
-      (MPSGraph/DirectML) on the same machine, once op coverage is broad enough to run a real
-      shared graph across all three — not meaningful yet with only 3 ops implemented
+- [x] **Backend latency benchmark.** Added `benchmarks/benchmark_backends.cpp` and a
+      `BUILD_BENCHMARKS` CMake option. It runs a synthetic transformer-block graph
+      (`matmul → add → gelu → layerNorm`) on every available backend and reports
+      min/median/mean/max latency plus max absolute difference vs. the CPU reference.
+      Verified on macOS/Metal: CPU and MPSGraph are both faster than the current naive
+      `GpuGeneric` implementation across the tested 1×512/1×1024/1×2048/1×4096 and batched
+      16–64×1024 shapes, confirming the benchmark is useful for tracking future
+      `GpuGeneric` performance work.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above
@@ -1096,7 +1100,9 @@ to own. Revisit if/when a concrete weight-only vision model needs it.
 
 - [ ] Cross-backend conformance suite: same graph, same inputs, run on every available backend on
       a given platform, assert outputs agree within per-dtype tolerance
-- [ ] Performance benchmarks: prefill throughput, decode tokens/sec, per-op latency, per backend
+- [x] Performance benchmarks: per-op/per-graph latency per backend — initial harness in
+      `benchmarks/benchmark_backends.cpp` (transformer block on `Cpu`/`GpuGeneric`/`Gpu`).
+      Prefill/decode token/sec and LLM-specific benchmarks deferred to `campello_llm` (Phase 5).
 - [ ] Example: minimal `campello_nn` program building/running a hand-written graph (no LLM)
 - [ ] Example: import and run a real ONNX vision model end-to-end (the face-detection test from
       Phase 4a is a natural candidate to promote here)
