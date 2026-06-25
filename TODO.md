@@ -544,41 +544,51 @@ vendor). Two real strategies exist:
       use `local_size_x=1`/`[numthreads(1,1,1)]` so they genuinely have one thread per group and
       don't need the gate. New `DeviceType::GpuGeneric` wired into `Context::create()`
       (`src/pi/context.cpp`) ahead of the existing per-platform branches, on every platform.
-  - **Two real bugs found in `campello_gpu` itself while verifying end-to-end on Metal** (not
-    assumed — found by writing a minimal standalone reproduction against `campello_gpu` directly,
-    bypassing this backend entirely, after every `GpuGenericOps` test initially read back all-zero
-    output despite no errors anywhere, including with `MTL_DEBUG_LAYER=1`/`MTL_SHADER_VALIDATION=1`
-    enabled):
-    1. **The actual cause:** `Device::createFence()`'s Metal `MetalFenceData::signaled` defaults to
-       `true` ("start signaled so first frame doesn't block" — a comment describing a
+  - **Two real bugs found in `campello_gpu` itself while verifying end-to-end on Metal, both now
+    fixed upstream** (not assumed — found by writing a minimal standalone reproduction against
+    `campello_gpu` directly, bypassing this backend entirely, after every `GpuGenericOps` test
+    initially read back all-zero output despite no errors anywhere, including with
+    `MTL_DEBUG_LAYER=1`/`MTL_SHADER_VALIDATION=1` enabled). Filed in `campello_gpu/TODO.md`'s own
+    "Bugs" section; **fixed locally as `campello_gpu` `v0.13.3`** (not yet tagged/pushed upstream
+    as of this writing — see the temporary `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` CMake override
+    below):
+    1. **The actual cause:** `Device::createFence()`'s Metal `MetalFenceData::signaled` defaulted
+       to `true` ("start signaled so first frame doesn't block" — a comment describing a
        ring-buffer-of-fences *rendering* pattern, not this backend's one-shot
        create-fence→submit→wait usage, which is also `campello_gpu`'s own documented "typical
-       usage" example in `fence.hpp`). So `Fence::wait()` on a freshly created fence returns `true`
-       immediately, without ever waiting for the submission it was passed to — every read happened
-       before the GPU had necessarily even started, let alone finished. **Worked around**, not
-       patched upstream: `GpuBackend::dispatch()` doesn't use a `campello_gpu::Fence` at all —
-       submits via the 1-arg `Device::submit()` and calls `Device::waitForIdle()` synchronously
-       before returning, then hands back an always-pre-signaled `GpuFence` (same shape as
-       `CpuFence`) — matching this codebase's own established "synchronous dispatch, pre-signaled
-       fence" convention (CPU/MPSGraph/DirectML all already work this way), so no architectural
-       change, just sidestepping the broken per-fence-object semantics.
-    2. **A separate, latent issue, not the proximate cause but real and confirmed by reading the
-       source:** `Buffer::download()`'s Metal implementation does a raw `memcpy` from
-       `buffer->contents()` with no `synchronizeResource:` call first — invalid/stale for a buffer
-       in `MTLResourceStorageModeManaged` (Apple's docs require an explicit GPU-side sync blit
-       before a CPU read can see a prior GPU write in that mode). `Device::createBuffer()` only
-       picks the always-coherent `MTLResourceStorageModeShared` instead when `BufferUsage::mapRead`
-       or `mapWrite` is set — neither of which this backend would otherwise have any reason to
-       request (it never calls a mapping API). Worked around the same way: `tensorBufferUsage()`
-       (`src/gpu/gpu_backend.cpp`) includes `mapRead|mapWrite` specifically to force Shared mode on
-       every tensor/output buffer, sidestepping the gap entirely. Confirmed harmless on Vulkan:
-       its `Device::createBuffer()` always allocates `HOST_VISIBLE|HOST_COHERENT` memory regardless
-       of usage flags (its own `mapRead`/`mapWrite` checks are dead/commented-out code there).
+       usage" example in `fence.hpp`). So `Fence::wait()` on a freshly created fence returned
+       `true` immediately, without ever waiting for the submission it was passed to — every read
+       happened before the GPU had necessarily even started, let alone finished. **Fixed in
+       `campello_gpu` 0.13.3:** `Device::submit(cmdBuffer, fence)` now resets the fence to
+       unsignaled right before `commit()`, mirroring the Vulkan backend's `vkResetFences()` call —
+       safe for both a fresh fence and a reused ring-buffer one. `GpuBackend::dispatch()` now uses
+       a real `campello_gpu::Fence` again (`createFence()` + `submit(cmdBuffer, fence)` +
+       `fence->wait()`, blocking before returning — still hands back an always-pre-signaled
+       `GpuFence`, matching CPU/MPSGraph/DirectML's synchronous-dispatch convention).
+    2. **A separate, latent issue, not the proximate cause but real:** `Buffer::download()`'s
+       Metal implementation did a raw `memcpy` from `buffer->contents()` with no
+       `synchronizeResource:` call first — invalid/stale for a buffer in
+       `MTLResourceStorageModeManaged` (Apple's docs require an explicit GPU-side sync blit before
+       a CPU read can see a prior GPU write in that mode). `Device::createBuffer()` only picks the
+       always-coherent `MTLResourceStorageModeShared` instead when `BufferUsage::mapRead` or
+       `mapWrite` is set. **Fixed in `campello_gpu` 0.13.3:** `download()` now encodes and
+       synchronously waits on a blit-encoder `synchronizeResource:` before the `memcpy`, gated on
+       the buffer's storage mode being `Managed` (no-op for `Shared`/iOS). With the real fix in
+       place, `tensorBufferUsage()` (`src/gpu/gpu_backend.cpp`) no longer forces `mapRead|mapWrite`
+       — back to plain `storage|copySrc|copyDst`, letting buffers use the (more efficient on
+       discrete-GPU hardware) `Managed` mode again.
+  - **Temporary build wiring:** since the 0.13.3 fixes are only committed in the local sibling
+    checkout (not yet tagged/pushed), `CMakeLists.txt` adds an opt-in
+    `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` cache variable — when set, `FetchContent_Declare` uses
+    `SOURCE_DIR` pointing at it instead of fetching `GIT_TAG v0.13.2`; defaults to empty, so CI and
+    every other machine still get the real fetch. **Revert once a release containing both fixes is
+    tagged:** drop the override entirely, bump `GIT_TAG` past `v0.13.2`.
   - **Verified, not just compiled:** full `ctest` suite (77 tests: 73 prior + 4 new) passes on this
-    Metal-capable machine — `Relu`/`AddExactShape`/`MatMul` individually, plus a **chained**
-    `Relu`→`Add` graph specifically added to test whether `campello_gpu` auto-tracks resource
-    hazards between two dispatches in the same compute pass (no explicit barrier call exists in
-    `ComputePassEncoder`'s API to confirm this otherwise) — it does, on Metal.
+    Metal-capable machine, built against the real 0.13.3 fixes with no workarounds —
+    `Relu`/`AddExactShape`/`MatMul` individually, plus a **chained** `Relu`→`Add` graph
+    specifically added to test whether `campello_gpu` auto-tracks resource hazards between two
+    dispatches in the same compute pass (no explicit barrier call exists in `ComputePassEncoder`'s
+    API to confirm this otherwise) — it does, on Metal.
   - **Vulkan:** GLSL→SPIR-V compilation verified (`glslangValidator`, installed via
     `brew install glslang` for this), but **not execution** — no Vulkan ICD/MoltenVK on this
     machine. **DirectX12:** `.hlsl` sources written against real D3D12/HLSL semantics but entirely

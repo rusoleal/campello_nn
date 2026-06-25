@@ -38,28 +38,18 @@ namespace
         return static_cast<cgpu::BufferUsage>(static_cast<int>(a) | static_cast<int>(b));
     }
 
-    // Includes mapRead/mapWrite even though nothing here ever calls a mapping
-    // API directly — campello_gpu's Metal Device::createBuffer() only picks
-    // MTLResourceStorageModeShared (CPU/GPU coherent, no explicit sync needed)
-    // when one of those flags is set; otherwise it picks
-    // MTLResourceStorageModeManaged, and campello_gpu's own Buffer::download()
-    // never calls synchronizeResource: for that mode (confirmed by reading
-    // both functions directly) — a real latent CPU/GPU coherency gap on
-    // Metal, independent of the dispatch()/Fence bug documented below (that
-    // one was the actual cause of every GpuGenericOps test reading back
-    // all-zero output before being fixed; this flag addition is a separate,
-    // belt-and-suspenders correctness fix found via source reading, not
-    // empirically required to pass the current tests). Vulkan's
-    // Device::createBuffer() always allocates HOST_VISIBLE|HOST_COHERENT
-    // memory regardless of usage flags (its own mapRead/mapWrite checks are
-    // dead/commented-out code there), so this is a no-op, not a regression,
-    // on that backend.
+    // No mapRead/mapWrite here — nothing in this backend ever calls a mapping
+    // API directly, and campello_gpu's Buffer::download() now (as of the
+    // local 0.13.3 fix, see TODO.md) correctly encodes a `synchronizeResource:`
+    // blit before reading MTLResourceStorageModeManaged buffers (the default
+    // storage mode without those flags), so there's no longer a reason to
+    // force MTLResourceStorageModeShared here — Managed mode is the more
+    // efficient default on discrete-GPU Metal hardware, and Vulkan's
+    // Device::createBuffer() doesn't distinguish the two anyway.
     cgpu::BufferUsage tensorBufferUsage()
     {
-        return combineUsage(
-            combineUsage(combineUsage(cgpu::BufferUsage::storage, cgpu::BufferUsage::copySrc),
-                         cgpu::BufferUsage::copyDst),
-            combineUsage(cgpu::BufferUsage::mapRead, cgpu::BufferUsage::mapWrite));
+        return combineUsage(combineUsage(cgpu::BufferUsage::storage, cgpu::BufferUsage::copySrc),
+                             cgpu::BufferUsage::copyDst);
     }
 
     size_t elementByteSize(DataType dt)
@@ -92,10 +82,11 @@ namespace
         uint64_t byteSize;
     };
 
-    // dispatch() blocks on Device::waitForIdle() before returning (see there for
-    // why), so by the time a GpuFence exists the work is already done — same
-    // "always pre-signaled" shape as CpuFence/MpsBackend's/DirectMlBackend's
-    // fences, all of which are synchronous-dispatch-then-pre-signaled too.
+    // dispatch() blocks on a real campello_gpu::Fence before returning (see
+    // there), so by the time a GpuFence exists the work is already done —
+    // same "always pre-signaled" shape as CpuFence/MpsBackend's/
+    // DirectMlBackend's fences, all of which are synchronous-dispatch-then-
+    // pre-signaled too.
     struct GpuFence
     {
         bool signaled = true;
@@ -510,17 +501,15 @@ void *GpuBackend::dispatch(
     }
 
     auto cmdBuffer = encoder->finish();
-    // Not campello_gpu::Fence-based: a freshly created Fence's
-    // `Fence::wait()` returns true immediately without ever waiting for this
-    // submission (confirmed by reading campello_gpu's Metal
-    // MetalFenceData — `signaled` defaults to `true`, "so first frame
-    // doesn't block" for a ring-buffer-of-fences rendering pattern, which
-    // isn't this backend's one-shot create-submit-wait usage). Worked around
-    // by making dispatch() itself synchronous instead — same convention the
-    // CPU/MPSGraph/DirectML backends already use — via Device::waitForIdle(),
-    // which has no such per-fence-object caveat.
-    impl->device->submit(cmdBuffer);
-    impl->device->waitForIdle();
+    // Blocks here (synchronous dispatch, same convention the CPU/MPSGraph/
+    // DirectML backends already use) via a real campello_gpu::Fence. Needs
+    // the local 0.13.3 fix (see TODO.md) to work correctly: a freshly created
+    // Fence previously defaulted to already-signaled, so wait() returned
+    // immediately without ever waiting for this submission — Device::submit()
+    // now resets it to unsignaled right before commit.
+    auto fence = impl->device->createFence();
+    impl->device->submit(cmdBuffer, fence);
+    fence->wait();
 
     return new GpuFence();
 }
