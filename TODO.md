@@ -758,11 +758,21 @@ vendor). Two real strategies exist:
       time (~1.03×). The transformer block did not improve (~2.2 ms unchanged), confirming that
       its bottleneck is no longer idle-thread waste; shared-memory/block tiling is the next
       optimization to chase for that workload.
-- [ ] **Fourth `GpuGeneric` performance optimization: shared-memory tiled matmul.** The
-      transformer block (`[1, 512] @ [512, 512]`) is still ~30× slower on `GpuGeneric` than on
-      CPU. The naive K-loop is likely bandwidth-bound on the small batch size; a `threadgroup`
-      memory tile (load a `TILE_K × TILE_N` block of `B` once per workgroup, reuse it across the
-      K dimension) is the standard next step to beat the CPU reference there.
+- [x] **Fourth `GpuGeneric` performance optimization: shared-memory tiled matmul (attempted).**
+      Implemented a `threadgroup`-memory tiled matmul (cooperative loads of a `TILE_K × TILE_N`
+      B tile plus the shared A row) and tested `TILE_K = 32` and `TILE_K = 128` variants on
+      macOS/Metal. Both were **slower** than the simple K-loop shader for the `[1, 512] @ [512, 512]`
+      transformer-block shape: latency went from ~2.2 ms to ~4.8 ms (`TILE_K=32`) and ~13 ms
+      (`TILE_K=128`). The reason is that `m = 1` gives no cross-output reuse of A, so the
+      barriers and cooperative-load overhead are not amortized. The matmul shader was reverted to
+      the simple dynamic-tile version.
+- [ ] **Fifth `GpuGeneric` performance optimization: op fusion for the transformer block.** With
+      shared-memory tiling ruled out for `m = 1`, the remaining ~2.2 ms transformer-block latency
+      is dominated by CPU-GPU dispatch overhead across four separate kernels (`matmul`, `add`,
+      `gelu`, `layerNorm`). Fusing those four ops into a single kernel would eliminate three
+      dispatches, three intermediate buffers, and three round-trips through device memory. The
+      natural first target is the exact sequence exercised by the benchmark:
+      `matmul → add → gelu → layerNorm`.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above
