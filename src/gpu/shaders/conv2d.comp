@@ -4,12 +4,12 @@
 // weights, explicit padding/stride/dilation/groups — matches the CPU
 // backend's evalConv2d (src/cpu/ops.cpp) exactly.
 //
-// 1D output tiling: each workgroup computes TILE_WIDTH consecutive flattened
-// output elements (n, o, oh, ow), improving per-workgroup parallelism and
-// memory locality. The dispatch is 1D with bounds checks.
-#define TILE_WIDTH 8
-
-layout(local_size_x = TILE_WIDTH, local_size_y = 1, local_size_z = 1) in;
+// 1D output tiling: each workgroup computes tileWidth consecutive flattened
+// output elements (n, o, oh, ow). tileWidth is passed at runtime so the host
+// can match the actual threadgroup size the backend uses (e.g., Metal's
+// threadExecutionWidth). For Vulkan the backend currently reports a workgroup
+// size of 1, so tileWidth is 1 and each workgroup computes one output element.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
 layout(std430, binding = 1) readonly buffer WBuf { float data[]; } wBuf;
@@ -19,13 +19,16 @@ layout(binding = 3) uniform Params
     uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
+    uint tileWidth;
 } params;
 
 void main()
 {
+    if (gl_LocalInvocationID.x >= params.tileWidth)
+        return;
     uint totalOut = params.outH * params.outW;
     uint totalOutputs = params.N * params.O * totalOut;
-    uint flatIdx = gl_WorkGroupID.x * TILE_WIDTH + gl_LocalInvocationID.x;
+    uint flatIdx = gl_WorkGroupID.x * params.tileWidth + gl_LocalInvocationID.x;
     if (flatIdx >= totalOutputs)
         return;
 

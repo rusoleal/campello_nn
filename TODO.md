@@ -748,6 +748,21 @@ vendor). Two real strategies exist:
       now computes 8 consecutive flattened output elements (n, o, oh, ow) instead of 1. This
       dropped YuNet benchmark latency on macOS/Metal from ~3.4 s to ~0.86 s (~3.9×), making
       `GpuGeneric` only ~1.1× slower than the CPU backend on that model (vs. ~4.4× before).
+- [x] **Third `GpuGeneric` performance optimization: dynamic tile width driven by the backend's
+      real workgroup size.** Added `campello_gpu::ComputePipeline::getWorkgroupSize()` so
+      `campello_nn` can discover the actual threadgroup width the backend will dispatch (e.g.,
+      Metal's `threadExecutionWidth`) and size its matmul/conv2d tiles to match it, instead of
+      hard-coding `TILE_WIDTH = 8` and leaving the extra threads idle. On macOS/Metal (Intel UHD
+      630, `threadExecutionWidth = 32`) this dropped YuNet benchmark latency from ~856 ms to
+      ~654 ms, making `GpuGeneric` **faster than the CPU backend** on that model for the first
+      time (~1.03×). The transformer block did not improve (~2.2 ms unchanged), confirming that
+      its bottleneck is no longer idle-thread waste; shared-memory/block tiling is the next
+      optimization to chase for that workload.
+- [ ] **Fourth `GpuGeneric` performance optimization: shared-memory tiled matmul.** The
+      transformer block (`[1, 512] @ [512, 512]`) is still ~30× slower on `GpuGeneric` than on
+      CPU. The naive K-loop is likely bandwidth-bound on the small batch size; a `threadgroup`
+      memory tile (load a `TILE_K × TILE_N` block of `B` once per workgroup, reuse it across the
+      K dimension) is the standard next step to beat the CPU reference there.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above

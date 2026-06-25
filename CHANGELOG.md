@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transformer-block benchmark latency on macOS/Metal by ~1.7×.
 - `GpuGeneric` conv2d now uses 1D output tiling (8 flattened output elements per workgroup),
   improving the YuNet benchmark latency on macOS/Metal by ~3.9×.
+- `GpuGeneric` matmul and conv2d now size their tiles to the backend's actual workgroup width
+  via the new `campello_gpu::ComputePipeline::getWorkgroupSize()` query, eliminating idle threads
+  on Metal. On macOS/Metal (Intel UHD 630) this makes `GpuGeneric` faster than the CPU backend on
+  YuNet for the first time (~675 ms CPU vs. ~654 ms `GpuGeneric`).
 
 ---
 

@@ -1,12 +1,11 @@
 // DirectX (HLSL). Written but unverified — see relu.hlsl's comment.
 // NCHW/grouped/dilated conv2d with 1D output tiling. See conv2d.comp.
-#define TILE_WIDTH 8
-
 struct Params
 {
     uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
+    uint tileWidth;
 };
 
 StructuredBuffer<float> xBuf : register(t0);
@@ -14,12 +13,14 @@ StructuredBuffer<float> wBuf : register(t1);
 RWStructuredBuffer<float> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
-[numthreads(TILE_WIDTH, 1, 1)]
+[numthreads(1, 1, 1)]
 void computeMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID)
 {
+    if (localId.x >= params.tileWidth)
+        return;
     uint totalOut = params.outH * params.outW;
     uint totalOutputs = params.N * params.O * totalOut;
-    uint flatIdx = groupId.x * TILE_WIDTH + localId.x;
+    uint flatIdx = groupId.x * params.tileWidth + localId.x;
     if (flatIdx >= totalOutputs)
         return;
 

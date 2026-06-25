@@ -3,13 +3,13 @@
 // Vulkan (GLSL). Batched matmul: supports rank >= 2 with matching batch
 // dimensions (no broadcasting).
 //
-// 1D column tiling: each workgroup computes TILE_WIDTH consecutive output
-// columns of one output row. This increases per-workgroup parallelism and
-// improves memory locality (all threads share the same A row and read
-// adjacent B columns).
-#define TILE_WIDTH 8
-
-layout(local_size_x = TILE_WIDTH, local_size_y = 1) in;
+// 1D column tiling: each workgroup computes tileWidth consecutive output
+// columns of one output row. tileWidth is passed at runtime so the host can
+// match the actual threadgroup size the backend uses (e.g., Metal's
+// threadExecutionWidth). For Vulkan the backend currently reports a
+// workgroup size of 1, so tileWidth is 1 and each workgroup computes one
+// output element.
+layout(local_size_x = 1, local_size_y = 1) in;
 
 layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
 layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
@@ -20,11 +20,14 @@ layout(binding = 3) uniform Params
     uint k;
     uint n;
     uint batchCount;
+    uint tileWidth;
 } params;
 
 void main()
 {
-    uint n = gl_WorkGroupID.x * TILE_WIDTH + gl_LocalInvocationID.x;
+    if (gl_LocalInvocationID.x >= params.tileWidth)
+        return;
+    uint n = gl_WorkGroupID.x * params.tileWidth + gl_LocalInvocationID.x;
     uint m = gl_WorkGroupID.y;
     uint batch = gl_WorkGroupID.z;
     if (m >= params.m || n >= params.n || batch >= params.batchCount)

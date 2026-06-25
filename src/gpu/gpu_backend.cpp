@@ -174,6 +174,8 @@ namespace
     struct ParamsMatMul
     {
         uint32_t m, k, n, batchCount;
+        uint32_t tileWidth;
+        uint32_t pad0, pad1, pad2;
     };
     // For LayerNorm/RmsNorm's row-per-workgroup dispatch (see those shaders'
     // comments). Mixed uint32/float is fine here — a flat sequence of 4-byte
@@ -245,6 +247,8 @@ namespace
         uint32_t N, O, C, H, W, Cg, KH, KW, outH, outW;
         uint32_t strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
         uint32_t inPerGroup, outPerGroup;
+        uint32_t tileWidth;
+        uint32_t pad0, pad1, pad2;
     };
     // Shared by MaxPool2d and AvgPool2d; `isMax` selects the behavior.
     // Matches pool2d.comp's Params block field-for-field.
@@ -848,7 +852,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                     throw std::runtime_error(
                         "campello_nn: GpuBackend: matmul() batch dimensions must match");
 
-            impl->resourcesFor(OpKind::MatMul);
+            auto &res = impl->resourcesFor(OpKind::MatMul);
             uint64_t m = (uint64_t)aShape[rank - 2];
             uint64_t k = (uint64_t)aShape[rank - 1];
             uint64_t outN = (uint64_t)bShape[rank - 1];
@@ -860,12 +864,19 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.output = impl->device->createBuffer(outElems * sizeof(float), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (matmul output) failed");
-            constexpr uint32_t kMatMulTileWidth = 8;
-            ParamsMatMul p{(uint32_t)m, (uint32_t)k, (uint32_t)outN, (uint32_t)batchCount};
+            uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
+            if (tileWidth < 1)
+                tileWidth = 1;
+            // Cap at a reasonable maximum to keep params compact and avoid
+            // pathological dispatch shapes on unusual devices.
+            constexpr uint32_t kMaxTileWidth = 64;
+            if (tileWidth > kMaxTileWidth)
+                tileWidth = kMaxTileWidth;
+            ParamsMatMul p{(uint32_t)m, (uint32_t)k, (uint32_t)outN, (uint32_t)batchCount, tileWidth, 0, 0, 0};
             cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (matmul params) failed");
-            cn.dispatchX = (outN + kMatMulTileWidth - 1) / kMatMulTileWidth;
+            cn.dispatchX = (outN + tileWidth - 1) / tileWidth;
             cn.dispatchY = m;
             cn.dispatchZ = batchCount;
             continue;
@@ -1153,22 +1164,28 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t groups = (uint32_t)p.groups;
             uint32_t inPerGroup = C / groups;
             uint32_t outPerGroup = O / groups;
-            impl->resourcesFor(OpKind::Conv2d);
+            auto &res = impl->resourcesFor(OpKind::Conv2d);
             uint64_t outCount = (uint64_t)numElements(node.shape);
             cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d output) failed");
+            uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
+            if (tileWidth < 1)
+                tileWidth = 1;
+            constexpr uint32_t kMaxTileWidth = 64;
+            if (tileWidth > kMaxTileWidth)
+                tileWidth = kMaxTileWidth;
             ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
                               (uint32_t)p.strideX, (uint32_t)p.strideY,
                               (uint32_t)p.dilationX, (uint32_t)p.dilationY,
                               (uint32_t)p.paddingLeft, (uint32_t)p.paddingTop,
-                              inPerGroup, outPerGroup};
+                              inPerGroup, outPerGroup,
+                              tileWidth, 0, 0, 0};
             cn.paramsBuffer = impl->device->createBuffer(sizeof(params), cgpu::BufferUsage::uniform, &params);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d params) failed");
-            constexpr uint32_t kConvTileWidth = 8;
             uint64_t totalOutputs = (uint64_t)N * O * outH * outW;
-            cn.dispatchX = (totalOutputs + kConvTileWidth - 1) / kConvTileWidth;
+            cn.dispatchX = (totalOutputs + tileWidth - 1) / tileWidth;
             cn.dispatchY = 1;
             cn.dispatchZ = 1;
             continue;

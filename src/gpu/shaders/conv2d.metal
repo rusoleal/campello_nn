@@ -2,16 +2,15 @@
 using namespace metal;
 
 // Metal. Same NCHW/grouped/dilated model as conv2d.comp. 1D output tiling:
-// each workgroup computes TILE_WIDTH consecutive flattened output elements.
+// each workgroup computes tileWidth consecutive flattened output elements.
 // campello_gpu's Metal dispatch uses the pipeline's threadExecutionWidth as
-// the threadgroup size, so we gate to the first TILE_WIDTH threads.
-#define TILE_WIDTH 8
-
+// the threadgroup size, so we gate to the first tileWidth threads.
 struct Params
 {
     uint N, O, C, H, W, Cg, KH, KW, outH, outW;
     uint strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
     uint inPerGroup, outPerGroup;
+    uint tileWidth;
 };
 
 kernel void computeMain(const device float *xBuf [[buffer(0)]],
@@ -21,12 +20,12 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
 {
-    if (localId.x >= TILE_WIDTH)
+    if (localId.x >= params.tileWidth)
         return;
 
     uint totalOut = params.outH * params.outW;
     uint totalOutputs = params.N * params.O * totalOut;
-    uint flatIdx = groupId.x * TILE_WIDTH + localId.x;
+    uint flatIdx = groupId.x * params.tileWidth + localId.x;
     if (flatIdx >= totalOutputs)
         return;
 
