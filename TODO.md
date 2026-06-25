@@ -739,6 +739,11 @@ vendor). Two real strategies exist:
       MPSGraph are both faster than the current naive `GpuGeneric` implementation across
       the tested shapes and models, confirming the benchmark is useful for tracking future
       `GpuGeneric` performance work.
+- [x] **First `GpuGeneric` performance optimization: 1D column-tiled matmul.** Each workgroup
+      now computes 8 consecutive output columns instead of 1, using up to 8 threads. This
+      improved the transformer-block benchmark latency on macOS/Metal from ~3.7 ms to ~2.2 ms
+      (~1.7×). YuNet latency was unchanged because that model is dominated by `conv2d`, not
+      `matmul`; conv2d tiling is the next optimization to chase.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above

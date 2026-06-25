@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real YuNet face-detection model, reporting min/median/mean/max and max absolute/score
   difference against the CPU reference.
 
+### Changed
+- `GpuGeneric` matmul now uses 1D column tiling (8 columns per workgroup), improving the
+  transformer-block benchmark latency on macOS/Metal by ~1.7×. Conv2d remains the next
+  dominant bottleneck for vision models like YuNet.
+
 ---
 
 ## [0.2.0] - 2026-06-23

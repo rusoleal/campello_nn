@@ -1,9 +1,15 @@
 #version 450
 
 // Vulkan (GLSL). Batched matmul: supports rank >= 2 with matching batch
-// dimensions (no broadcasting). Each workgroup computes one (m,n) element
-// for one batch slice. Same naive/no-tiling K-loop as the CPU reference.
-layout(local_size_x = 1, local_size_y = 1) in;
+// dimensions (no broadcasting).
+//
+// 1D column tiling: each workgroup computes TILE_WIDTH consecutive output
+// columns of one output row. This increases per-workgroup parallelism and
+// improves memory locality (all threads share the same A row and read
+// adjacent B columns).
+#define TILE_WIDTH 8
+
+layout(local_size_x = TILE_WIDTH, local_size_y = 1) in;
 
 layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
 layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
@@ -18,7 +24,7 @@ layout(binding = 3) uniform Params
 
 void main()
 {
-    uint n = gl_WorkGroupID.x;
+    uint n = gl_WorkGroupID.x * TILE_WIDTH + gl_LocalInvocationID.x;
     uint m = gl_WorkGroupID.y;
     uint batch = gl_WorkGroupID.z;
     if (m >= params.m || n >= params.n || batch >= params.batchCount)

@@ -1,7 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Metal. Batched matmul; see matmul.comp. Thread-0 gate per relu.metal.
+// Metal. Batched matmul with 1D column tiling. See matmul.comp.
+// campello_gpu's Metal dispatch uses the pipeline's threadExecutionWidth as
+// the threadgroup size, so we gate to the first TILE_WIDTH threads and have
+// each compute one column of the tile.
+#define TILE_WIDTH 8
 
 struct Params
 {
@@ -18,9 +22,9 @@ kernel void computeMain(const device float *aBuf [[buffer(0)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
 {
-    if (localId.x != 0)
+    if (localId.x >= TILE_WIDTH)
         return;
-    uint n = groupId.x;
+    uint n = groupId.x * TILE_WIDTH + localId.x;
     uint m = groupId.y;
     uint batch = groupId.z;
     if (m >= params.m || n >= params.n || batch >= params.batchCount)

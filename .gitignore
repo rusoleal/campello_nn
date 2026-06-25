@@ -3,3 +3,6 @@ build
 build_*
 .idea
 .vscode
+*.spv
+*.metallib
+*.air

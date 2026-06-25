@@ -1,5 +1,6 @@
-// DirectX (HLSL). Written but unverified — see relu.hlsl's comment. Same
-// batched/naive-K-loop scope as matmul.comp.
+// DirectX (HLSL). Written but unverified — see relu.hlsl's comment.
+// Batched matmul with 1D column tiling. See matmul.comp.
+#define TILE_WIDTH 8
 
 struct Params
 {
@@ -14,10 +15,10 @@ StructuredBuffer<float> bBuf : register(t1);
 RWStructuredBuffer<float> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
-[numthreads(1, 1, 1)]
-void computeMain(uint3 groupId : SV_GroupID)
+[numthreads(TILE_WIDTH, 1, 1)]
+void computeMain(uint3 groupId : SV_GroupID, uint3 localId : SV_GroupThreadID)
 {
-    uint n = groupId.x;
+    uint n = groupId.x * TILE_WIDTH + localId.x;
     uint m = groupId.y;
     uint batch = groupId.z;
     if (m >= params.m || n >= params.n || batch >= params.batchCount)

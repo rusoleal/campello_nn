@@ -173,7 +173,7 @@ namespace
     };
     struct ParamsMatMul
     {
-        uint32_t m, k, n, pad0;
+        uint32_t m, k, n, batchCount;
     };
     // For LayerNorm/RmsNorm's row-per-workgroup dispatch (see those shaders'
     // comments). Mixed uint32/float is fine here — a flat sequence of 4-byte
@@ -860,11 +860,12 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.output = impl->device->createBuffer(outElems * sizeof(float), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (matmul output) failed");
+            constexpr uint32_t kMatMulTileWidth = 8;
             ParamsMatMul p{(uint32_t)m, (uint32_t)k, (uint32_t)outN, (uint32_t)batchCount};
             cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (matmul params) failed");
-            cn.dispatchX = outN;
+            cn.dispatchX = (outN + kMatMulTileWidth - 1) / kMatMulTileWidth;
             cn.dispatchY = m;
             cn.dispatchZ = batchCount;
             continue;
