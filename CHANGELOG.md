@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elementwise outputs to the Conv2d output buffer in-place, avoiding intermediate buffer
   allocations and memory round-trips. YuNet benchmark latency on macOS/Metal improved from
   ~697 ms to ~673 ms (~3.5%).
+- `GpuGeneric` conv2d dispatch switched from a flattened 1D output grid to a 2D spatial-tile
+  grid (`dispatchX = tileColsPerRow * N * O`, `dispatchY = outH`) and the shader was rewritten
+  with a shared-memory tiled path behind a `USE_SHARED_MEMORY` toggle. The shared-memory path
+  is currently disabled by default on Metal/Vulkan/DirectX because it regressed YuNet latency
+  on Intel integrated graphics (likely barrier/smem overhead on unified memory). With the
+  shared path off, the 2D dispatch still improved YuNet latency on macOS/Metal from ~673 ms
+  to ~617 ms (~8%). The shared-memory implementation is left in place for re-enablement/tuning
+  on discrete GPUs.
 
 ---
 

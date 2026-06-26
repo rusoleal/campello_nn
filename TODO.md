@@ -772,12 +772,21 @@ vendor). Two real strategies exist:
       own. This avoids the intermediate buffer allocations and memory round-trips for those
       sequences. On macOS/Metal (Intel UHD 630) YuNet latency improved from ~697 ms to ~673 ms
       (~3.5%). All 179 tests pass.
-- [ ] **Sixth `GpuGeneric` performance optimization: shared-memory tiled conv2d.** The YuNet gap
-      to MPSGraph is still large (~673 ms `GpuGeneric` vs. ~70 ms MPSGraph, ~9.6×). Since conv2d
-      dominates the model and has real cross-output reuse of input activations and weights, a
-      `threadgroup`-memory tiled conv2d (cooperatively loading an input tile and/or weight tile
-      per workgroup) is the next optimization to close that gap. Unlike the transformer-block
-      matmul, this shape has enough reuse to amortize barrier overhead.
+- [x] **Sixth `GpuGeneric` performance optimization: shared-memory tiled conv2d (implemented,
+      disabled by default on Metal).** Implemented a `threadgroup`/shared-memory tiled conv2d in
+      `src/gpu/shaders/conv2d.{comp,metal,hlsl}`: each workgroup loads an input tile and weight
+      slice into shared memory per channel chunk, then computes a 1D spatial tile of outputs.
+      The shader is gated by `USE_SHARED_MEMORY` and currently defaults to `0` on Metal because
+      benchmarking showed it regressed YuNet latency on Intel integrated graphics (likely
+      barrier/shared-memory overhead dominates on this unified-memory architecture). With the
+      shared path disabled, the new 2D dispatch shape still improved YuNet from ~673 ms to
+      ~617 ms (~8%). All 179 tests pass. The shared-memory code is left in place with a toggle
+      so it can be re-enabled/tuned on discrete GPUs or other platforms where it may help.
+- [ ] **Seventh `GpuGeneric` performance optimization: close the YuNet gap to MPSGraph.**
+      `GpuGeneric` YuNet is now ~617 ms vs. CPU ~745 ms and MPSGraph ~68 ms. The next step is
+      to identify why the naive conv2d path is still ~9× slower than MPSGraph — likely kernel
+      fusion (Winograd/im2col+GEMM) or reduced dispatch overhead — and implement a matching
+      optimization.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above

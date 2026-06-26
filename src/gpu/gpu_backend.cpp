@@ -1263,7 +1263,8 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
             if (tileWidth < 1)
                 tileWidth = 1;
-            constexpr uint32_t kMaxTileWidth = 64;
+            // The shared-memory conv2d shader is specialized for MAX_TILE_OW=32.
+            constexpr uint32_t kMaxTileWidth = 32;
             if (tileWidth > kMaxTileWidth)
                 tileWidth = kMaxTileWidth;
             ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
@@ -1275,9 +1276,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.paramsBuffer = impl->device->createBuffer(sizeof(params), cgpu::BufferUsage::uniform, &params);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d params) failed");
-            uint64_t totalOutputs = (uint64_t)N * O * outH * outW;
-            cn.dispatchX = (totalOutputs + tileWidth - 1) / tileWidth;
-            cn.dispatchY = 1;
+            uint32_t tileColsPerRow = (outW + tileWidth - 1) / tileWidth;
+            cn.dispatchX = (uint64_t)tileColsPerRow * N * O;
+            cn.dispatchY = outH;
             cn.dispatchZ = 1;
             continue;
         }
