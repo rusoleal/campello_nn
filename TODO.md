@@ -551,9 +551,7 @@ vendor). Two real strategies exist:
     `campello_gpu` directly, bypassing this backend entirely, after every `GpuGenericOps` test
     initially read back all-zero output despite no errors anywhere, including with
     `MTL_DEBUG_LAYER=1`/`MTL_SHADER_VALIDATION=1` enabled). Filed in `campello_gpu/TODO.md`'s own
-    "Bugs" section; **fixed locally as `campello_gpu` `v0.13.3`** (not yet tagged/pushed upstream
-    as of this writing — see the temporary `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` CMake override
-    below):
+    "Bugs" section; **fixed upstream in `campello_gpu` `v0.14.0`**:
     1. **The actual cause:** `Device::createFence()`'s Metal `MetalFenceData::signaled` defaulted
        to `true` ("start signaled so first frame doesn't block" — a comment describing a
        ring-buffer-of-fences *rendering* pattern, not this backend's one-shot
@@ -561,7 +559,7 @@ vendor). Two real strategies exist:
        usage" example in `fence.hpp`). So `Fence::wait()` on a freshly created fence returned
        `true` immediately, without ever waiting for the submission it was passed to — every read
        happened before the GPU had necessarily even started, let alone finished. **Fixed in
-       `campello_gpu` 0.13.3:** `Device::submit(cmdBuffer, fence)` now resets the fence to
+       `campello_gpu` 0.14.0:** `Device::submit(cmdBuffer, fence)` now resets the fence to
        unsignaled right before `commit()`, mirroring the Vulkan backend's `vkResetFences()` call —
        safe for both a fresh fence and a reused ring-buffer one. `GpuBackend::dispatch()` now uses
        a real `campello_gpu::Fence` again (`createFence()` + `submit(cmdBuffer, fence)` +
@@ -573,20 +571,17 @@ vendor). Two real strategies exist:
        `MTLResourceStorageModeManaged` (Apple's docs require an explicit GPU-side sync blit before
        a CPU read can see a prior GPU write in that mode). `Device::createBuffer()` only picks the
        always-coherent `MTLResourceStorageModeShared` instead when `BufferUsage::mapRead` or
-       `mapWrite` is set. **Fixed in `campello_gpu` 0.13.3:** `download()` now encodes and
+       `mapWrite` is set. **Fixed in `campello_gpu` 0.14.0:** `download()` now encodes and
        synchronously waits on a blit-encoder `synchronizeResource:` before the `memcpy`, gated on
        the buffer's storage mode being `Managed` (no-op for `Shared`/iOS). With the real fix in
        place, `tensorBufferUsage()` (`src/gpu/gpu_backend.cpp`) no longer forces `mapRead|mapWrite`
        — back to plain `storage|copySrc|copyDst`, letting buffers use the (more efficient on
        discrete-GPU hardware) `Managed` mode again.
-  - **Temporary build wiring:** since the 0.13.3 fixes are only committed in the local sibling
-    checkout (not yet tagged/pushed), `CMakeLists.txt` adds an opt-in
-    `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` cache variable — when set, `FetchContent_Declare` uses
-    `SOURCE_DIR` pointing at it instead of fetching `GIT_TAG v0.13.2`; defaults to empty, so CI and
-    every other machine still get the real fetch. **Revert once a release containing both fixes is
-    tagged:** drop the override entirely, bump `GIT_TAG` past `v0.13.2`.
-  - **Verified, not just compiled:** full `ctest` suite (77 tests: 73 prior + 4 new) passes on this
-    Metal-capable machine, built against the real 0.13.3 fixes with no workarounds —
+  - `CMakeLists.txt` fetches `campello_gpu` at `GIT_TAG v0.14.0`; the temporary
+    `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` local-checkout override has been removed now that the
+    required fixes are released.
+  - **Verified, not just compiled:** full `ctest` suite passes on this Metal-capable machine, built
+    against the released v0.14.0 with no workarounds —
     `Relu`/`AddExactShape`/`MatMul` individually, plus a **chained** `Relu`→`Add` graph
     specifically added to test whether `campello_gpu` auto-tracks resource hazards between two
     dispatches in the same compute pass (no explicit barrier call exists in `ComputePassEncoder`'s
@@ -782,11 +777,35 @@ vendor). Two real strategies exist:
       shared path disabled, the new 2D dispatch shape still improved YuNet from ~673 ms to
       ~617 ms (~8%). All 179 tests pass. The shared-memory code is left in place with a toggle
       so it can be re-enabled/tuned on discrete GPUs or other platforms where it may help.
-- [ ] **Seventh `GpuGeneric` performance optimization: close the YuNet gap to MPSGraph.**
-      `GpuGeneric` YuNet is now ~617 ms vs. CPU ~745 ms and MPSGraph ~68 ms. The next step is
-      to identify why the naive conv2d path is still ~9× slower than MPSGraph — likely kernel
-      fusion (Winograd/im2col+GEMM) or reduced dispatch overhead — and implement a matching
-      optimization.
+- [x] **Seventh `GpuGeneric` performance optimization: im2col + GEMM for small-spatial-dim
+      convolutions.** Added `im2col` and `conv_gemm` shaders and wired them into `GpuBackend` so
+      Conv2d nodes with poor direct-convolution thread utilization (small `outW`) dispatch as an
+      im2col matrix expansion followed by a GEMM. The path is limited to `groups == 1` for now and
+      is selected when `outW <= tileWidth / 4`. On macOS/Metal (Intel UHD 630) YuNet latency
+      dropped from ~617 ms to ~199 ms (~3.1× faster); ResNet-50 stays neutral at ~1.15 s vs.
+      ~1.10 s before. All 179 tests pass.
+- [x] **Eighth `GpuGeneric` performance optimization: fuse Conv2d + Add[bias] + ReLU into one
+      dispatch.** Added a `conv_fused` shader and compile-time pattern matching so Conv2d blocks
+      with a bias-add and ReLU successor dispatch as a single kernel. The pattern fires 18 times on
+      YuNet but zero times on the exported ResNet-50 v1-7 (which uses Conv→BatchNorm→ReLU instead
+      of Conv→Bias→ReLU). YuNet stays at ~199 ms; ResNet-50 stays at ~1.15 s. All 179 tests pass.
+- [x] **Ninth `GpuGeneric` performance optimization: bind-group caching.** Added a
+      per-`CompiledGraph` cache keyed by bind-group layout + ordered buffer bindings and routed all
+      `dispatch()` bind-group creation through it. On macOS/Metal (Intel UHD 630) the win is within
+      noise: ResNet-50 ~1.155 s (was ~1.156 s), YuNet ~203 ms (was ~199 ms), transformer ~1.15 ms
+      (was ~1.10 ms). The bottleneck is shader execution time, not host bind-group overhead. All
+      179 tests pass.
+- [x] **Tenth `GpuGeneric` performance optimization: fold BatchNorm into Conv2d for ResNet-50.**
+      Added a `conv_fused_bn` shader and compile-time detection of `Conv → BatchNorm → ReLU`. The
+      BN affine transform is folded into per-channel `scale_factor` and `folded_bias` buffers, so
+      the whole block dispatches as one kernel. On macOS/Metal (Intel UHD 630) ResNet-50 improved
+      from ~1.156 s to ~1.098 s (~5% faster); YuNet stays at ~200 ms. All 179 tests pass.
+- [ ] **Eleventh `GpuGeneric` performance optimization: faster large-feature-map convolution.**
+      The remaining ~6× ResNet-50 gap is now the cost of the naive direct-convolution shader
+      itself. The next wins are a shared-memory or tiled GEMM-based conv path that reuses weights
+      across threads, or Winograd for 3×3/stride-1 kernels. The shared-memory conv2d path already
+      exists behind `USE_SHARED_MEMORY` but regressed on Intel integrated graphics; it may help on
+      discrete GPUs or with a different tile shape.
 - [x] **Benchmark on a bigger real model: ResNet-50.** Downloaded ResNet-50 v1-7 from the
       ONNX Model Zoo (~98 MB) to `tests/fixtures/`, added ONNX importer support for the
       `Flatten`/`GlobalAveragePool`/`Gemm(transB=1)` ops it uses, and added a ResNet-50

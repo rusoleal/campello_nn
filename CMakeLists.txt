@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_nn VERSION 0.2.0)
+project(campello_nn VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -136,30 +136,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_INTEGRATION_TESTS OFF CACHE BOOL "" FORCE)
-    # TEMPORARY local-dev override: CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR, if set,
-    # points FetchContent at a local sibling checkout instead of fetching
-    # v0.13.2 from GitHub — needed right now because that checkout has two
-    # Metal fixes this backend depends on (Fence::wait() never actually
-    # waiting on a fresh fence; Buffer::download() not syncing Managed-mode
-    # buffers — see TODO.md) that are only committed locally as of this
-    # writing, not yet tagged/pushed upstream. Defaults to empty (unset) so
-    # CI and every other machine still get the real GIT_TAG fetch below.
-    # Revert entirely (drop this option, bump GIT_TAG) once a release
-    # containing both fixes exists.
-    set(CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR "" CACHE PATH
-        "Local campello_gpu checkout to build against instead of fetching from GitHub (dev-only)")
-    if(CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR)
-        FetchContent_Declare(
-            campello_gpu
-            SOURCE_DIR ${CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR}
-        )
-    else()
-        FetchContent_Declare(
-            campello_gpu
-            GIT_REPOSITORY https://github.com/rusoleal/campello_gpu.git
-            GIT_TAG v0.13.2
-        )
-    endif()
+    FetchContent_Declare(
+        campello_gpu
+        GIT_REPOSITORY https://github.com/rusoleal/campello_gpu.git
+        GIT_TAG v0.14.0
+    )
     FetchContent_MakeAvailable(campello_gpu)
     set(BUILD_TESTS ${_campello_nn_saved_build_tests2} CACHE BOOL "" FORCE)
     set(BUILD_EXAMPLES ${_campello_nn_saved_build_examples2} CACHE BOOL "" FORCE)

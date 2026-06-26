@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-26
+
 ### Fixed
 - `GpuBackend::compileGraph()` no longer passes a null pointer to `campello_gpu`'s data-carrying
   `createBuffer()` overload for zero-byte constants (dead ONNX initializers). This caused a crash
@@ -24,10 +26,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   difference against the CPU reference.
 
 ### Changed
+- Bumped `campello_gpu` dependency from `v0.13.2` to `v0.14.0`; removed the temporary
+  `CAMPELLO_NN_CAMPELLO_GPU_LOCAL_DIR` local-checkout override from `CMakeLists.txt` now that the
+  required Metal fence/download fixes are in the released tag.
 - `GpuGeneric` matmul now uses 1D column tiling (8 columns per workgroup), improving the
   transformer-block benchmark latency on macOS/Metal by ~1.7×.
 - `GpuGeneric` conv2d now uses 1D output tiling (8 flattened output elements per workgroup),
   improving the YuNet benchmark latency on macOS/Metal by ~3.9×.
+- `GpuGeneric` conv2d now uses an `im2col + GEMM` path for `groups == 1` convolutions with
+  small output width (`outW <= tileWidth / 4`), where the direct-convolution shader has poor
+  thread utilization. On macOS/Metal (Intel UHD 630) this drops YuNet latency from ~617 ms to
+  ~199 ms (~3.1×); ResNet-50 stays neutral at ~1.15 s vs. ~1.10 s before.
+- `GpuGeneric` now fuses `Conv2d -> Add[bias] -> ReLU` into a single dispatch when the pattern is
+  detected. This eliminates two dispatches and their bind-group builds per fused block. The pattern
+  matches 18 Conv blocks in YuNet but does not match the exported ResNet-50 v1-7 (Conv→BatchNorm→
+  ReLU), so YuNet stays at ~199 ms and ResNet-50 stays at ~1.15 s on macOS/Metal.
+- `GpuGeneric` now caches `cgpu::BindGroup` objects across `dispatch()` calls in a per-graph cache
+  keyed by bind-group layout and buffer bindings. This removes per-dispatch bind-group recreation
+  overhead, but on macOS/Metal (Intel UHD 630) the latency change is within noise, confirming that
+  the remaining gap is shader execution time rather than host-side dispatch overhead.
+- `GpuGeneric` now folds inference-time BatchNorm into the preceding Conv2d and fuses the whole
+  `Conv → BatchNorm → ReLU` block into a single dispatch. ResNet-50 v1-7 latency on macOS/Metal
+  (Intel UHD 630) improved from ~1.156 s to ~1.098 s (~5%); YuNet and the transformer block are
+  unchanged.
 - `GpuGeneric` matmul and conv2d now size their tiles to the backend's actual workgroup width
   via the new `campello_gpu::ComputePipeline::getWorkgroupSize()` query, eliminating idle threads
   on Metal. On macOS/Metal (Intel UHD 630) this makes `GpuGeneric` faster than the CPU backend on
@@ -88,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graph caching: `GraphBuilder::serialize()`/`deserialize()` and `graph_cache.hpp`'s
   `saveGraphToFile`/`loadGraphFromFile`/`loadGraphFromMemory`.
 
-[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rusoleal/campello_nn/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rusoleal/campello_nn/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rusoleal/campello_nn/releases/tag/v0.1.0

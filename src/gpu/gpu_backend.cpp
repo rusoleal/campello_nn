@@ -24,6 +24,10 @@
 #include "shaders/gemm_metallib.hpp"
 #include "shaders/softmax_metallib.hpp"
 #include "shaders/conv2d_metallib.hpp"
+#include "shaders/im2col_metallib.hpp"
+#include "shaders/conv_gemm_metallib.hpp"
+#include "shaders/conv_fused_metallib.hpp"
+#include "shaders/conv_fused_bn_metallib.hpp"
 #include "shaders/pool2d_metallib.hpp"
 #include "shaders/resize_metallib.hpp"
 #include "shaders/batchnorm_metallib.hpp"
@@ -47,6 +51,10 @@
 #include "shaders/gemm_spv.hpp"
 #include "shaders/softmax_spv.hpp"
 #include "shaders/conv2d_spv.hpp"
+#include "shaders/im2col_spv.hpp"
+#include "shaders/conv_gemm_spv.hpp"
+#include "shaders/conv_fused_spv.hpp"
+#include "shaders/conv_fused_bn_spv.hpp"
 #include "shaders/pool2d_spv.hpp"
 #include "shaders/resize_spv.hpp"
 #include "shaders/batchnorm_spv.hpp"
@@ -77,13 +85,12 @@ namespace
     }
 
     // No mapRead/mapWrite here — nothing in this backend ever calls a mapping
-    // API directly, and campello_gpu's Buffer::download() now (as of the
-    // local 0.13.3 fix, see TODO.md) correctly encodes a `synchronizeResource:`
-    // blit before reading MTLResourceStorageModeManaged buffers (the default
-    // storage mode without those flags), so there's no longer a reason to
-    // force MTLResourceStorageModeShared here — Managed mode is the more
-    // efficient default on discrete-GPU Metal hardware, and Vulkan's
-    // Device::createBuffer() doesn't distinguish the two anyway.
+    // API directly, and campello_gpu's Buffer::download() (as of v0.14.0)
+    // correctly encodes a `synchronizeResource:` blit before reading
+    // MTLResourceStorageModeManaged buffers (the default storage mode without
+    // those flags), so there's no longer a reason to force MTLResourceStorageModeShared
+    // here — Managed mode is the more efficient default on discrete-GPU Metal hardware,
+    // and Vulkan's Device::createBuffer() doesn't distinguish the two anyway.
     cgpu::BufferUsage tensorBufferUsage()
     {
         return combineUsage(combineUsage(cgpu::BufferUsage::storage, cgpu::BufferUsage::copySrc),
@@ -247,6 +254,27 @@ namespace
         uint32_t N, O, C, H, W, Cg, KH, KW, outH, outW;
         uint32_t strideX, strideY, dilationX, dilationY, paddingLeft, paddingTop;
         uint32_t inPerGroup, outPerGroup;
+        uint32_t tileWidth;
+        uint32_t pad0, pad1, pad2;
+    };
+    // im2col for the im2col+GEMM conv2d path (groups == 1).
+    // Matches im2col.{comp,metal,hlsl}.
+    struct ParamsIm2Col
+    {
+        uint32_t N, C, H, W;
+        uint32_t KH, KW;
+        uint32_t outH, outW;
+        uint32_t strideX, strideY;
+        uint32_t dilationX, dilationY;
+        uint32_t paddingLeft, paddingTop;
+        uint32_t tileWidth;
+    };
+    // GEMM step of im2col-based conv2d (groups == 1).
+    // Matches conv_gemm.{comp,metal,hlsl}.
+    struct ParamsConvGemm
+    {
+        uint32_t M, K, O;
+        uint32_t outH, outW;
         uint32_t tileWidth;
         uint32_t pad0, pad1, pad2;
     };
@@ -427,6 +455,50 @@ namespace
 #endif
     }
 
+    // Internal helpers used only by the GpuBackend implementation, not real IR ops.
+    enum class GpuInternalOp
+    {
+        Im2Col,
+        ConvGemm,
+        ConvFused,
+        ConvFusedBn,
+    };
+
+    ShaderBytes shaderBytesForInternal(GpuInternalOp op)
+    {
+#if defined(__APPLE__)
+        switch (op)
+        {
+        case GpuInternalOp::Im2Col:
+            return {im2col_metallib_bytes, im2col_metallib_bytes_len, "computeMain"};
+        case GpuInternalOp::ConvGemm:
+            return {conv_gemm_metallib_bytes, conv_gemm_metallib_bytes_len, "computeMain"};
+        case GpuInternalOp::ConvFused:
+            return {conv_fused_metallib_bytes, conv_fused_metallib_bytes_len, "computeMain"};
+        case GpuInternalOp::ConvFusedBn:
+            return {conv_fused_bn_metallib_bytes, conv_fused_bn_metallib_bytes_len, "computeMain"};
+        }
+#elif defined(_WIN32)
+        (void)op;
+        throw std::runtime_error(
+            "campello_nn: GpuBackend: no precompiled DirectX12 shader bytecode shipped yet "
+            "(src/gpu/shaders/*.hlsl are written but unverified — see TODO.md)");
+#else
+        switch (op)
+        {
+        case GpuInternalOp::Im2Col:
+            return {im2col_spv_bytes, im2col_spv_bytes_len, "main"};
+        case GpuInternalOp::ConvGemm:
+            return {conv_gemm_spv_bytes, conv_gemm_spv_bytes_len, "main"};
+        case GpuInternalOp::ConvFused:
+            return {conv_fused_spv_bytes, conv_fused_spv_bytes_len, "main"};
+        case GpuInternalOp::ConvFusedBn:
+            return {conv_fused_bn_spv_bytes, conv_fused_bn_spv_bytes_len, "main"};
+        }
+#endif
+        throw std::runtime_error("campello_nn: GpuBackend: unsupported GpuInternalOp");
+    }
+
     // Every op's binding layout: `numInputs` read-only storage buffers, then one
     // read/write storage buffer (the output), then one uniform buffer (params) —
     // same shape for every op in this round, so one helper covers Relu/Add/MatMul
@@ -537,23 +609,34 @@ namespace
 
     // One compiled node's resources. `output`/`paramsBuffer` are allocated once
     // at compileGraph() time (both depend only on the static IR shape, not on
-    // dispatch-time input values). `bindGroup` is deliberately NOT cached here —
-    // campello_gpu's BindGroup is immutable once created (WebGPU-shaped: to
-    // rebind a different buffer you create a new BindGroup, unlike D3D12's
-    // rebindable descriptor tables that DirectMlBackend's resolveBuffer()
-    // pattern relies on), and a node's actual input buffers may trace back to an
-    // Input node whose real Tensor differs per dispatch() call. So `dispatch()`
-    // rebuilds every real op's BindGroup fresh, every call — simpler and
-    // correct, at the cost of optimizing away rebuilds for inputs that
-    // provably never change between calls (e.g. pure-Constant subgraphs) —
-    // deliberately not done in this vertical-slice round, see TODO.md.
+    // dispatch-time input values). Bind groups are cached per-CompiledGraph in
+    // `CompiledGraph::bindGroupCache`: campello_gpu's BindGroup is immutable once
+    // created, so a different binding configuration gets a different cache key.
     struct CompiledNode
     {
         OpKind kind;
         bool usesBroadcastBinary = false; // true for Add/Mul that need broadcasting
+        bool usesIm2Col = false;          // true for Conv2d using the im2col+GEMM path
+        bool fusedWithBiasRelu = false;   // true for Conv2d fused with Add[bias] + ReLU
         std::shared_ptr<cgpu::Buffer> output;       // null for Input
         std::shared_ptr<cgpu::Buffer> paramsBuffer;  // null for Input/Constant/Concat
+        // Only used when usesIm2Col == true:
+        std::shared_ptr<cgpu::Buffer> im2ColOutput;       // im2col intermediate matrix
+        std::shared_ptr<cgpu::Buffer> convGemmParamsBuffer; // params for conv_gemm shader
+        // Only used when fusedWithBiasRelu == true:
+        size_t fusedAddIdx = SIZE_MAX;
+        size_t fusedReluIdx = SIZE_MAX;
+        size_t fusedBiasInputIdx = SIZE_MAX;
+        std::shared_ptr<cgpu::Buffer> fusedBiasBuffer;
+        // Only used when fusedWithBatchNormRelu == true:
+        bool fusedWithBatchNormRelu = false;
+        size_t fusedBatchNormIdx = SIZE_MAX;
+        size_t fusedBatchNormReluIdx = SIZE_MAX;
+        std::shared_ptr<cgpu::Buffer> fusedScaleBuffer;
+        std::shared_ptr<cgpu::Buffer> fusedFoldedBiasBuffer;
         uint64_t dispatchX = 0, dispatchY = 1, dispatchZ = 1;
+        uint64_t im2colDispatchX = 1, im2colDispatchY = 1;
+        uint64_t convGemmDispatchX = 1, convGemmDispatchY = 1;
         std::vector<ConcatPiece> concatPieces; // only populated for OpKind::Concat
 
         // In-place fusion: output aliases an earlier node's buffer instead of
@@ -563,10 +646,40 @@ namespace
         size_t inPlaceSource = SIZE_MAX; // valid when inPlaceOutput is true
     };
 
+    // Key for the per-CompiledGraph bind-group cache. A bind group is uniquely
+    // determined by its layout and the ordered set of (buffer, offset, size)
+    // bindings. Buffer object identity is captured via shared_ptr::get().
+    struct BindGroupCacheKey
+    {
+        void *layout = nullptr;
+        std::vector<std::tuple<void *, uint64_t, uint64_t>> bindings;
+
+        bool operator==(const BindGroupCacheKey &other) const
+        {
+            return layout == other.layout && bindings == other.bindings;
+        }
+    };
+
+    struct BindGroupCacheKeyHash
+    {
+        size_t operator()(const BindGroupCacheKey &k) const
+        {
+            size_t h = std::hash<void *>{}(k.layout);
+            for (const auto &b : k.bindings)
+            {
+                h ^= std::hash<void *>{}(std::get<0>(b)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<uint64_t>{}(std::get<1>(b)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<uint64_t>{}(std::get<2>(b)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            }
+            return h;
+        }
+    };
+
     struct CompiledGraph
     {
         GraphIR ir;
         std::vector<CompiledNode> nodes;
+        std::unordered_map<BindGroupCacheKey, std::shared_ptr<cgpu::BindGroup>, BindGroupCacheKeyHash> bindGroupCache;
     };
 }
 
@@ -574,6 +687,7 @@ struct GpuBackend::Impl
 {
     std::shared_ptr<cgpu::Device> device;
     std::unordered_map<OpKind, OpResources> opResources;
+    std::unordered_map<GpuInternalOp, OpResources> internalOpResources;
     std::optional<OpResources> broadcastBinaryResources;
 
     OpResources &resourcesFor(OpKind kind)
@@ -606,6 +720,46 @@ struct GpuBackend::Impl
             throw std::runtime_error("campello_nn: GpuBackend: createComputePipeline failed");
 
         auto [it2, ok] = opResources.emplace(kind, std::move(res));
+        (void)ok;
+        return it2->second;
+    }
+
+    OpResources &resourcesForInternal(GpuInternalOp op)
+    {
+        auto it = internalOpResources.find(op);
+        if (it != internalOpResources.end())
+            return it->second;
+
+        OpResources res;
+        uint32_t numInputs = 2;
+        if (op == GpuInternalOp::Im2Col)
+            numInputs = 1;
+        else if (op == GpuInternalOp::ConvFused)
+            numInputs = 3;
+        else if (op == GpuInternalOp::ConvFusedBn)
+            numInputs = 4;
+        res.bindGroupLayout = buildBindGroupLayout(*device, numInputs);
+
+        cgpu::PipelineLayoutDescriptor playoutDesc;
+        playoutDesc.bindGroupLayouts = {res.bindGroupLayout};
+        res.pipelineLayout = device->createPipelineLayout(playoutDesc);
+        if (!res.pipelineLayout)
+            throw std::runtime_error("campello_nn: GpuBackend: createPipelineLayout failed (internal)");
+
+        ShaderBytes sb = shaderBytesForInternal(op);
+        auto module = device->createShaderModule(sb.data, sb.size);
+        if (!module)
+            throw std::runtime_error("campello_nn: GpuBackend: createShaderModule failed (internal)");
+
+        cgpu::ComputePipelineDescriptor cpDesc;
+        cpDesc.compute.module = module;
+        cpDesc.compute.entryPoint = sb.entryPoint;
+        cpDesc.layout = res.pipelineLayout;
+        res.pipeline = device->createComputePipeline(cpDesc);
+        if (!res.pipeline)
+            throw std::runtime_error("campello_nn: GpuBackend: createComputePipeline failed (internal)");
+
+        auto [it2, ok] = internalOpResources.emplace(op, std::move(res));
         (void)ok;
         return it2->second;
     }
@@ -755,7 +909,71 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                 compiled->nodes[actIdx].inPlaceOutput = true;
                 compiled->nodes[actIdx].inPlaceSource = i;
             }
+
+            // Fuse Conv2d + Add[bias] + ReLU into a single dispatch when possible.
+            if (actKind == OpKind::Relu)
+            {
+                compiled->nodes[i].fusedWithBiasRelu = true;
+                compiled->nodes[i].fusedAddIdx = addIdx;
+                compiled->nodes[i].fusedReluIdx = actIdx;
+                compiled->nodes[i].fusedBiasInputIdx = biasInputIdx;
+            }
         }
+    }
+
+    // Detect Conv2d -> BatchNorm -> ReLU patterns and fold the BN affine params
+    // into the Conv2d. At inference time BN is:
+    //   y = (x - mean) * rsqrt(var + eps) * scale + bias
+    //     = x * scale_factor + folded_bias
+    // where scale_factor = scale * rsqrt(var + eps)
+    //       folded_bias  = bias - mean * scale_factor
+    // The folded params are uploaded as GPU buffers and consumed by conv_fused_bn.
+    for (size_t i = 0; i < n; i++)
+    {
+        const Node &node = ir.nodes[i];
+        if (node.kind != OpKind::Conv2d)
+            continue;
+        if (compiled->nodes[i].fusedWithBiasRelu)
+            continue;
+
+        // Conv2d must have exactly one consumer (BatchNorm).
+        if (consumers[i].size() != 1)
+            continue;
+        size_t bnIdx = consumers[i][0];
+        const Node &bnNode = ir.nodes[bnIdx];
+        if (bnNode.kind != OpKind::BatchNorm || bnNode.inputs.size() != 5)
+            continue;
+
+        // BatchNorm must have exactly one consumer (ReLU).
+        if (consumers[bnIdx].size() != 1)
+            continue;
+        size_t reluIdx = consumers[bnIdx][0];
+        if (ir.nodes[reluIdx].kind != OpKind::Relu)
+            continue;
+
+        // All BN parameters must be Constants.
+        size_t meanIdx = bnNode.inputs[1];
+        size_t varIdx = bnNode.inputs[2];
+        size_t scaleIdx = bnNode.inputs[3];
+        size_t biasIdx = bnNode.inputs[4];
+        if (ir.nodes[meanIdx].kind != OpKind::Constant ||
+            ir.nodes[varIdx].kind != OpKind::Constant ||
+            ir.nodes[scaleIdx].kind != OpKind::Constant ||
+            ir.nodes[biasIdx].kind != OpKind::Constant)
+            continue;
+
+        // The BN channel count must match the Conv output channel count.
+        const std::vector<int64_t> &wShape = ir.nodes[node.inputs[1]].shape;
+        uint32_t O = (uint32_t)wShape[0];
+        if (numElements(ir.nodes[meanIdx].shape) != O ||
+            numElements(ir.nodes[varIdx].shape) != O ||
+            numElements(ir.nodes[scaleIdx].shape) != O ||
+            numElements(ir.nodes[biasIdx].shape) != O)
+            continue;
+
+        compiled->nodes[i].fusedWithBatchNormRelu = true;
+        compiled->nodes[i].fusedBatchNormIdx = bnIdx;
+        compiled->nodes[i].fusedBatchNormReluIdx = reluIdx;
     }
 
     for (size_t i = 0; i < n; i++)
@@ -1255,18 +1473,187 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t groups = (uint32_t)p.groups;
             uint32_t inPerGroup = C / groups;
             uint32_t outPerGroup = O / groups;
-            auto &res = impl->resourcesFor(OpKind::Conv2d);
             uint64_t outCount = (uint64_t)numElements(node.shape);
             cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d output) failed");
-            uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
-            if (tileWidth < 1)
-                tileWidth = 1;
-            // The shared-memory conv2d shader is specialized for MAX_TILE_OW=32.
+
+            // Fuse Conv2d + BatchNorm + ReLU into a single dispatch when the pattern
+            // was detected above. Fold the BN affine transform into scale_factor and
+            // folded_bias buffers consumed by the conv_fused_bn shader.
+            if (cn.fusedWithBatchNormRelu)
+            {
+                const Node &bnNode = ir.nodes[cn.fusedBatchNormIdx];
+                size_t meanIdx = bnNode.inputs[1];
+                size_t varIdx = bnNode.inputs[2];
+                size_t scaleIdx = bnNode.inputs[3];
+                size_t biasIdx = bnNode.inputs[4];
+                float eps = bnNode.floatAttr0;
+
+                const float *mean = reinterpret_cast<const float *>(ir.nodes[meanIdx].constantBytes.data());
+                const float *var = reinterpret_cast<const float *>(ir.nodes[varIdx].constantBytes.data());
+                const float *scale = reinterpret_cast<const float *>(ir.nodes[scaleIdx].constantBytes.data());
+                const float *bias = reinterpret_cast<const float *>(ir.nodes[biasIdx].constantBytes.data());
+
+                std::vector<float> scaleFactor(O);
+                std::vector<float> foldedBias(O);
+                for (uint32_t o = 0; o < O; o++)
+                {
+                    scaleFactor[o] = scale[o] / sqrtf(var[o] + eps);
+                    foldedBias[o] = bias[o] - mean[o] * scaleFactor[o];
+                }
+
+                cn.fusedScaleBuffer = impl->device->createBuffer(O * sizeof(float), tensorBufferUsage(), scaleFactor.data());
+                cn.fusedFoldedBiasBuffer = impl->device->createBuffer(O * sizeof(float), tensorBufferUsage(), foldedBias.data());
+                if (!cn.fusedScaleBuffer || !cn.fusedFoldedBiasBuffer)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (folded BN params) failed");
+
+                auto &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn);
+                uint32_t tileWidth = fusedBnRes.pipeline->getWorkgroupSize().x;
+                if (tileWidth < 1)
+                    tileWidth = 1;
+                constexpr uint32_t kMaxTileWidth = 32;
+                if (tileWidth > kMaxTileWidth)
+                    tileWidth = kMaxTileWidth;
+                ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
+                                  (uint32_t)p.strideX, (uint32_t)p.strideY,
+                                  (uint32_t)p.dilationX, (uint32_t)p.dilationY,
+                                  (uint32_t)p.paddingLeft, (uint32_t)p.paddingTop,
+                                  inPerGroup, outPerGroup,
+                                  tileWidth, 0, 0, 0};
+                cn.paramsBuffer = impl->device->createBuffer(sizeof(params), cgpu::BufferUsage::uniform, &params);
+                if (!cn.paramsBuffer)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv_fused_bn params) failed");
+                uint32_t tileColsPerRow = (outW + tileWidth - 1) / tileWidth;
+                cn.dispatchX = (uint64_t)tileColsPerRow * N * O;
+                cn.dispatchY = outH;
+                cn.dispatchZ = 1;
+                continue;
+            }
+
+            // Fuse Conv2d + Add[bias] + ReLU into a single dispatch when the pattern
+            // was detected in the in-place fusion pass above. This wins on vision
+            // backbones (ResNet-50) by eliminating two dispatches and two bind-group
+            // builds per block.
+            if (cn.fusedWithBiasRelu)
+            {
+                // The bias node is an input to Add, so it can appear after Conv2d in
+                // the topologically sorted IR. Resolve it now (Constant or Reshape of
+                // Constant) and fall back to non-fused if we can't.
+                size_t biasIdx = cn.fusedBiasInputIdx;
+                cn.fusedBiasBuffer = nullptr;
+                while (biasIdx != SIZE_MAX)
+                {
+                    const Node &biasNode = ir.nodes[biasIdx];
+                    if (biasNode.kind == OpKind::Constant)
+                    {
+                        cn.fusedBiasBuffer = compiled->nodes[biasIdx].output;
+                        break;
+                    }
+                    if (biasNode.kind == OpKind::Reshape && !biasNode.inputs.empty())
+                    {
+                        biasIdx = biasNode.inputs[0];
+                        continue;
+                    }
+                    break;
+                }
+                if (!cn.fusedBiasBuffer)
+                    cn.fusedWithBiasRelu = false;
+            }
+
+            if (cn.fusedWithBiasRelu)
+            {
+                auto &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused);
+                uint32_t tileWidth = fusedRes.pipeline->getWorkgroupSize().x;
+                if (tileWidth < 1)
+                    tileWidth = 1;
+                constexpr uint32_t kMaxTileWidth = 32;
+                if (tileWidth > kMaxTileWidth)
+                    tileWidth = kMaxTileWidth;
+                ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
+                                  (uint32_t)p.strideX, (uint32_t)p.strideY,
+                                  (uint32_t)p.dilationX, (uint32_t)p.dilationY,
+                                  (uint32_t)p.paddingLeft, (uint32_t)p.paddingTop,
+                                  inPerGroup, outPerGroup,
+                                  tileWidth, 0, 0, 0};
+                cn.paramsBuffer = impl->device->createBuffer(sizeof(params), cgpu::BufferUsage::uniform, &params);
+                if (!cn.paramsBuffer)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv_fused params) failed");
+                uint32_t tileColsPerRow = (outW + tileWidth - 1) / tileWidth;
+                cn.dispatchX = (uint64_t)tileColsPerRow * N * O;
+                cn.dispatchY = outH;
+                cn.dispatchZ = 1;
+                continue;
+            }
+
+            // Decide between the im2col+GEMM path and the direct-convolution path.
+            // For now im2col is limited to groups == 1; grouped conv falls back to
+            // the direct shader.
+            //
+            // The direct-convolution shader dispatches tileWidth threads per output
+            // row; when outW is much smaller than tileWidth most of those threads are
+            // idle. The im2col+GEMM path has a more uniform dispatch shape and wins
+            // on those small-spatial-dim convolutions (e.g., YuNet), while the direct
+            // shader remains faster for large feature-map convolutions (e.g., early
+            // ResNet-50 layers) where thread utilization is already good.
+            auto &res = impl->resourcesFor(OpKind::Conv2d);
+            uint32_t convTileWidth = res.pipeline->getWorkgroupSize().x;
+            if (convTileWidth < 1)
+                convTileWidth = 1;
             constexpr uint32_t kMaxTileWidth = 32;
-            if (tileWidth > kMaxTileWidth)
-                tileWidth = kMaxTileWidth;
+            if (convTileWidth > kMaxTileWidth)
+                convTileWidth = kMaxTileWidth;
+
+            uint32_t M = N * outH * outW;
+            uint32_t K = Cg * KH * KW;
+            bool useIm2Col = (groups == 1) && (KH > 1 || KW > 1) &&
+                             (outW <= convTileWidth / 4) &&
+                             (M >= 8) && (O >= 2) && (K >= 9);
+
+            if (useIm2Col)
+            {
+                cn.usesIm2Col = true;
+                auto &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col);
+                auto &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm);
+
+                uint64_t im2ColElems = (uint64_t)M * (uint64_t)K;
+                cn.im2ColOutput = impl->device->createBuffer(im2ColElems * sizeof(float), tensorBufferUsage());
+                if (!cn.im2ColOutput)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (im2col output) failed");
+
+                constexpr uint32_t kGemmMaxTileWidth = 64;
+                uint32_t im2colTileWidth = im2colRes.pipeline->getWorkgroupSize().x;
+                if (im2colTileWidth < 1)
+                    im2colTileWidth = 1;
+                if (im2colTileWidth > kGemmMaxTileWidth)
+                    im2colTileWidth = kGemmMaxTileWidth;
+                uint32_t convGemmTileWidth = convGemmRes.pipeline->getWorkgroupSize().x;
+                if (convGemmTileWidth < 1)
+                    convGemmTileWidth = 1;
+                if (convGemmTileWidth > kGemmMaxTileWidth)
+                    convGemmTileWidth = kGemmMaxTileWidth;
+
+                ParamsIm2Col im2colParams{N, C, H, W, KH, KW, outH, outW,
+                                          (uint32_t)p.strideX, (uint32_t)p.strideY,
+                                          (uint32_t)p.dilationX, (uint32_t)p.dilationY,
+                                          (uint32_t)p.paddingLeft, (uint32_t)p.paddingTop,
+                                          im2colTileWidth};
+                cn.paramsBuffer = impl->device->createBuffer(sizeof(im2colParams), cgpu::BufferUsage::uniform, &im2colParams);
+                if (!cn.paramsBuffer)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (im2col params) failed");
+
+                ParamsConvGemm convGemmParams{M, K, O, outH, outW, convGemmTileWidth, 0, 0, 0};
+                cn.convGemmParamsBuffer = impl->device->createBuffer(sizeof(convGemmParams), cgpu::BufferUsage::uniform, &convGemmParams);
+                if (!cn.convGemmParamsBuffer)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv_gemm params) failed");
+
+                cn.im2colDispatchX = (K + im2colTileWidth - 1) / im2colTileWidth;
+                cn.im2colDispatchY = M;
+                cn.convGemmDispatchX = (O + convGemmTileWidth - 1) / convGemmTileWidth;
+                cn.convGemmDispatchY = M;
+                continue;
+            }
+            uint32_t tileWidth = convTileWidth;
             ParamsConv params{N, O, C, H, W, Cg, KH, KW, outH, outW,
                               (uint32_t)p.strideX, (uint32_t)p.strideY,
                               (uint32_t)p.dilationX, (uint32_t)p.dilationY,
@@ -1471,10 +1858,38 @@ void *GpuBackend::dispatch(
     auto encoder = impl->device->createCommandEncoder();
     auto pass = encoder->beginComputePass();
 
+    // Bind-group cache: the same binding configuration always produces the same
+    // immutable BindGroup, so reuse previously-created groups across dispatch()
+    // calls. The cache is per-CompiledGraph and keyed by layout + buffer bindings.
+    auto getOrCreateBindGroup = [&](const cgpu::BindGroupDescriptor &desc) -> std::shared_ptr<cgpu::BindGroup>
+    {
+        BindGroupCacheKey key;
+        key.layout = desc.layout.get();
+        key.bindings.reserve(desc.entries.size());
+        for (const auto &entry : desc.entries)
+        {
+            const auto &bb = std::get<cgpu::BufferBinding>(entry.resource);
+            key.bindings.push_back({bb.buffer.get(), bb.offset, bb.size});
+        }
+        auto it = g->bindGroupCache.find(key);
+        if (it != g->bindGroupCache.end())
+            return it->second;
+        auto bg = impl->device->createBindGroup(desc);
+        if (!bg)
+            throw std::runtime_error("campello_nn: GpuBackend: createBindGroup failed (cached)");
+        g->bindGroupCache.emplace(std::move(key), bg);
+        return bg;
+    };
+
     for (size_t i = 0; i < n; i++)
     {
         const Node &node = g->ir.nodes[i];
         CompiledNode &cn = g->nodes[i];
+
+        // Fused Conv2d + Add[bias] + ReLU sets the Add/ReLU resolved entries
+        // when it dispatches the Conv2d node, so skip them here.
+        if (resolved[i])
+            continue;
 
         if (node.kind == OpKind::Input)
         {
@@ -1516,12 +1931,106 @@ void *GpuBackend::dispatch(
                 bgDesc.entries.push_back({1, cgpu::BufferBinding{cn.output, 0, cn.output->getLength()}});
                 bgDesc.entries.push_back(
                     {2, cgpu::BufferBinding{piece.paramsBuffer, 0, piece.paramsBuffer->getLength()}});
-                auto bindGroup = impl->device->createBindGroup(bgDesc);
-                if (!bindGroup)
-                    throw std::runtime_error("campello_nn: GpuBackend: createBindGroup (concat piece) failed");
+                auto bindGroup = getOrCreateBindGroup(bgDesc);
                 pass->setBindGroup(0, bindGroup, {}, 0, 0);
                 pass->dispatchWorkgroups(piece.dispatchX, 1, 1);
             }
+            resolved[i] = cn.output;
+            continue;
+        }
+
+        if (node.kind == OpKind::Conv2d && cn.fusedWithBatchNormRelu)
+        {
+            // Fused Conv2d + BatchNorm + ReLU path.
+            OpResources &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn);
+
+            auto &inputBuf = resolved[node.inputs[0]];
+            auto &weightBuf = resolved[node.inputs[1]];
+            auto &scaleBuf = cn.fusedScaleBuffer;
+            auto &foldedBiasBuf = cn.fusedFoldedBiasBuffer;
+            if (!inputBuf || !weightBuf || !scaleBuf || !foldedBiasBuf || !cn.output || !cn.paramsBuffer)
+                throw std::runtime_error("campello_nn: GpuBackend: null buffer binding in conv_fused_bn dispatch");
+
+            cgpu::BindGroupDescriptor bgDesc;
+            bgDesc.layout = fusedBnRes.bindGroupLayout;
+            bgDesc.entries.push_back({0, cgpu::BufferBinding{inputBuf, 0, inputBuf->getLength()}});
+            bgDesc.entries.push_back({1, cgpu::BufferBinding{weightBuf, 0, weightBuf->getLength()}});
+            bgDesc.entries.push_back({2, cgpu::BufferBinding{scaleBuf, 0, scaleBuf->getLength()}});
+            bgDesc.entries.push_back({3, cgpu::BufferBinding{foldedBiasBuf, 0, foldedBiasBuf->getLength()}});
+            bgDesc.entries.push_back({4, cgpu::BufferBinding{cn.output, 0, cn.output->getLength()}});
+            bgDesc.entries.push_back({5, cgpu::BufferBinding{cn.paramsBuffer, 0, cn.paramsBuffer->getLength()}});
+            auto bindGroup = getOrCreateBindGroup(bgDesc);
+            pass->setPipeline(fusedBnRes.pipeline);
+            pass->setBindGroup(0, bindGroup, {}, 0, 0);
+            pass->dispatchWorkgroups(cn.dispatchX, cn.dispatchY, cn.dispatchZ);
+
+            resolved[i] = cn.output;
+            resolved[cn.fusedBatchNormIdx] = cn.output;
+            resolved[cn.fusedBatchNormReluIdx] = cn.output;
+            continue;
+        }
+
+        if (node.kind == OpKind::Conv2d && cn.fusedWithBiasRelu)
+        {
+            // Fused Conv2d + Add[bias] + ReLU path.
+            OpResources &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused);
+
+            auto &inputBuf = resolved[node.inputs[0]];
+            auto &weightBuf = resolved[node.inputs[1]];
+            auto &biasBuf = cn.fusedBiasBuffer;
+            if (!inputBuf || !weightBuf || !biasBuf || !cn.output || !cn.paramsBuffer)
+                throw std::runtime_error("campello_nn: GpuBackend: null buffer binding in conv_fused dispatch");
+
+            cgpu::BindGroupDescriptor bgDesc;
+            bgDesc.layout = fusedRes.bindGroupLayout;
+            bgDesc.entries.push_back({0, cgpu::BufferBinding{inputBuf, 0, inputBuf->getLength()}});
+            bgDesc.entries.push_back({1, cgpu::BufferBinding{weightBuf, 0, weightBuf->getLength()}});
+            bgDesc.entries.push_back({2, cgpu::BufferBinding{biasBuf, 0, biasBuf->getLength()}});
+            bgDesc.entries.push_back({3, cgpu::BufferBinding{cn.output, 0, cn.output->getLength()}});
+            bgDesc.entries.push_back({4, cgpu::BufferBinding{cn.paramsBuffer, 0, cn.paramsBuffer->getLength()}});
+            auto bindGroup = getOrCreateBindGroup(bgDesc);
+            pass->setPipeline(fusedRes.pipeline);
+            pass->setBindGroup(0, bindGroup, {}, 0, 0);
+            pass->dispatchWorkgroups(cn.dispatchX, cn.dispatchY, cn.dispatchZ);
+
+            resolved[i] = cn.output;
+            resolved[cn.fusedAddIdx] = cn.output;
+            resolved[cn.fusedReluIdx] = cn.output;
+            continue;
+        }
+
+        if (node.kind == OpKind::Conv2d && cn.usesIm2Col)
+        {
+            // im2col + GEMM path (groups == 1).
+            OpResources &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col);
+            OpResources &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm);
+
+            auto &inputBuf = resolved[node.inputs[0]];
+            auto &weightBuf = resolved[node.inputs[1]];
+
+            // im2col dispatch
+            cgpu::BindGroupDescriptor im2colBgDesc;
+            im2colBgDesc.layout = im2colRes.bindGroupLayout;
+            im2colBgDesc.entries.push_back({0, cgpu::BufferBinding{inputBuf, 0, inputBuf->getLength()}});
+            im2colBgDesc.entries.push_back({1, cgpu::BufferBinding{cn.im2ColOutput, 0, cn.im2ColOutput->getLength()}});
+            im2colBgDesc.entries.push_back({2, cgpu::BufferBinding{cn.paramsBuffer, 0, cn.paramsBuffer->getLength()}});
+            auto im2colBindGroup = getOrCreateBindGroup(im2colBgDesc);
+            pass->setPipeline(im2colRes.pipeline);
+            pass->setBindGroup(0, im2colBindGroup, {}, 0, 0);
+            pass->dispatchWorkgroups(cn.im2colDispatchX, cn.im2colDispatchY, 1);
+
+            // GEMM dispatch
+            cgpu::BindGroupDescriptor gemmBgDesc;
+            gemmBgDesc.layout = convGemmRes.bindGroupLayout;
+            gemmBgDesc.entries.push_back({0, cgpu::BufferBinding{cn.im2ColOutput, 0, cn.im2ColOutput->getLength()}});
+            gemmBgDesc.entries.push_back({1, cgpu::BufferBinding{weightBuf, 0, weightBuf->getLength()}});
+            gemmBgDesc.entries.push_back({2, cgpu::BufferBinding{cn.output, 0, cn.output->getLength()}});
+            gemmBgDesc.entries.push_back({3, cgpu::BufferBinding{cn.convGemmParamsBuffer, 0, cn.convGemmParamsBuffer->getLength()}});
+            auto gemmBindGroup = getOrCreateBindGroup(gemmBgDesc);
+            pass->setPipeline(convGemmRes.pipeline);
+            pass->setBindGroup(0, gemmBindGroup, {}, 0, 0);
+            pass->dispatchWorkgroups(cn.convGemmDispatchX, cn.convGemmDispatchY, 1);
+
             resolved[i] = cn.output;
             continue;
         }
@@ -1541,9 +2050,7 @@ void *GpuBackend::dispatch(
         bgDesc.entries.push_back({binding++, cgpu::BufferBinding{cn.output, 0, cn.output->getLength()}});
         bgDesc.entries.push_back({binding++, cgpu::BufferBinding{cn.paramsBuffer, 0, cn.paramsBuffer->getLength()}});
 
-        auto bindGroup = impl->device->createBindGroup(bgDesc);
-        if (!bindGroup)
-            throw std::runtime_error("campello_nn: GpuBackend: createBindGroup failed");
+        auto bindGroup = getOrCreateBindGroup(bgDesc);
 
         pass->setPipeline(res.pipeline);
         pass->setBindGroup(0, bindGroup, {}, 0, 0);
@@ -1565,11 +2072,10 @@ void *GpuBackend::dispatch(
 
     auto cmdBuffer = encoder->finish();
     // Blocks here (synchronous dispatch, same convention the CPU/MPSGraph/
-    // DirectML backends already use) via a real campello_gpu::Fence. Needs
-    // the local 0.13.3 fix (see TODO.md) to work correctly: a freshly created
-    // Fence previously defaulted to already-signaled, so wait() returned
-    // immediately without ever waiting for this submission — Device::submit()
-    // now resets it to unsignaled right before commit.
+    // DirectML backends already use) via a real campello_gpu::Fence. As of
+    // campello_gpu v0.14.0, Device::submit() resets a freshly created fence to
+    // unsignaled right before commit, so wait() here actually waits for the
+    // submission instead of returning immediately.
     auto fence = impl->device->createFence();
     impl->device->submit(cmdBuffer, fence);
     fence->wait();

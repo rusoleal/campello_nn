@@ -1,0 +1,53 @@
+#version 450
+
+// Vulkan (GLSL). im2col for NCHW float32 conv2d (groups == 1).
+// Output is a row-major [M, K] matrix where:
+//   M = N * outH * outW
+//   K = C * KH * KW
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
+layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(binding = 2) uniform Params
+{
+    uint N, C, H, W;
+    uint KH, KW;
+    uint outH, outW;
+    uint strideX, strideY;
+    uint dilationX, dilationY;
+    uint paddingLeft, paddingTop;
+    uint tileWidth;
+} params;
+
+void main()
+{
+    if (gl_LocalInvocationID.x >= params.tileWidth)
+        return;
+
+    uint K = params.C * params.KH * params.KW;
+    uint k = gl_WorkGroupID.x * params.tileWidth + gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.y;
+    if (m >= params.N * params.outH * params.outW || k >= K)
+        return;
+
+    uint outPlane = params.outH * params.outW;
+    uint n = m / outPlane;
+    uint r = m % outPlane;
+    uint oh = r / params.outW;
+    uint ow = r % params.outW;
+
+    uint c = k / (params.KH * params.KW);
+    uint rem = k % (params.KH * params.KW);
+    uint kh = rem / params.KW;
+    uint kw = rem % params.KW;
+
+    int ih = int(oh * params.strideY) + int(kh * params.dilationY) - int(params.paddingTop);
+    int iw = int(ow * params.strideX) + int(kw * params.dilationX) - int(params.paddingLeft);
+
+    float val = 0.0;
+    if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W))
+    {
+        val = xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
+    }
+    outputBuf.data[m * K + k] = val;
+}
