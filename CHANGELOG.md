@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared path off, the 2D dispatch still improved YuNet latency on macOS/Metal from ~673 ms
   to ~617 ms (~8%). The shared-memory implementation is left in place for re-enablement/tuning
   on discrete GPUs.
+- **ONNX importer:** added support for `Flatten`, `GlobalAveragePool`, and `Gemm` with
+  `transA`/`transB` (inserting explicit `transpose()` ops when needed). This enables importing
+  standard ResNet-style image-classification models.
+- **Benchmark:** added a third workload, ResNet-50 v1 image classification (224×224 ONNX,
+  ImageNet preprocessing), alongside the existing transformer-block and YuNet workloads.
+  On macOS/Metal (Intel UHD 630): CPU ~4.3 s, `GpuGeneric` ~1.1 s (~3.8× faster than CPU),
+  MPSGraph ~185 ms.
 
 ---
 

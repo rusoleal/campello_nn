@@ -17,6 +17,11 @@
   to regenerate fixtures; `tflite_parser.cpp`'s hand-written field accessors are what the
   library actually ships with).
 
+- `resnet50-v1-7.onnx` — from the [ONNX Model Zoo](https://github.com/onnx/models),
+  `validated/vision/classification/resnet/model/resnet50-v1-7.onnx`. MIT License
+  (Copyright (c) ONNX Project Contributors). Used here as a larger, standard image-
+  classification benchmark in `benchmarks/benchmark_backends.cpp`.
+
 - `blaze_face_short_range.tflite` — from
   [Google MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector),
   downloaded from

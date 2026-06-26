@@ -1,12 +1,14 @@
 // Benchmarks campello_nn backends (Cpu, GpuGeneric, and platform-native Gpu)
-// on two workloads:
+// on three workloads:
 //   1. Synthetic transformer block: matmul -> add -> gelu -> layerNorm
 //   2. Real model: YuNet face detection (ONNX import + image decode/resize)
+//   3. Real model: ResNet-50 v1 image classification (ONNX import + ImageNet
+//      preprocessing)
 //
 // Build with -DBUILD_BENCHMARKS=ON, then run:
 //   ./build/benchmarks/campello_nn_benchmark [batch] [hidden]
 //
-// The YuNet workload is included when CAMPELLO_NN_TEST_FIXTURES_DIR is defined
+// The vision workloads are included when CAMPELLO_NN_TEST_FIXTURES_DIR is defined
 // (i.e., when campello_image is available).
 
 #include <algorithm>
@@ -373,6 +375,83 @@ namespace
         return maxScore;
     }
 
+    std::vector<float> loadAndPreprocessImageResNet(std::shared_ptr<cnn::Context> context,
+                                                     const std::string &path)
+    {
+        auto img = cimg::Image::fromFile(path.c_str());
+        if (!img)
+            throw std::runtime_error("benchmark: failed to decode image '" + path + "'");
+        int64_t W = img->getWidth(), H = img->getHeight();
+        const uint8_t *rgba = (const uint8_t *)img->getData();
+
+        // Convert RGBA -> RGB NCHW float in [0, 255].
+        std::vector<float> rgb(static_cast<size_t>(3 * H * W));
+        for (int64_t y = 0; y < H; y++)
+        {
+            for (int64_t x = 0; x < W; x++)
+            {
+                const uint8_t *px = rgba + static_cast<size_t>(y * W + x) * 4;
+                size_t idx = static_cast<size_t>(y * W + x);
+                rgb[(0 * H * W) + idx] = px[0]; // R
+                rgb[(1 * H * W) + idx] = px[1]; // G
+                rgb[(2 * H * W) + idx] = px[2]; // B
+            }
+        }
+
+        // Resize to 224x224 using campello_nn's resize op.
+        const int64_t targetSize = 224;
+        cnn::GraphBuilder builder(context);
+        auto x = builder.input("x", {cnn::DataType::Float32, {1, 3, H, W}});
+        cnn::ResizeDescriptor desc;
+        desc.outputHeight = targetSize;
+        desc.outputWidth = targetSize;
+        desc.mode = cnn::ResizeMode::Bilinear;
+        auto graph = builder.build({{"out", builder.resize(x, desc)}});
+
+        auto tin = context->createTensor({cnn::DataType::Float32, {1, 3, H, W}, false, true});
+        auto tout = context->createTensor({cnn::DataType::Float32,
+                                           {1, 3, targetSize, targetSize}, true, false});
+        tin->write(rgb.data(), rgb.size() * sizeof(float));
+        auto fence = context->dispatch(*graph, {{"x", tin}}, {{"out", tout}});
+        fence->wait();
+
+        std::vector<float> resized(static_cast<size_t>(3 * targetSize * targetSize));
+        tout->read(resized.data(), resized.size() * sizeof(float));
+
+        // ImageNet normalization: (x / 255 - mean) / std, channels in RGB order.
+        const float mean[3] = {0.485f, 0.456f, 0.406f};
+        const float stddev[3] = {0.229f, 0.224f, 0.225f};
+        size_t spatial = static_cast<size_t>(targetSize * targetSize);
+        for (int c = 0; c < 3; ++c)
+        {
+            for (size_t i = 0; i < spatial; ++i)
+            {
+                float v = resized[c * spatial + i] / 255.0f;
+                resized[c * spatial + i] = (v - mean[c]) / stddev[c];
+            }
+        }
+        return resized;
+    }
+
+    std::vector<float> runResNet(std::shared_ptr<cnn::Context> context,
+                                  cnn::OnnxImportResult &model,
+                                  const std::vector<float> &inputData)
+    {
+        auto inTensor = context->createTensor(model.inputs.at("data"));
+        inTensor->write(inputData.data(), inputData.size() * sizeof(float));
+
+        std::unordered_map<std::string, std::shared_ptr<cnn::Tensor>> outputs;
+        for (auto &kv : model.outputs)
+            outputs[kv.first] = context->createTensor(kv.second);
+
+        auto fence = context->dispatch(*model.graph, {{"data", inTensor}}, outputs);
+        fence->wait();
+
+        std::vector<float> out(static_cast<size_t>(model.outputs.begin()->second.shape[1]));
+        outputs.begin()->second->read(out.data(), out.size() * sizeof(float));
+        return out;
+    }
+
     void benchmarkYuNet()
     {
         std::printf("\n=== YuNet face detection (320x320 ONNX) ===\n");
@@ -455,6 +534,82 @@ namespace
                         r.maxAbsDiff);
         }
     }
+
+    void benchmarkResNet50()
+    {
+        std::printf("\n=== ResNet-50 v1 image classification (224x224 ONNX) ===\n");
+        std::printf("  Warm-up: 3, Timed iterations: 10\n\n");
+
+        std::string fixturesDir = CAMPELLO_NN_TEST_FIXTURES_DIR;
+        std::string modelPath = fixturesDir + "/resnet50-v1-7.onnx";
+
+        // Preprocess image once on CPU (not part of the model timing).
+        std::vector<float> inputData;
+        {
+            auto cpuContext = cnn::Context::create({cnn::DeviceType::Cpu});
+            inputData = loadAndPreprocessImageResNet(cpuContext, fixturesDir + "/images/face.jpg");
+        }
+
+        // Compute CPU reference logits once.
+        std::vector<float> referenceOutput;
+        {
+            auto cpuContext = cnn::Context::create({cnn::DeviceType::Cpu});
+            auto model = cnn::importOnnxFromFile(cpuContext, modelPath);
+            referenceOutput = runResNet(cpuContext, model, inputData);
+            std::printf("  CPU reference top-1 logit: %.4f\n\n",
+                        *std::max_element(referenceOutput.begin(), referenceOutput.end()));
+        }
+
+        auto benchmarkBackendResNet = [&](cnn::DeviceType type) -> BackendResult
+        {
+            BackendResult r{type, {}, 0.0, false};
+            try
+            {
+                auto context = cnn::Context::create({type});
+                auto model = cnn::importOnnxFromFile(context, modelPath);
+
+                r.stats = timeIterations(3, 10, [&]()
+                                         { runResNet(context, model, inputData); });
+
+                auto out = runResNet(context, model, inputData);
+                r.maxAbsDiff = 0.0;
+                for (size_t i = 0; i < out.size(); ++i)
+                    r.maxAbsDiff = std::max(r.maxAbsDiff,
+                                            static_cast<double>(std::abs(out[i] - referenceOutput[i])));
+                r.available = true;
+            }
+            catch (const std::exception &e)
+            {
+                std::fprintf(stderr, "%s unavailable: %s\n", deviceTypeName(type), e.what());
+            }
+            return r;
+        };
+
+        std::vector<BackendResult> results;
+        results.push_back(benchmarkBackendResNet(cnn::DeviceType::Cpu));
+        results.push_back(benchmarkBackendResNet(cnn::DeviceType::GpuGeneric));
+#ifdef __APPLE__
+        results.push_back(benchmarkBackendResNet(cnn::DeviceType::Gpu));
+#endif
+
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "Backend", "min", "median", "mean", "max", "maxAbsDiff");
+        std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                    "-------", "---", "------", "----", "---", "------------");
+        for (const auto &r : results)
+        {
+            if (!r.available)
+            {
+                std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
+                            deviceTypeName(r.type), "N/A", "N/A", "N/A", "N/A", "N/A");
+                continue;
+            }
+            std::printf("%-18s %9.3f ms %9.3f ms %9.3f ms %9.3f ms %11.3e\n",
+                        deviceTypeName(r.type),
+                        r.stats.min, r.stats.median, r.stats.mean, r.stats.max,
+                        r.maxAbsDiff);
+        }
+    }
 #endif // CAMPELLO_NN_TEST_FIXTURES_DIR
 }
 
@@ -477,8 +632,9 @@ int main(int argc, char **argv)
 
 #ifdef CAMPELLO_NN_TEST_FIXTURES_DIR
     benchmarkYuNet();
+    benchmarkResNet50();
 #else
-    std::printf("\nYuNet workload skipped (campello_image not available).\n");
+    std::printf("\nVision workloads skipped (campello_image not available).\n");
 #endif
 
     return 0;

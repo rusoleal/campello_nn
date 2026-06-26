@@ -6,3 +6,5 @@ build_*
 *.spv
 *.metallib
 *.air
+# Large downloaded benchmark fixture; fetched at configure time by benchmarks/CMakeLists.txt
+tests/fixtures/resnet50-v1-7.onnx

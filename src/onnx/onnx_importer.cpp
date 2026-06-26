@@ -129,13 +129,17 @@ namespace
             return builder.matmul(in(0), in(1));
         if (node.opType == "Gemm")
         {
-            if (getIntAttr(node, "transA", 0) != 0 || getIntAttr(node, "transB", 0) != 0)
-                throw std::runtime_error("campello_nn: ONNX Gemm with transA/transB set is not yet supported by the ONNX importer");
             if (node.inputs.size() < 3)
                 throw std::runtime_error("campello_nn: ONNX Gemm without a C input is not yet supported by the ONNX importer");
             float alpha = getFloatAttr(node, "alpha", 1.0f);
             float beta = getFloatAttr(node, "beta", 1.0f);
-            return builder.gemm(in(0), in(1), in(2), alpha, beta);
+            Operand a = in(0);
+            Operand b = in(1);
+            if (getIntAttr(node, "transA", 0) != 0)
+                a = builder.transpose(a, {1, 0});
+            if (getIntAttr(node, "transB", 0) != 0)
+                b = builder.transpose(b, {1, 0});
+            return builder.gemm(a, b, in(2), alpha, beta);
         }
         if (node.opType == "BatchNormalization")
         {
@@ -169,6 +173,35 @@ namespace
             desc.paddingBottom = pads[2];
             desc.paddingRight = pads[3];
             return node.opType == "MaxPool" ? builder.maxPool2d(in(0), desc) : builder.avgPool2d(in(0), desc);
+        }
+        if (node.opType == "GlobalAveragePool")
+        {
+            Operand x = in(0);
+            std::vector<int64_t> inputShape = internal::operandShapeForImport(x);
+            if (inputShape.size() != 4)
+                throw std::runtime_error("campello_nn: ONNX GlobalAveragePool expects a rank-4 (NCHW) input");
+            Pool2dDescriptor desc;
+            desc.kernelHeight = inputShape[2];
+            desc.kernelWidth = inputShape[3];
+            desc.strideY = inputShape[2];
+            desc.strideX = inputShape[3];
+            return builder.avgPool2d(x, desc);
+        }
+        if (node.opType == "Flatten")
+        {
+            Operand x = in(0);
+            std::vector<int64_t> inputShape = internal::operandShapeForImport(x);
+            int64_t axis = getIntAttr(node, "axis", 1);
+            if (axis < 0)
+                axis += static_cast<int64_t>(inputShape.size());
+            if (axis < 0 || axis > static_cast<int64_t>(inputShape.size()))
+                throw std::runtime_error("campello_nn: ONNX Flatten 'axis' out of range");
+            int64_t outer = 1, inner = 1;
+            for (int64_t i = 0; i < axis; ++i)
+                outer *= inputShape[i];
+            for (size_t i = axis; i < inputShape.size(); ++i)
+                inner *= inputShape[i];
+            return builder.reshape(x, {outer, inner});
         }
         if (node.opType == "Reshape")
         {
@@ -260,6 +293,10 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
 
     for (auto &vi : onnxGraph.inputs)
     {
+        // ONNX models often list initializers (weights) as graph inputs too.
+        // Treat them as constants below; don't expose them as user-provided inputs.
+        if (onnxGraph.initializers.count(vi.name))
+            continue;
         TensorDescriptor desc{onnx::onnxElemTypeToDataType(vi.elemType), vi.shape, false, true};
         values[vi.name] = builder.input(vi.name, desc);
         result.inputs[vi.name] = desc;

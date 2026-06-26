@@ -787,6 +787,12 @@ vendor). Two real strategies exist:
       to identify why the naive conv2d path is still ~9× slower than MPSGraph — likely kernel
       fusion (Winograd/im2col+GEMM) or reduced dispatch overhead — and implement a matching
       optimization.
+- [x] **Benchmark on a bigger real model: ResNet-50.** Downloaded ResNet-50 v1-7 from the
+      ONNX Model Zoo (~98 MB) to `tests/fixtures/`, added ONNX importer support for the
+      `Flatten`/`GlobalAveragePool`/`Gemm(transB=1)` ops it uses, and added a ResNet-50
+      workload to `benchmarks/benchmark_backends.cpp` with ImageNet preprocessing. Verified
+      on macOS/Metal: CPU ~4.3 s, `GpuGeneric` ~1.1 s, MPSGraph ~185 ms; all backends agree
+      within ~1e-5 maxAbsDiff.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above
