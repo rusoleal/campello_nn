@@ -766,13 +766,18 @@ vendor). Two real strategies exist:
       (`TILE_K=128`). The reason is that `m = 1` gives no cross-output reuse of A, so the
       barriers and cooperative-load overhead are not amortized. The matmul shader was reverted to
       the simple dynamic-tile version.
-- [ ] **Fifth `GpuGeneric` performance optimization: op fusion for the transformer block.** With
-      shared-memory tiling ruled out for `m = 1`, the remaining ~2.2 ms transformer-block latency
-      is dominated by CPU-GPU dispatch overhead across four separate kernels (`matmul`, `add`,
-      `gelu`, `layerNorm`). Fusing those four ops into a single kernel would eliminate three
-      dispatches, three intermediate buffers, and three round-trips through device memory. The
-      natural first target is the exact sequence exercised by the benchmark:
-      `matmul → add → gelu → layerNorm`.
+- [x] **Fifth `GpuGeneric` performance optimization: in-place elementwise fusion for YuNet.**
+      Detected `Conv2d → Add[bias] → Relu/Sigmoid` patterns in `GpuBackend::compileGraph()` and
+      made the Add/Relu/Sigmoid nodes alias the Conv2d output buffer instead of allocating their
+      own. This avoids the intermediate buffer allocations and memory round-trips for those
+      sequences. On macOS/Metal (Intel UHD 630) YuNet latency improved from ~697 ms to ~673 ms
+      (~3.5%). All 179 tests pass.
+- [ ] **Sixth `GpuGeneric` performance optimization: shared-memory tiled conv2d.** The YuNet gap
+      to MPSGraph is still large (~673 ms `GpuGeneric` vs. ~70 ms MPSGraph, ~9.6×). Since conv2d
+      dominates the model and has real cross-output reuse of input activations and weights, a
+      `threadgroup`-memory tiled conv2d (cooperatively loading an input tile and/or weight tile
+      per workgroup) is the next optimization to close that gap. Unlike the transformer-block
+      matmul, this shape has enough reuse to amortize barrier overhead.
 - [ ] Real Vulkan execution verification (Linux/Android hardware or `llvmpipe`/Mesa software
       Vulkan) and any real DirectX12 verification (Windows toolchain) — both currently
       compile-only-or-less, as noted above

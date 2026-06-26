@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the new `campello_gpu::ComputePipeline::getWorkgroupSize()` query, eliminating idle threads
   on Metal. On macOS/Metal (Intel UHD 630) this makes `GpuGeneric` faster than the CPU backend on
   YuNet for the first time (~675 ms CPU vs. ~654 ms `GpuGeneric`).
+- `GpuGeneric` now detects `Conv2d -> Add[bias] -> Relu/Sigmoid` patterns and aliases the
+  elementwise outputs to the Conv2d output buffer in-place, avoiding intermediate buffer
+  allocations and memory round-trips. YuNet benchmark latency on macOS/Metal improved from
+  ~697 ms to ~673 ms (~3.5%).
 
 ---
 

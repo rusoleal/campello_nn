@@ -555,6 +555,12 @@ namespace
         std::shared_ptr<cgpu::Buffer> paramsBuffer;  // null for Input/Constant/Concat
         uint64_t dispatchX = 0, dispatchY = 1, dispatchZ = 1;
         std::vector<ConcatPiece> concatPieces; // only populated for OpKind::Concat
+
+        // In-place fusion: output aliases an earlier node's buffer instead of
+        // allocating a fresh one. Used for elementwise ops (Add/Relu) that
+        // follow a Conv2d, so intermediate buffers/memory traffic are avoided.
+        bool inPlaceOutput = false;
+        size_t inPlaceSource = SIZE_MAX; // valid when inPlaceOutput is true
     };
 
     struct CompiledGraph
@@ -689,6 +695,69 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
     size_t n = ir.nodes.size();
     compiled->nodes.resize(n);
 
+    // Build a map from each node's index to the list of nodes that consume it.
+    std::vector<std::vector<size_t>> consumers(n);
+    for (size_t i = 0; i < n; i++)
+    {
+        for (size_t inIdx : ir.nodes[i].inputs)
+        {
+            if (inIdx < n)
+                consumers[inIdx].push_back(i);
+        }
+    }
+
+    // Detect Conv2d -> Add[bias] -> activation patterns so the elementwise
+    // ops can reuse the Conv2d output buffer in-place. This avoids allocating
+    // and writing intermediate buffers without needing a custom conv shader.
+    // The ONNX importer produces: Conv2d(x,w) -> Reshape(bias_const) -> Add -> Relu/Sigmoid.
+    std::function<bool(size_t)> isBiasConstantChain = [&](size_t idx) -> bool
+    {
+        if (idx >= n)
+            return false;
+        const Node &node = ir.nodes[idx];
+        if (node.kind == OpKind::Constant)
+            return true;
+        if (node.kind == OpKind::Reshape && node.inputs.size() == 1)
+            return isBiasConstantChain(node.inputs[0]);
+        return false;
+    };
+
+    for (size_t i = 0; i < n; i++)
+    {
+        const Node &node = ir.nodes[i];
+        if (node.kind != OpKind::Conv2d)
+            continue;
+
+        // Conv2d must have exactly one consumer (the Add) for in-place fusion.
+        if (consumers[i].size() != 1)
+            continue;
+        size_t addIdx = consumers[i][0];
+        const Node &addNode = ir.nodes[addIdx];
+        if (addNode.kind != OpKind::Add || addNode.inputs.size() != 2)
+            continue;
+
+        // Identify which Add input is the conv output and which is the bias.
+        size_t biasInputIdx = (addNode.inputs[0] == i) ? addNode.inputs[1] : addNode.inputs[0];
+        if (!isBiasConstantChain(biasInputIdx))
+            continue;
+
+        // Mark Add to write in-place to the Conv2d output buffer.
+        compiled->nodes[addIdx].inPlaceOutput = true;
+        compiled->nodes[addIdx].inPlaceSource = i;
+
+        // If Add is followed by a single Relu/Sigmoid, mark that as in-place too.
+        if (consumers[addIdx].size() == 1)
+        {
+            size_t actIdx = consumers[addIdx][0];
+            OpKind actKind = ir.nodes[actIdx].kind;
+            if (actKind == OpKind::Relu || actKind == OpKind::Sigmoid)
+            {
+                compiled->nodes[actIdx].inPlaceOutput = true;
+                compiled->nodes[actIdx].inPlaceSource = i;
+            }
+        }
+    }
+
     for (size_t i = 0; i < n; i++)
     {
         const Node &node = ir.nodes[i];
@@ -726,18 +795,30 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             continue;
 
         case OpKind::Relu:
+        case OpKind::Sigmoid:
         {
             if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: relu() only supports Float32 in this round");
-            impl->resourcesFor(OpKind::Relu);
+                throw std::runtime_error(std::string("campello_nn: GpuBackend: ") +
+                    (node.kind == OpKind::Relu ? "relu()" : "sigmoid()") +
+                    " only supports Float32 in this round");
+            impl->resourcesFor(node.kind);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
-            if (!cn.output)
-                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu output) failed");
+            if (cn.inPlaceOutput)
+            {
+                cn.output = compiled->nodes[cn.inPlaceSource].output;
+                if (!cn.output)
+                    throw std::runtime_error("campello_nn: GpuBackend: in-place relu/sigmoid source has no buffer");
+            }
+            else
+            {
+                cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+                if (!cn.output)
+                    throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu/sigmoid output) failed");
+            }
             ParamsElementwise p{(uint32_t)count, 0, 0, 0};
             cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
             if (!cn.paramsBuffer)
-                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu params) failed");
+                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu/sigmoid params) failed");
             cn.dispatchX = count;
             continue;
         }
@@ -755,11 +836,22 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             const std::vector<int64_t> &bShape = ir.nodes[node.inputs[1]].shape;
             bool broadcast = (aShape != node.shape || bShape != node.shape);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
-            if (!cn.output)
-                throw std::runtime_error(
-                    std::string("campello_nn: GpuBackend: createBuffer (") +
-                    (node.kind == OpKind::Add ? "add" : "mul") + " output) failed");
+            if (cn.inPlaceOutput)
+            {
+                cn.output = compiled->nodes[cn.inPlaceSource].output;
+                if (!cn.output)
+                    throw std::runtime_error(
+                        std::string("campello_nn: GpuBackend: in-place ") +
+                        (node.kind == OpKind::Add ? "add" : "mul") + " source has no buffer");
+            }
+            else
+            {
+                cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+                if (!cn.output)
+                    throw std::runtime_error(
+                        std::string("campello_nn: GpuBackend: createBuffer (") +
+                        (node.kind == OpKind::Add ? "add" : "mul") + " output) failed");
+            }
 
             if (broadcast)
             {
@@ -884,7 +976,6 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
 
 
-        case OpKind::Sigmoid:
         case OpKind::Gelu:
         {
             if (node.dataType != DataType::Float32)
