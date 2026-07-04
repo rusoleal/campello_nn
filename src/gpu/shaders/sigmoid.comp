@@ -1,16 +1,34 @@
-#version 450
-
 // Vulkan (GLSL). Same one-workgroup-per-element model; see relu.comp's comment.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params { uint count; uint pad0; uint pad1; uint pad2; } params;
 
 void main()
 {
-    uint idx = gl_WorkGroupID.x;
-    if (idx >= params.count)
+    uint base = gl_WorkGroupID.x * 4u;
+    if (base >= params.count)
         return;
-    outputBuf.data[idx] = 1.0 / (1.0 + exp(-inputBuf.data[idx]));
+
+    uint end = min(base + 4u, params.count);
+    if (end - base == 4u)
+    {
+        T4 v = T4(inputBuf.data[base], inputBuf.data[base + 1u],
+                  inputBuf.data[base + 2u], inputBuf.data[base + 3u]);
+        T4 one = T4(T(1.0));
+        v = one / (one + exp(-v));
+        outputBuf.data[base]      = v.x;
+        outputBuf.data[base + 1u] = v.y;
+        outputBuf.data[base + 2u] = v.z;
+        outputBuf.data[base + 3u] = v.w;
+    }
+    else
+    {
+        for (uint i = base; i < end; ++i)
+        {
+            float v = TO_FLOAT(inputBuf.data[i]);
+            outputBuf.data[i] = TO_T(1.0 / (1.0 + exp(-v)));
+        }
+    }
 }

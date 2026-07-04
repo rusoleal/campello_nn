@@ -10,9 +10,9 @@ struct Params
     uint numIndices;
 };
 
-StructuredBuffer<float> dataBuf : register(t0);
+StructuredBuffer<T> dataBuf : register(t0);
 StructuredBuffer<uint> indicesBuf : register(t1);
-RWStructuredBuffer<float> outputBuf : register(u0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

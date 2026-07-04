@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. See relu.metal's comment for the thread-0 gate rationale, and
 // gelu.comp's comment for why this needs a manual erf approximation
 // (metal_stdlib has no native erf — verified directly against the installed
@@ -29,17 +26,46 @@ static inline float erfApprox(float x)
     return s * y;
 }
 
-kernel void computeMain(const device float *inputBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+T4 geluT4(T4 v)
+{
+    T4 r;
+    for (int i = 0; i < 4; ++i)
+    {
+        float x = TO_FLOAT(v[i]);
+        r[i] = TO_T(0.5f * x * (1.0f + erfApprox(x * 0.70710678118654752f)));
+    }
+    return r;
+}
+
+kernel void computeMain(const device T *inputBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint groupId [[threadgroup_position_in_grid]],
                          uint localId [[thread_position_in_threadgroup]])
 {
     if (localId != 0)
         return;
-    uint idx = groupId;
-    if (idx >= params.count)
+    uint base = groupId * 4u;
+    if (base >= params.count)
         return;
-    float v = inputBuf[idx];
-    outputBuf[idx] = 0.5f * v * (1.0f + erfApprox(v * 0.70710678118654752f));
+
+    uint end = min(base + 4u, params.count);
+    if (end - base == 4u)
+    {
+        T4 v = T4(inputBuf[base], inputBuf[base + 1u],
+                  inputBuf[base + 2u], inputBuf[base + 3u]);
+        v = geluT4(v);
+        outputBuf[base]      = v.x;
+        outputBuf[base + 1u] = v.y;
+        outputBuf[base + 2u] = v.z;
+        outputBuf[base + 3u] = v.w;
+    }
+    else
+    {
+        for (uint i = base; i < end; ++i)
+        {
+            float v = TO_FLOAT(inputBuf[i]);
+            outputBuf[i] = TO_T(0.5f * v * (1.0f + erfApprox(v * 0.70710678118654752f)));
+        }
+    }
 }

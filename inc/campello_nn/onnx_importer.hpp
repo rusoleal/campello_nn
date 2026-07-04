@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <campello_nn/constants/data_type.hpp>
 #include <campello_nn/context.hpp>
 #include <campello_nn/graph.hpp>
 #include <campello_nn/graph_info.hpp>
@@ -27,6 +28,20 @@ namespace systems::leal::campello_nn
     };
 
     /**
+     * @brief Options controlling how an ONNX model is imported.
+     */
+    struct OnnxImportOptions
+    {
+        /**
+         * Target dtype for compute tensors. When set to `Float16`, float-valued
+         * graph inputs, initializers, and compute nodes are imported as `Float16`
+         * so the resulting `Graph` can run on FP16-optimized backends (e.g.
+         * `GpuGeneric`) without requiring a separate FP16 ONNX file.
+         */
+        DataType targetDataType = DataType::Float32;
+    };
+
+    /**
      * @brief Imports an ONNX model from a memory buffer directly into a compiled `Graph`.
      *
      * The primary entry point — `importOnnxFromFile()` is a convenience wrapper
@@ -45,8 +60,18 @@ namespace systems::leal::campello_nn
      * @param context Backend to compile the imported graph against.
      * @param data Pointer to the encoded `.onnx` model bytes.
      * @param size Number of bytes at `data`.
+     * @param options Import options (e.g. target dtype).
      */
-    OnnxImportResult importOnnxFromMemory(std::shared_ptr<Context> context, const uint8_t *data, size_t size);
+    OnnxImportResult importOnnxFromMemory(std::shared_ptr<Context> context, const uint8_t *data, size_t size,
+                                          const OnnxImportOptions &options);
+
+    /**
+     * @brief Convenience overload that imports with default options.
+     */
+    inline OnnxImportResult importOnnxFromMemory(std::shared_ptr<Context> context, const uint8_t *data, size_t size)
+    {
+        return importOnnxFromMemory(context, data, size, OnnxImportOptions{});
+    }
 
     /**
      * @brief Imports an ONNX model file directly into a compiled `Graph`.
@@ -56,7 +81,17 @@ namespace systems::leal::campello_nn
      *
      * @param context Backend to compile the imported graph against.
      * @param path Filesystem path to a `.onnx` file.
+     * @param options Import options (e.g. target dtype).
      */
-    OnnxImportResult importOnnxFromFile(std::shared_ptr<Context> context, const std::string &path);
+    OnnxImportResult importOnnxFromFile(std::shared_ptr<Context> context, const std::string &path,
+                                        const OnnxImportOptions &options);
+
+    /**
+     * @brief Convenience overload that imports with default options.
+     */
+    inline OnnxImportResult importOnnxFromFile(std::shared_ptr<Context> context, const std::string &path)
+    {
+        return importOnnxFromFile(context, path, OnnxImportOptions{});
+    }
 
 } // namespace systems::leal::campello_nn

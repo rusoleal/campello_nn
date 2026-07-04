@@ -1,40 +1,87 @@
-#version 450
-
-// Vulkan (GLSL). New dispatch model vs. the elementwise ops: one workgroup
-// per output *row* (dispatchX = outerTotal, the number of rows), not per
-// element — the single active thread (still local_size_x=1, genuinely one
-// thread per group on this backend) loops over lastDim internally: first
-// pass computes mean/variance, second pass writes the normalized row.
-// Formula matches src/cpu/ops.cpp's evalLayerNorm exactly. No bounds check on
-// `row` needed (unlike matmul.comp's defensive one) — dispatchX is always set
-// to exactly outerTotal in gpu_backend.cpp, no over-dispatch possible here.
+// Vulkan (GLSL). One workgroup per output *row* (dispatchX = outerTotal). Each
+// workgroup loops over lastDim internally: first pass computes mean, second
+// pass computes variance, third pass writes the normalized row. The row loops
+// are vectorized with T4 loads and float accumulation; a scalar tail handles
+// the remainder. Formula matches src/cpu/ops.cpp's evalLayerNorm exactly.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
-layout(std430, binding = 1) readonly buffer ScaleBuf { float data[]; } scaleBuf;
-layout(std430, binding = 2) readonly buffer BiasBuf { float data[]; } biasBuf;
-layout(std430, binding = 3) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer XBuf { T data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer ScaleBuf { T data[]; } scaleBuf;
+layout(std430, binding = 2) readonly buffer BiasBuf { T data[]; } biasBuf;
+layout(std430, binding = 3) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 4) uniform Params { uint lastDim; float eps; uint pad1; uint pad2; } params;
+
+vec4 toFloat4(T4 v)
+{
+    return vec4(TO_FLOAT(v.x), TO_FLOAT(v.y), TO_FLOAT(v.z), TO_FLOAT(v.w));
+}
+
+T4 toT4(vec4 v)
+{
+    return T4(TO_T(v.x), TO_T(v.y), TO_T(v.z), TO_T(v.w));
+}
 
 void main()
 {
     uint row = gl_WorkGroupID.x;
     uint base = row * params.lastDim;
+    uint lastDim = params.lastDim;
 
-    float mean = 0.0;
-    for (uint k = 0u; k < params.lastDim; k++)
-        mean += xBuf.data[base + k];
-    mean /= float(params.lastDim);
-
-    float var = 0.0;
-    for (uint k = 0u; k < params.lastDim; k++)
+    vec4 acc = vec4(0.0);
+    uint k = 0u;
+    for (; k + 3u < lastDim; k += 4u)
     {
-        float d = xBuf.data[base + k] - mean;
+        T4 v = T4(xBuf.data[base + k], xBuf.data[base + k + 1u],
+                  xBuf.data[base + k + 2u], xBuf.data[base + k + 3u]);
+        acc += toFloat4(v);
+    }
+    float mean = acc.x + acc.y + acc.z + acc.w;
+    for (; k < lastDim; ++k)
+        mean += TO_FLOAT(xBuf.data[base + k]);
+    mean /= float(lastDim);
+
+    acc = vec4(0.0);
+    k = 0u;
+    for (; k + 3u < lastDim; k += 4u)
+    {
+        T4 v = T4(xBuf.data[base + k], xBuf.data[base + k + 1u],
+                  xBuf.data[base + k + 2u], xBuf.data[base + k + 3u]);
+        vec4 d = toFloat4(v) - mean;
+        acc += d * d;
+    }
+    float var = acc.x + acc.y + acc.z + acc.w;
+    for (; k < lastDim; ++k)
+    {
+        float d = TO_FLOAT(xBuf.data[base + k]) - mean;
         var += d * d;
     }
-    var /= float(params.lastDim);
+    var /= float(lastDim);
     float invStd = 1.0 / sqrt(var + params.eps);
 
-    for (uint k = 0u; k < params.lastDim; k++)
-        outputBuf.data[base + k] = (xBuf.data[base + k] - mean) * invStd * scaleBuf.data[k] + biasBuf.data[k];
+    k = 0u;
+    for (; k + 3u < lastDim; k += 4u)
+    {
+        T4 xv = T4(xBuf.data[base + k], xBuf.data[base + k + 1u],
+                   xBuf.data[base + k + 2u], xBuf.data[base + k + 3u]);
+        T4 sv = T4(scaleBuf.data[k], scaleBuf.data[k + 1u],
+                   scaleBuf.data[k + 2u], scaleBuf.data[k + 3u]);
+        T4 bv = T4(biasBuf.data[k], biasBuf.data[k + 1u],
+                   biasBuf.data[k + 2u], biasBuf.data[k + 3u]);
+        vec4 x = toFloat4(xv);
+        vec4 s = toFloat4(sv);
+        vec4 b = toFloat4(bv);
+        vec4 y = (x - mean) * invStd * s + b;
+        T4 res = toT4(y);
+        outputBuf.data[base + k]         = res.x;
+        outputBuf.data[base + k + 1u]    = res.y;
+        outputBuf.data[base + k + 2u]    = res.z;
+        outputBuf.data[base + k + 3u]    = res.w;
+    }
+    for (; k < lastDim; ++k)
+    {
+        float x = TO_FLOAT(xBuf.data[base + k]);
+        float s = TO_FLOAT(scaleBuf.data[k]);
+        float b = TO_FLOAT(biasBuf.data[k]);
+        outputBuf.data[base + k] = TO_T((x - mean) * invStd * s + b);
+    }
 }

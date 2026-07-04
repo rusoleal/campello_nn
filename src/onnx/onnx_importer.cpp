@@ -1,6 +1,7 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <campello_nn/float16.hpp>
 #include <campello_nn/onnx_importer.hpp>
 #include <campello_nn/graph_builder.hpp>
 #include <campello_nn/operand.hpp>
@@ -33,6 +34,31 @@ namespace
     {
         const onnx::OnnxAttribute *a = node.findAttribute(name);
         return (a && !a->s.empty()) ? a->s : defaultVal;
+    }
+
+    bool onnxElemTypeIsFloat(int32_t elemType)
+    {
+        return elemType == 1 /* ONNX_FLOAT */ || elemType == 10 /* ONNX_FLOAT16 */;
+    }
+
+    DataType targetDataTypeFor(int32_t elemType, const OnnxImportOptions &options)
+    {
+        if (onnxElemTypeIsFloat(elemType))
+            return options.targetDataType;
+        return onnx::onnxElemTypeToDataType(elemType);
+    }
+
+    std::vector<uint8_t> convertFloat32ToFloat16Bytes(const uint8_t *data, size_t byteCount)
+    {
+        if (byteCount % sizeof(float) != 0)
+            throw std::runtime_error("campello_nn: importOnnxFromMemory: FP32 initializer byte count is not a multiple of 4");
+        size_t count = byteCount / sizeof(float);
+        std::vector<uint8_t> out(count * sizeof(uint16_t));
+        const float *src = reinterpret_cast<const float *>(data);
+        uint16_t *dst = reinterpret_cast<uint16_t *>(out.data());
+        for (size_t i = 0; i < count; ++i)
+            dst[i] = encodeFloat16(src[i]);
+        return out;
     }
 
     // Resolves ONNX Reshape's 0 ("copy from input shape") and -1 ("infer from
@@ -74,7 +100,8 @@ namespace
     // a clear "not yet supported" error rather than silently producing wrong output.
     Operand applyNode(GraphBuilder &builder, const onnx::OnnxNode &node,
                        std::unordered_map<std::string, Operand> &values,
-                       const onnx::OnnxGraph &onnxGraph)
+                       const onnx::OnnxGraph &onnxGraph,
+                       const OnnxImportOptions &options)
     {
         auto in = [&](size_t idx) -> Operand
         {
@@ -113,8 +140,18 @@ namespace
             int64_t C = outShape[1];
             // Bias is per-output-channel; reshape to [1,C,1,1] and let add()'s
             // NumPy-style broadcasting expand it across N/H/W.
-            Operand biasConst = builder.constant({DataType::Float32, {1, C, 1, 1}, false, false},
-                                                  biasIt->second.bytes.data(), biasIt->second.bytes.size());
+            DataType biasDt = targetDataTypeFor(biasIt->second.elemType, options);
+            const uint8_t *biasData = biasIt->second.bytes.data();
+            size_t biasSize = biasIt->second.bytes.size();
+            std::vector<uint8_t> biasConverted;
+            if (biasDt == DataType::Float16 && biasIt->second.elemType == 1 /* ONNX_FLOAT */)
+            {
+                biasConverted = convertFloat32ToFloat16Bytes(biasData, biasSize);
+                biasData = biasConverted.data();
+                biasSize = biasConverted.size();
+            }
+            Operand biasConst = builder.constant({biasDt, {1, C, 1, 1}, false, false},
+                                                  biasData, biasSize);
             return builder.add(convOut, biasConst);
         }
         if (node.opType == "Add")
@@ -282,7 +319,8 @@ namespace
     }
 }
 
-OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_ptr<Context> context, const uint8_t *data, size_t size)
+OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_ptr<Context> context, const uint8_t *data, size_t size,
+                                                                    const OnnxImportOptions &options)
 {
     std::vector<uint8_t> bytes(data, data + size);
     onnx::OnnxGraph onnxGraph = onnx::parseOnnxModel(bytes);
@@ -297,7 +335,8 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
         // Treat them as constants below; don't expose them as user-provided inputs.
         if (onnxGraph.initializers.count(vi.name))
             continue;
-        TensorDescriptor desc{onnx::onnxElemTypeToDataType(vi.elemType), vi.shape, false, true};
+        DataType dt = targetDataTypeFor(vi.elemType, options);
+        TensorDescriptor desc{dt, vi.shape, false, true};
         values[vi.name] = builder.input(vi.name, desc);
         result.inputs[vi.name] = desc;
     }
@@ -309,8 +348,18 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
         // see applyNode — and never need to become a campello_nn Tensor/Operand.
         if (!onnx::onnxElemTypeHasDataType(tensor.elemType))
             continue;
-        TensorDescriptor desc{tensor.toDataType(), tensor.shape, false, false};
-        values[name] = builder.constant(desc, tensor.bytes.data(), tensor.bytes.size());
+        DataType dt = targetDataTypeFor(tensor.elemType, options);
+        const uint8_t *tensorData = tensor.bytes.data();
+        size_t tensorSize = tensor.bytes.size();
+        std::vector<uint8_t> converted;
+        if (dt == DataType::Float16 && tensor.elemType == 1 /* ONNX_FLOAT */)
+        {
+            converted = convertFloat32ToFloat16Bytes(tensorData, tensorSize);
+            tensorData = converted.data();
+            tensorSize = converted.size();
+        }
+        TensorDescriptor desc{dt, tensor.shape, false, false};
+        values[name] = builder.constant(desc, tensorData, tensorSize);
     }
 
     // ONNX requires nodes to already be in topological order, same assumption
@@ -321,7 +370,7 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
             throw std::runtime_error("campello_nn: ONNX node '" + node.opType + "' has no outputs");
         if (node.outputs.size() > 1)
             throw std::runtime_error("campello_nn: ONNX op '" + node.opType + "' has multiple outputs, not yet supported by the ONNX importer");
-        values[node.outputs[0]] = applyNode(builder, node, values, onnxGraph);
+        values[node.outputs[0]] = applyNode(builder, node, values, onnxGraph, options);
     }
 
     // Uses the actual built graph's inferred shape (via operandShapeForImport),
@@ -333,19 +382,20 @@ OnnxImportResult systems::leal::campello_nn::importOnnxFromMemory(std::shared_pt
     {
         Operand op = values.at(vi.name);
         outputOperands[vi.name] = op;
-        result.outputs[vi.name] = TensorDescriptor{onnx::onnxElemTypeToDataType(vi.elemType),
-                                                     internal::operandShapeForImport(op), true, false};
+        DataType dt = targetDataTypeFor(vi.elemType, options);
+        result.outputs[vi.name] = TensorDescriptor{dt, internal::operandShapeForImport(op), true, false};
     }
     result.info = internal::graphInfoForImport(builder, outputOperands);
     result.graph = builder.build(outputOperands);
     return result;
 }
 
-OnnxImportResult systems::leal::campello_nn::importOnnxFromFile(std::shared_ptr<Context> context, const std::string &path)
+OnnxImportResult systems::leal::campello_nn::importOnnxFromFile(std::shared_ptr<Context> context, const std::string &path,
+                                                                 const OnnxImportOptions &options)
 {
     std::ifstream f(path, std::ios::binary);
     if (!f)
         throw std::runtime_error("campello_nn: importOnnxFromFile() cannot open '" + path + "'");
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    return importOnnxFromMemory(context, bytes.data(), bytes.size());
+    return importOnnxFromMemory(context, bytes.data(), bytes.size(), options);
 }

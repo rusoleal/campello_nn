@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Fused Conv2d + BatchNorm + ReLU for NCHW float32 (inference mode).
 // Inputs:  x (NCHW), w (OIHW), scale_factor (1D [O]), folded_bias (1D [O])
 // Output:  relu(conv(x,w) * scale_factor[o] + folded_bias[o]) in NCHW
@@ -18,11 +15,11 @@ struct Params
     uint tileWidth;
 };
 
-kernel void computeMain(const device float *xBuf [[buffer(0)]],
-                         const device float *wBuf [[buffer(1)]],
-                         const device float *scaleBuf [[buffer(2)]],
-                         const device float *biasBuf [[buffer(3)]],
-                         device float *outputBuf [[buffer(4)]],
+kernel void computeMain(const device T *xBuf [[buffer(0)]],
+                         const device T *wBuf [[buffer(1)]],
+                         const device T *scaleBuf [[buffer(2)]],
+                         const device T *biasBuf [[buffer(3)]],
+                         device T *outputBuf [[buffer(4)]],
                          constant Params &params [[buffer(5)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
@@ -56,8 +53,8 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                     int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw * params.dilationX);
                     if (iw < 0 || iw >= int(params.W))
                         continue;
-                    float xv = xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
-                    float wv = wBuf[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw];
+                    float xv = TO_FLOAT(xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
+                    float wv = TO_FLOAT(wBuf[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw]);
                     sum += xv * wv;
                 }
             }
@@ -66,7 +63,7 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
 
     if (isActive)
     {
-        sum = sum * scaleBuf[o] + biasBuf[o];
-        outputBuf[(no * params.outH + oh) * params.outW + ow] = max(0.0f, sum);
+        sum = sum * TO_FLOAT(scaleBuf[o]) + TO_FLOAT(biasBuf[o]);
+        outputBuf[(no * params.outH + oh) * params.outW + ow] = TO_T(max(0.0f, sum));
     }
 }

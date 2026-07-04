@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <campello_nn/context.hpp>
+#include <campello_nn/float16.hpp>
 #include <campello_nn/graph_builder.hpp>
 
 #ifdef CAMPELLO_NN_TEST_FIXTURES_DIR
@@ -82,6 +83,7 @@ namespace
         Stats stats;
         double maxAbsDiff = 0.0;
         bool available = false;
+        std::string name;
     };
 
     // -------------------------------------------------------------------------
@@ -130,41 +132,52 @@ namespace
     };
 
     TransformerGraph buildTransformerGraph(std::shared_ptr<cnn::Context> context,
-                                           int64_t batch, int64_t hidden)
+                                           int64_t batch, int64_t hidden,
+                                           cnn::DataType dt = cnn::DataType::Float32)
     {
         TransformerGraph g;
         g.context = context;
 
         cnn::GraphBuilder builder(context);
-        auto x = builder.input("x", {cnn::DataType::Float32, {batch, hidden}});
-        auto w = builder.input("w", {cnn::DataType::Float32, {hidden, hidden}});
-        auto bias = builder.input("bias", {cnn::DataType::Float32, {1, hidden}});
-        auto scale = builder.input("scale", {cnn::DataType::Float32, {hidden}});
-        auto lnBias = builder.input("lnBias", {cnn::DataType::Float32, {hidden}});
+        auto x = builder.input("x", {dt, {batch, hidden}});
+        auto w = builder.input("w", {dt, {hidden, hidden}});
+        auto bias = builder.input("bias", {dt, {1, hidden}});
+        auto scale = builder.input("scale", {dt, {hidden}});
+        auto lnBias = builder.input("lnBias", {dt, {hidden}});
 
         auto linear = builder.add(builder.matmul(x, w), bias);
         auto activated = builder.gelu(linear);
         auto out = builder.layerNorm(activated, scale, lnBias, 1e-5f);
         g.graph = builder.build({{"out", out}});
 
-        g.tx = context->createTensor({cnn::DataType::Float32, {batch, hidden}, false, true});
-        g.tw = context->createTensor({cnn::DataType::Float32, {hidden, hidden}, false, true});
-        g.tbias = context->createTensor({cnn::DataType::Float32, {1, hidden}, false, true});
-        g.tscale = context->createTensor({cnn::DataType::Float32, {hidden}, false, true});
-        g.tlnBias = context->createTensor({cnn::DataType::Float32, {hidden}, false, true});
-        g.tout = context->createTensor({cnn::DataType::Float32, {batch, hidden}, true, false});
+        g.tx = context->createTensor({dt, {batch, hidden}, false, true});
+        g.tw = context->createTensor({dt, {hidden, hidden}, false, true});
+        g.tbias = context->createTensor({dt, {1, hidden}, false, true});
+        g.tscale = context->createTensor({dt, {hidden}, false, true});
+        g.tlnBias = context->createTensor({dt, {hidden}, false, true});
+        g.tout = context->createTensor({dt, {batch, hidden}, true, false});
 
-        auto xv = makeRandomBuffer(static_cast<size_t>(batch * hidden), 0x12345678);
-        auto wv = makeRandomBuffer(static_cast<size_t>(hidden * hidden), 0x23456789);
-        auto biasV = makeRandomBuffer(static_cast<size_t>(hidden), 0x3456789a);
-        auto scaleV = makeRandomBuffer(static_cast<size_t>(hidden), 0x456789ab);
-        auto lnBiasV = makeRandomBuffer(static_cast<size_t>(hidden), 0x56789abc);
+        auto writeRandom = [&](std::shared_ptr<cnn::Tensor> tensor, int64_t count, uint32_t seed)
+        {
+            auto fv = makeRandomBuffer(static_cast<size_t>(count), seed);
+            if (dt == cnn::DataType::Float16)
+            {
+                std::vector<uint16_t> hv(fv.size());
+                for (size_t i = 0; i < fv.size(); ++i)
+                    hv[i] = cnn::encodeFloat16(fv[i]);
+                tensor->write(hv.data(), hv.size() * sizeof(uint16_t));
+            }
+            else
+            {
+                tensor->write(fv.data(), fv.size() * sizeof(float));
+            }
+        };
 
-        g.tx->write(xv.data(), xv.size() * sizeof(float));
-        g.tw->write(wv.data(), wv.size() * sizeof(float));
-        g.tbias->write(biasV.data(), biasV.size() * sizeof(float));
-        g.tscale->write(scaleV.data(), scaleV.size() * sizeof(float));
-        g.tlnBias->write(lnBiasV.data(), lnBiasV.size() * sizeof(float));
+        writeRandom(g.tx, batch * hidden, 0x12345678);
+        writeRandom(g.tw, hidden * hidden, 0x23456789);
+        writeRandom(g.tbias, hidden, 0x3456789a);
+        writeRandom(g.tscale, hidden, 0x456789ab);
+        writeRandom(g.tlnBias, hidden, 0x56789abc);
 
         return g;
     }
@@ -181,8 +194,17 @@ namespace
 
     std::vector<float> readTransformerOutput(TransformerGraph &g)
     {
-        std::vector<float> out(static_cast<size_t>(g.tout->shape()[0] *
-                                                     g.tout->shape()[1]));
+        size_t count = static_cast<size_t>(g.tout->shape()[0] * g.tout->shape()[1]);
+        if (g.tout->dataType() == cnn::DataType::Float16)
+        {
+            std::vector<uint16_t> half(count);
+            g.tout->read(half.data(), half.size() * sizeof(uint16_t));
+            std::vector<float> out(count);
+            for (size_t i = 0; i < count; ++i)
+                out[i] = cnn::decodeFloat16(half[i]);
+            return out;
+        }
+        std::vector<float> out(count);
         g.tout->read(out.data(), out.size() * sizeof(float));
         return out;
     }
@@ -208,18 +230,20 @@ namespace
         }
 
         std::vector<BackendResult> results;
-        results.push_back({cnn::DeviceType::Cpu, cpuStats, 0.0, true});
+        results.push_back({cnn::DeviceType::Cpu, cpuStats, 0.0, true, deviceTypeName(cnn::DeviceType::Cpu)});
 
-        auto tryGpuGeneric = [&]() -> BackendResult
+        auto runGpuGeneric = [&](cnn::DataType dt, const char *name)
+            -> std::pair<BackendResult, std::vector<float>>
         {
-            BackendResult r{cnn::DeviceType::GpuGeneric, {}, 0.0, false};
+            BackendResult r{cnn::DeviceType::GpuGeneric, {}, 0.0, false, name};
+            std::vector<float> out;
             try
             {
                 auto context = cnn::Context::create({cnn::DeviceType::GpuGeneric});
-                auto g = buildTransformerGraph(context, batch, hidden);
+                auto g = buildTransformerGraph(context, batch, hidden, dt);
                 r.stats = timeIterations(3, 10, [&]()
                                          { runTransformerBlockOnce(g); });
-                auto out = readTransformerOutput(g);
+                out = readTransformerOutput(g);
                 r.maxAbsDiff = 0.0;
                 for (size_t i = 0; i < out.size(); ++i)
                     r.maxAbsDiff = std::max(r.maxAbsDiff,
@@ -228,16 +252,20 @@ namespace
             }
             catch (const std::exception &e)
             {
-                std::fprintf(stderr, "GpuGeneric unavailable: %s\n", e.what());
+                std::fprintf(stderr, "%s unavailable: %s\n", name, e.what());
             }
-            return r;
+            return {r, out};
         };
-        results.push_back(tryGpuGeneric());
+
+        auto [rGpuGenericFp32, outGpuGenericFp32] = runGpuGeneric(cnn::DataType::Float32, "GpuGeneric");
+        auto [rGpuGenericFp16, outGpuGenericFp16] = runGpuGeneric(cnn::DataType::Float16, "GpuGeneric (FP16)");
+        results.push_back(rGpuGenericFp32);
+        results.push_back(rGpuGenericFp16);
 
 #ifdef __APPLE__
         auto tryGpu = [&]() -> BackendResult
         {
-            BackendResult r{cnn::DeviceType::Gpu, {}, 0.0, false};
+            BackendResult r{cnn::DeviceType::Gpu, {}, 0.0, false, deviceTypeName(cnn::DeviceType::Gpu)};
             try
             {
                 auto context = cnn::Context::create({cnn::DeviceType::Gpu});
@@ -269,19 +297,38 @@ namespace
             if (!r.available)
             {
                 std::printf("%-18s %10s  %10s  %10s  %10s  %12s\n",
-                            deviceTypeName(r.type), "N/A", "N/A", "N/A", "N/A", "N/A");
+                            r.name.empty() ? deviceTypeName(r.type) : r.name.c_str(),
+                            "N/A", "N/A", "N/A", "N/A", "N/A");
                 continue;
             }
             std::printf("%-18s %9.3f ms %9.3f ms %9.3f ms %9.3f ms %11.3e\n",
-                        deviceTypeName(r.type),
+                        r.name.empty() ? deviceTypeName(r.type) : r.name.c_str(),
                         r.stats.min, r.stats.median, r.stats.mean, r.stats.max,
                         r.maxAbsDiff);
+        }
+
+        if (rGpuGenericFp16.available)
+        {
+            double fp16vsFp32 = 0.0;
+            if (rGpuGenericFp32.available)
+            {
+                for (size_t i = 0; i < outGpuGenericFp16.size(); ++i)
+                    fp16vsFp32 = std::max(fp16vsFp32,
+                                          static_cast<double>(std::abs(outGpuGenericFp16[i] - outGpuGenericFp32[i])));
+            }
+            double speedup = rGpuGenericFp32.stats.median > 0.0
+                                 ? rGpuGenericFp32.stats.median / rGpuGenericFp16.stats.median
+                                 : 0.0;
+            std::printf("\nGpuGeneric FP16 vs FP32: median speedup = %.2fx, maxAbsDiff = %.3e\n",
+                        speedup, fp16vsFp32);
         }
 
         for (const auto &r : results)
         {
             if (!r.available)
                 continue;
+            if (r.name == "GpuGeneric (FP16)")
+                continue; // FP16 vs CPU reference is expected to be looser; reported separately above.
             double maxVal = 0.0;
             for (float v : referenceOutput)
                 maxVal = std::max(maxVal, static_cast<double>(std::abs(v)));
@@ -291,7 +338,8 @@ namespace
                 std::fprintf(stderr,
                              "ERROR: backend %s deviates from Cpu reference "
                              "(maxAbsDiff=%.3e, maxVal=%.3e)\n",
-                             deviceTypeName(r.type), r.maxAbsDiff, maxVal);
+                             r.name.empty() ? deviceTypeName(r.type) : r.name.c_str(),
+                             r.maxAbsDiff, maxVal);
             }
         }
     }

@@ -118,7 +118,7 @@ otherwise unverified by compilation (see `TODO.md` Phase 3b's last item).
 
 ### Dtype Support
 
-All ops support both Float32 and Float16 (CPU: decode-at-boundary, see above; MPSGraph: native).
+All ops support both Float32 and Float16 (CPU: decode-at-boundary, see above; MPSGraph: native; GpuGeneric: native via precompiled FP32/FP16 SPIR-V/Metal variants). `GpuGeneric` FP16 kernels use vectorized `T4` loads/stores for bandwidth-bound ops and keep reductions (matmul, norms, softmax) in FP32 for numerical stability. Early FP16 performance tuning for `matmul`/`gemm` (a 2-column-per-thread layout) regressed on the test Intel UHD 630 GPU and was reverted, so FP16 is currently functional but not consistently faster than FP32 on that hardware.
 `gather`'s `indices` operand accepts Int32 or Uint32. Int8 is real quantization, not just
 storage: `quantizeLinear`/`dequantizeLinear` (per-tensor scale/zero-point, matching ONNX's ops
 and MPSGraph's `quantizeTensor:`/`dequantizeTensor:` scalar overloads) and `quantizedMatmul`
@@ -150,7 +150,10 @@ int8×int8 GEMM kernel). Per-channel scale (MPSGraph's `scaleTensor:` overloads)
   (`Gemm` with transA/transB, multi-output nodes, a non-constant `Reshape`/`Resize` shape input,
   unmapped op types) throw rather than guess. `importOnnxFromMemory()` is the real implementation;
   `importOnnxFromFile()` just reads the file into a buffer and calls it — don't add file-specific
-  logic to the memory path.
+  logic to the memory path. An optional `OnnxImportOptions` argument lets callers import a float
+  model as all-`Float16` (`options.targetDataType = DataType::Float16`); float initializers and
+  graph inputs are converted to half via `encodeFloat16()`, so the resulting `Graph` can run on
+  FP16 backends such as `GpuGeneric` without needing a separate FP16 ONNX file.
 - `internal::operandShapeForImport(const Operand&)` (declared in the public `operand.hpp`, inside
   an `internal` namespace; implemented in `graph_builder.cpp`): the importer's only window into an
   intermediate tensor's actual inferred shape (needed by `Reshape`'s `-1`, `Resize`'s scales, and

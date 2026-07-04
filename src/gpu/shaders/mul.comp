@@ -1,18 +1,35 @@
-#version 450
-
 // Vulkan (GLSL). Exact-shape mul only (no broadcast) — same restriction as
-// add.comp. Same one-workgroup-per-element model; see relu.comp's comment.
+// add.comp. Each workgroup processes a contiguous 4-element block; see
+// relu.comp's comment for the rationale.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
-layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
-layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer ABuf { T data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { T data[]; } bBuf;
+layout(std430, binding = 2) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 3) uniform Params { uint count; uint pad0; uint pad1; uint pad2; } params;
 
 void main()
 {
-    uint idx = gl_WorkGroupID.x;
-    if (idx >= params.count)
+    uint base = gl_WorkGroupID.x * 4u;
+    if (base >= params.count)
         return;
-    outputBuf.data[idx] = aBuf.data[idx] * bBuf.data[idx];
+
+    uint end = min(base + 4u, params.count);
+    if (end - base == 4u)
+    {
+        T4 a = T4(aBuf.data[base], aBuf.data[base + 1u],
+                  aBuf.data[base + 2u], aBuf.data[base + 3u]);
+        T4 b = T4(bBuf.data[base], bBuf.data[base + 1u],
+                  bBuf.data[base + 2u], bBuf.data[base + 3u]);
+        T4 v = a * b;
+        outputBuf.data[base]      = v.x;
+        outputBuf.data[base + 1u] = v.y;
+        outputBuf.data[base + 2u] = v.z;
+        outputBuf.data[base + 3u] = v.w;
+    }
+    else
+    {
+        for (uint i = base; i < end; ++i)
+            outputBuf.data[i] = aBuf.data[i] * bBuf.data[i];
+    }
 }

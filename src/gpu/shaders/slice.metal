@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Same one-workgroup-per-element model and thread-0 gate as
 // relu.metal; same generic per-dim decode as slice.comp — see that file's
 // comment.
@@ -15,8 +12,8 @@ struct Params
     uint mult0, mult1, mult2, mult3, mult4, mult5, mult6, mult7;
 };
 
-kernel void computeMain(const device float *inputBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+kernel void computeMain(const device T *inputBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint groupId [[threadgroup_position_in_grid]],
                          uint localId [[thread_position_in_threadgroup]])

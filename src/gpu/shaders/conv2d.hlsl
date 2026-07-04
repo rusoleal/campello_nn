@@ -17,9 +17,9 @@ struct Params
     uint tileWidth;
 };
 
-StructuredBuffer<float> xBuf : register(t0);
-StructuredBuffer<float> wBuf : register(t1);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> xBuf : register(t0);
+StructuredBuffer<T> wBuf : register(t1);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 groupshared float sharedX[TILE_CG][MAX_KH][MAX_TILE_IW];

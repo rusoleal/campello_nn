@@ -1,28 +1,67 @@
-#version 450
-
-// Vulkan (GLSL). Same row-per-workgroup dispatch model as layernorm.comp —
-// see that file's comment. Formula matches src/cpu/ops.cpp's evalRmsNorm.
+// Vulkan (GLSL). Same row-per-workgroup dispatch model as layernorm.comp. The
+// row loop is vectorized with T4 loads and float accumulation; a scalar tail
+// handles the remainder. Formula matches src/cpu/ops.cpp's evalRmsNorm.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
-layout(std430, binding = 1) readonly buffer ScaleBuf { float data[]; } scaleBuf;
-layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer XBuf { T data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer ScaleBuf { T data[]; } scaleBuf;
+layout(std430, binding = 2) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 3) uniform Params { uint lastDim; float eps; uint pad1; uint pad2; } params;
+
+vec4 toFloat4(T4 v)
+{
+    return vec4(TO_FLOAT(v.x), TO_FLOAT(v.y), TO_FLOAT(v.z), TO_FLOAT(v.w));
+}
+
+T4 toT4(vec4 v)
+{
+    return T4(TO_T(v.x), TO_T(v.y), TO_T(v.z), TO_T(v.w));
+}
 
 void main()
 {
     uint row = gl_WorkGroupID.x;
     uint base = row * params.lastDim;
+    uint lastDim = params.lastDim;
 
-    float meanSquare = 0.0;
-    for (uint k = 0u; k < params.lastDim; k++)
+    vec4 acc = vec4(0.0);
+    uint k = 0u;
+    for (; k + 3u < lastDim; k += 4u)
     {
-        float v = xBuf.data[base + k];
+        T4 v = T4(xBuf.data[base + k], xBuf.data[base + k + 1u],
+                  xBuf.data[base + k + 2u], xBuf.data[base + k + 3u]);
+        vec4 f = toFloat4(v);
+        acc += f * f;
+    }
+    float meanSquare = acc.x + acc.y + acc.z + acc.w;
+    for (; k < lastDim; ++k)
+    {
+        float v = TO_FLOAT(xBuf.data[base + k]);
         meanSquare += v * v;
     }
-    meanSquare /= float(params.lastDim);
+    meanSquare /= float(lastDim);
     float invRms = 1.0 / sqrt(meanSquare + params.eps);
 
-    for (uint k = 0u; k < params.lastDim; k++)
-        outputBuf.data[base + k] = xBuf.data[base + k] * invRms * scaleBuf.data[k];
+    k = 0u;
+    for (; k + 3u < lastDim; k += 4u)
+    {
+        T4 xv = T4(xBuf.data[base + k], xBuf.data[base + k + 1u],
+                   xBuf.data[base + k + 2u], xBuf.data[base + k + 3u]);
+        T4 sv = T4(scaleBuf.data[k], scaleBuf.data[k + 1u],
+                   scaleBuf.data[k + 2u], scaleBuf.data[k + 3u]);
+        vec4 x = toFloat4(xv);
+        vec4 s = toFloat4(sv);
+        vec4 y = x * invRms * s;
+        T4 res = toT4(y);
+        outputBuf.data[base + k]         = res.x;
+        outputBuf.data[base + k + 1u]    = res.y;
+        outputBuf.data[base + k + 2u]    = res.z;
+        outputBuf.data[base + k + 3u]    = res.w;
+    }
+    for (; k < lastDim; ++k)
+    {
+        float x = TO_FLOAT(xBuf.data[base + k]);
+        float s = TO_FLOAT(scaleBuf.data[k]);
+        outputBuf.data[base + k] = TO_T(x * invRms * s);
+    }
 }

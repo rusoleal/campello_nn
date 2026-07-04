@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Same nearest/bilinear model as resize.comp — see that file's
 // comment. Thread-0 gate for the same reason as relu.metal.
 
@@ -22,8 +19,8 @@ float resizeSrcCoord(uint dst, uint inSize, uint outSize, constant Params &param
     return clamp(src, 0.0f, float(inSize - 1));
 }
 
-kernel void computeMain(const device float *inputBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+kernel void computeMain(const device T *inputBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
@@ -52,7 +49,7 @@ kernel void computeMain(const device float *inputBuf [[buffer(0)]],
         }
         ih = clamp(ih, 0, int(params.H) - 1);
         iw = clamp(iw, 0, int(params.W) - 1);
-        value = inputBuf[nc * params.H * params.W + uint(ih) * params.W + uint(iw)];
+        value = TO_FLOAT(inputBuf[nc * params.H * params.W + uint(ih) * params.W + uint(iw)]);
     }
     else // Bilinear
     {
@@ -63,11 +60,11 @@ kernel void computeMain(const device float *inputBuf [[buffer(0)]],
         float fh = srcH - float(h0);
         float fw = srcW - float(w0);
         uint base = nc * params.H * params.W;
-        float top = inputBuf[base + uint(h0) * params.W + uint(w0)] * (1.0f - fw) +
-                    inputBuf[base + uint(h0) * params.W + uint(w1)] * fw;
-        float bottom = inputBuf[base + uint(h1) * params.W + uint(w0)] * (1.0f - fw) +
-                       inputBuf[base + uint(h1) * params.W + uint(w1)] * fw;
+        float top = TO_FLOAT(inputBuf[base + uint(h0) * params.W + uint(w0)]) * (1.0f - fw) +
+                    TO_FLOAT(inputBuf[base + uint(h0) * params.W + uint(w1)]) * fw;
+        float bottom = TO_FLOAT(inputBuf[base + uint(h1) * params.W + uint(w0)]) * (1.0f - fw) +
+                       TO_FLOAT(inputBuf[base + uint(h1) * params.W + uint(w1)]) * fw;
         value = top * (1.0f - fh) + bottom * fh;
     }
-    outputBuf[(nc * params.outH + oh) * params.outW + ow] = value;
+    outputBuf[(nc * params.outH + oh) * params.outW + ow] = TO_T(value);
 }

@@ -11,8 +11,8 @@ struct Params
     uint gather0, gather1, gather2, gather3, gather4, gather5, gather6, gather7;
 };
 
-StructuredBuffer<float> inputBuf : register(t0);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> inputBuf : register(t0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

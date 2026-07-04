@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. GEMM step of im2col-based conv2d for NCHW float32 (groups == 1).
 // A = im2col matrix [M, K] row-major (input to this shader)
 // B = weights [O, K] row-major (flattened OIHW)
@@ -13,9 +10,9 @@ struct Params
     uint tileWidth;
 };
 
-kernel void computeMain(const device float *aBuf [[buffer(0)]],
-                         const device float *bBuf [[buffer(1)]],
-                         device float *outputBuf [[buffer(2)]],
+kernel void computeMain(const device T *aBuf [[buffer(0)]],
+                         const device T *bBuf [[buffer(1)]],
+                         device T *outputBuf [[buffer(2)]],
                          constant Params &params [[buffer(3)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
@@ -31,8 +28,8 @@ kernel void computeMain(const device float *aBuf [[buffer(0)]],
     float sum = 0.0f;
     for (uint k = 0; k < params.K; k++)
     {
-        float a = aBuf[m * params.K + k];
-        float b = bBuf[o * params.K + k];
+        float a = TO_FLOAT(aBuf[m * params.K + k]);
+        float b = TO_FLOAT(bBuf[o * params.K + k]);
         sum += a * b;
     }
 
@@ -41,5 +38,5 @@ kernel void computeMain(const device float *aBuf [[buffer(0)]],
     uint r = m % outPlane;
     uint oh = r / params.outW;
     uint ow = r % params.outW;
-    outputBuf[((n * params.O + o) * params.outH + oh) * params.outW + ow] = sum;
+    outputBuf[((n * params.O + o) * params.outH + oh) * params.outW + ow] = TO_T(sum);
 }

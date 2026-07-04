@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). Shared by both OpKind::MaxPool2d and OpKind::AvgPool2d —
 // same precedent as the CPU backend's evalPool2d (src/cpu/ops.cpp), which
 // is one function taking an `isMax` bool rather than two near-duplicates.
@@ -13,8 +11,8 @@
 // neither).
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint H, W, outH, outW;
@@ -44,11 +42,11 @@ void main()
             int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw);
             if (iw < 0 || iw >= int(params.W))
                 continue;
-            float v = inputBuf.data[nc * params.H * params.W + uint(ih) * params.W + uint(iw)];
+            float v = TO_FLOAT(inputBuf.data[nc * params.H * params.W + uint(ih) * params.W + uint(iw)]);
             acc = params.isMax != 0u ? max(acc, v) : acc + v;
             count++;
         }
     }
     outputBuf.data[(nc * params.outH + oh) * params.outW + ow] =
-        params.isMax != 0u ? acc : (count > 0 ? acc / float(count) : 0.0);
+        TO_T(params.isMax != 0u ? acc : (count > 0 ? acc / float(count) : 0.0));
 }

@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Same per-input-dispatch outer/axis/inner model as concat.comp —
 // see that file's comment.
 
@@ -14,8 +11,8 @@ struct Params
     uint pad0, pad1, pad2;
 };
 
-kernel void computeMain(const device float *inputBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+kernel void computeMain(const device T *inputBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint groupId [[threadgroup_position_in_grid]],
                          uint localId [[thread_position_in_threadgroup]])

@@ -10,58 +10,110 @@
 
 #if defined(__APPLE__)
 #include "shaders/relu_metallib.hpp"
+#include "shaders/relu_f16_metallib.hpp"
 #include "shaders/add_metallib.hpp"
+#include "shaders/add_f16_metallib.hpp"
 #include "shaders/matmul_metallib.hpp"
+#include "shaders/matmul_f16_metallib.hpp"
 #include "shaders/mul_metallib.hpp"
+#include "shaders/mul_f16_metallib.hpp"
 #include "shaders/sigmoid_metallib.hpp"
+#include "shaders/sigmoid_f16_metallib.hpp"
 #include "shaders/gelu_metallib.hpp"
+#include "shaders/gelu_f16_metallib.hpp"
 #include "shaders/layernorm_metallib.hpp"
+#include "shaders/layernorm_f16_metallib.hpp"
 #include "shaders/rmsnorm_metallib.hpp"
+#include "shaders/rmsnorm_f16_metallib.hpp"
 #include "shaders/transpose_metallib.hpp"
+#include "shaders/transpose_f16_metallib.hpp"
 #include "shaders/slice_metallib.hpp"
+#include "shaders/slice_f16_metallib.hpp"
 #include "shaders/concat_metallib.hpp"
+#include "shaders/concat_f16_metallib.hpp"
 #include "shaders/gather_metallib.hpp"
+#include "shaders/gather_f16_metallib.hpp"
 #include "shaders/gemm_metallib.hpp"
+#include "shaders/gemm_f16_metallib.hpp"
 #include "shaders/softmax_metallib.hpp"
+#include "shaders/softmax_f16_metallib.hpp"
 #include "shaders/conv2d_metallib.hpp"
+#include "shaders/conv2d_f16_metallib.hpp"
 #include "shaders/im2col_metallib.hpp"
+#include "shaders/im2col_f16_metallib.hpp"
 #include "shaders/conv_gemm_metallib.hpp"
+#include "shaders/conv_gemm_f16_metallib.hpp"
 #include "shaders/conv_fused_metallib.hpp"
+#include "shaders/conv_fused_f16_metallib.hpp"
 #include "shaders/conv_fused_bn_metallib.hpp"
+#include "shaders/conv_fused_bn_f16_metallib.hpp"
 #include "shaders/pool2d_metallib.hpp"
+#include "shaders/pool2d_f16_metallib.hpp"
 #include "shaders/resize_metallib.hpp"
+#include "shaders/resize_f16_metallib.hpp"
 #include "shaders/batchnorm_metallib.hpp"
+#include "shaders/batchnorm_f16_metallib.hpp"
 #include "shaders/instancenorm_metallib.hpp"
+#include "shaders/instancenorm_f16_metallib.hpp"
 #include "shaders/quantize_linear_metallib.hpp"
+#include "shaders/quantize_linear_f16_metallib.hpp"
 #include "shaders/dequantize_linear_metallib.hpp"
+#include "shaders/dequantize_linear_f16_metallib.hpp"
 #include "shaders/broadcast_binary_metallib.hpp"
+#include "shaders/broadcast_binary_f16_metallib.hpp"
 #elif !defined(_WIN32)
 #include "shaders/relu_spv.hpp"
+#include "shaders/relu_f16_spv.hpp"
 #include "shaders/add_spv.hpp"
+#include "shaders/add_f16_spv.hpp"
 #include "shaders/matmul_spv.hpp"
+#include "shaders/matmul_f16_spv.hpp"
 #include "shaders/mul_spv.hpp"
+#include "shaders/mul_f16_spv.hpp"
 #include "shaders/sigmoid_spv.hpp"
+#include "shaders/sigmoid_f16_spv.hpp"
 #include "shaders/gelu_spv.hpp"
+#include "shaders/gelu_f16_spv.hpp"
 #include "shaders/layernorm_spv.hpp"
+#include "shaders/layernorm_f16_spv.hpp"
 #include "shaders/rmsnorm_spv.hpp"
+#include "shaders/rmsnorm_f16_spv.hpp"
 #include "shaders/transpose_spv.hpp"
+#include "shaders/transpose_f16_spv.hpp"
 #include "shaders/slice_spv.hpp"
+#include "shaders/slice_f16_spv.hpp"
 #include "shaders/concat_spv.hpp"
+#include "shaders/concat_f16_spv.hpp"
 #include "shaders/gather_spv.hpp"
+#include "shaders/gather_f16_spv.hpp"
 #include "shaders/gemm_spv.hpp"
+#include "shaders/gemm_f16_spv.hpp"
 #include "shaders/softmax_spv.hpp"
+#include "shaders/softmax_f16_spv.hpp"
 #include "shaders/conv2d_spv.hpp"
+#include "shaders/conv2d_f16_spv.hpp"
 #include "shaders/im2col_spv.hpp"
+#include "shaders/im2col_f16_spv.hpp"
 #include "shaders/conv_gemm_spv.hpp"
+#include "shaders/conv_gemm_f16_spv.hpp"
 #include "shaders/conv_fused_spv.hpp"
+#include "shaders/conv_fused_f16_spv.hpp"
 #include "shaders/conv_fused_bn_spv.hpp"
+#include "shaders/conv_fused_bn_f16_spv.hpp"
 #include "shaders/pool2d_spv.hpp"
+#include "shaders/pool2d_f16_spv.hpp"
 #include "shaders/resize_spv.hpp"
+#include "shaders/resize_f16_spv.hpp"
 #include "shaders/batchnorm_spv.hpp"
+#include "shaders/batchnorm_f16_spv.hpp"
 #include "shaders/instancenorm_spv.hpp"
+#include "shaders/instancenorm_f16_spv.hpp"
 #include "shaders/quantize_linear_spv.hpp"
+#include "shaders/quantize_linear_f16_spv.hpp"
 #include "shaders/dequantize_linear_spv.hpp"
+#include "shaders/dequantize_linear_f16_spv.hpp"
 #include "shaders/broadcast_binary_spv.hpp"
+#include "shaders/broadcast_binary_f16_spv.hpp"
 #endif
 // _WIN32 (DirectX12): no precompiled bytecode shipped yet — src/gpu/shaders/
 // *.hlsl are written against real D3D12/HLSL semantics but unverified (no
@@ -111,6 +163,21 @@ namespace
             return 1;
         }
         throw std::runtime_error("campello_nn: GpuBackend: unknown DataType");
+    }
+
+    bool isFloat32Or16(DataType dt)
+    {
+        return dt == DataType::Float32 || dt == DataType::Float16;
+    }
+
+    void requireFloat32Or16(DataType dt, const char *opName)
+    {
+        if (!isFloat32Or16(dt))
+        {
+            throw std::runtime_error(
+                std::string("campello_nn: GpuBackend: ") + opName +
+                " only supports Float32 or Float16 in this round");
+        }
     }
 
     int64_t numElements(const std::vector<int64_t> &shape)
@@ -334,6 +401,25 @@ namespace
         uint32_t strideB[8];
     };
 
+    struct OpKindDataTypeKey
+    {
+        OpKind kind;
+        DataType dataType;
+        bool operator==(const OpKindDataTypeKey &other) const
+        {
+            return kind == other.kind && dataType == other.dataType;
+        }
+    };
+
+    struct OpKindDataTypeKeyHash
+    {
+        size_t operator()(const OpKindDataTypeKey &k) const
+        {
+            return std::hash<int>{}(static_cast<int>(k.kind)) ^
+                   (std::hash<int>{}(static_cast<int>(k.dataType)) << 1);
+        }
+    };
+
     struct ShaderBytes
     {
         const unsigned char *data;
@@ -347,59 +433,82 @@ namespace
     // what's actually declared in each shader source: GLSL's compute entry is
     // always named "main" (a GLSL requirement); the Metal/HLSL sources here are
     // both named "computeMain" by choice.
-    ShaderBytes shaderBytesFor(OpKind kind)
+    ShaderBytes shaderBytesFor(OpKind kind, DataType dt)
     {
+        const bool f16 = (dt == DataType::Float16);
 #if defined(__APPLE__)
         switch (kind)
         {
         case OpKind::Relu:
-            return {relu_metallib_bytes, relu_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{relu_f16_metallib_bytes, relu_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{relu_metallib_bytes, relu_metallib_bytes_len, "computeMain"};
         case OpKind::Add:
-            return {add_metallib_bytes, add_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{add_f16_metallib_bytes, add_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{add_metallib_bytes, add_metallib_bytes_len, "computeMain"};
         case OpKind::MatMul:
-            return {matmul_metallib_bytes, matmul_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{matmul_f16_metallib_bytes, matmul_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{matmul_metallib_bytes, matmul_metallib_bytes_len, "computeMain"};
         case OpKind::Mul:
-            return {mul_metallib_bytes, mul_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{mul_f16_metallib_bytes, mul_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{mul_metallib_bytes, mul_metallib_bytes_len, "computeMain"};
         case OpKind::Sigmoid:
-            return {sigmoid_metallib_bytes, sigmoid_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{sigmoid_f16_metallib_bytes, sigmoid_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{sigmoid_metallib_bytes, sigmoid_metallib_bytes_len, "computeMain"};
         case OpKind::Gelu:
-            return {gelu_metallib_bytes, gelu_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{gelu_f16_metallib_bytes, gelu_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{gelu_metallib_bytes, gelu_metallib_bytes_len, "computeMain"};
         case OpKind::LayerNorm:
-            return {layernorm_metallib_bytes, layernorm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{layernorm_f16_metallib_bytes, layernorm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{layernorm_metallib_bytes, layernorm_metallib_bytes_len, "computeMain"};
         case OpKind::RmsNorm:
-            return {rmsnorm_metallib_bytes, rmsnorm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{rmsnorm_f16_metallib_bytes, rmsnorm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{rmsnorm_metallib_bytes, rmsnorm_metallib_bytes_len, "computeMain"};
         case OpKind::Transpose:
-            return {transpose_metallib_bytes, transpose_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{transpose_f16_metallib_bytes, transpose_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{transpose_metallib_bytes, transpose_metallib_bytes_len, "computeMain"};
         case OpKind::Slice:
-            return {slice_metallib_bytes, slice_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{slice_f16_metallib_bytes, slice_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{slice_metallib_bytes, slice_metallib_bytes_len, "computeMain"};
         case OpKind::Concat:
-            return {concat_metallib_bytes, concat_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{concat_f16_metallib_bytes, concat_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{concat_metallib_bytes, concat_metallib_bytes_len, "computeMain"};
         case OpKind::Gather:
-            return {gather_metallib_bytes, gather_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{gather_f16_metallib_bytes, gather_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{gather_metallib_bytes, gather_metallib_bytes_len, "computeMain"};
         case OpKind::Gemm:
-            return {gemm_metallib_bytes, gemm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{gemm_f16_metallib_bytes, gemm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{gemm_metallib_bytes, gemm_metallib_bytes_len, "computeMain"};
         case OpKind::Softmax:
-            return {softmax_metallib_bytes, softmax_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{softmax_f16_metallib_bytes, softmax_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{softmax_metallib_bytes, softmax_metallib_bytes_len, "computeMain"};
         case OpKind::Conv2d:
-            return {conv2d_metallib_bytes, conv2d_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{conv2d_f16_metallib_bytes, conv2d_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{conv2d_metallib_bytes, conv2d_metallib_bytes_len, "computeMain"};
         case OpKind::MaxPool2d:
         case OpKind::AvgPool2d:
-            return {pool2d_metallib_bytes, pool2d_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{pool2d_f16_metallib_bytes, pool2d_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{pool2d_metallib_bytes, pool2d_metallib_bytes_len, "computeMain"};
         case OpKind::Resize:
-            return {resize_metallib_bytes, resize_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{resize_f16_metallib_bytes, resize_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{resize_metallib_bytes, resize_metallib_bytes_len, "computeMain"};
         case OpKind::BatchNorm:
-            return {batchnorm_metallib_bytes, batchnorm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{batchnorm_f16_metallib_bytes, batchnorm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{batchnorm_metallib_bytes, batchnorm_metallib_bytes_len, "computeMain"};
         case OpKind::InstanceNorm:
-            return {instancenorm_metallib_bytes, instancenorm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{instancenorm_f16_metallib_bytes, instancenorm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{instancenorm_metallib_bytes, instancenorm_metallib_bytes_len, "computeMain"};
         case OpKind::QuantizeLinear:
-            return {quantize_linear_metallib_bytes, quantize_linear_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{quantize_linear_f16_metallib_bytes, quantize_linear_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{quantize_linear_metallib_bytes, quantize_linear_metallib_bytes_len, "computeMain"};
         case OpKind::DequantizeLinear:
-            return {dequantize_linear_metallib_bytes, dequantize_linear_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{dequantize_linear_f16_metallib_bytes, dequantize_linear_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{dequantize_linear_metallib_bytes, dequantize_linear_metallib_bytes_len, "computeMain"};
         default:
             throw std::runtime_error("campello_nn: GpuBackend: unsupported OpKind");
         }
 #elif defined(_WIN32)
         (void)kind;
+        (void)f16;
         throw std::runtime_error(
             "campello_nn: GpuBackend: no precompiled DirectX12 shader bytecode shipped yet "
             "(src/gpu/shaders/*.hlsl are written but unverified — see TODO.md)");
@@ -407,48 +516,69 @@ namespace
         switch (kind)
         {
         case OpKind::Relu:
-            return {relu_spv_bytes, relu_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{relu_f16_spv_bytes, relu_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{relu_spv_bytes, relu_spv_bytes_len, "main"};
         case OpKind::Add:
-            return {add_spv_bytes, add_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{add_f16_spv_bytes, add_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{add_spv_bytes, add_spv_bytes_len, "main"};
         case OpKind::MatMul:
-            return {matmul_spv_bytes, matmul_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{matmul_f16_spv_bytes, matmul_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{matmul_spv_bytes, matmul_spv_bytes_len, "main"};
         case OpKind::Mul:
-            return {mul_spv_bytes, mul_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{mul_f16_spv_bytes, mul_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{mul_spv_bytes, mul_spv_bytes_len, "main"};
         case OpKind::Sigmoid:
-            return {sigmoid_spv_bytes, sigmoid_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{sigmoid_f16_spv_bytes, sigmoid_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{sigmoid_spv_bytes, sigmoid_spv_bytes_len, "main"};
         case OpKind::Gelu:
-            return {gelu_spv_bytes, gelu_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{gelu_f16_spv_bytes, gelu_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{gelu_spv_bytes, gelu_spv_bytes_len, "main"};
         case OpKind::LayerNorm:
-            return {layernorm_spv_bytes, layernorm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{layernorm_f16_spv_bytes, layernorm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{layernorm_spv_bytes, layernorm_spv_bytes_len, "main"};
         case OpKind::RmsNorm:
-            return {rmsnorm_spv_bytes, rmsnorm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{rmsnorm_f16_spv_bytes, rmsnorm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{rmsnorm_spv_bytes, rmsnorm_spv_bytes_len, "main"};
         case OpKind::Transpose:
-            return {transpose_spv_bytes, transpose_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{transpose_f16_spv_bytes, transpose_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{transpose_spv_bytes, transpose_spv_bytes_len, "main"};
         case OpKind::Slice:
-            return {slice_spv_bytes, slice_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{slice_f16_spv_bytes, slice_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{slice_spv_bytes, slice_spv_bytes_len, "main"};
         case OpKind::Concat:
-            return {concat_spv_bytes, concat_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{concat_f16_spv_bytes, concat_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{concat_spv_bytes, concat_spv_bytes_len, "main"};
         case OpKind::Gather:
-            return {gather_spv_bytes, gather_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{gather_f16_spv_bytes, gather_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{gather_spv_bytes, gather_spv_bytes_len, "main"};
         case OpKind::Gemm:
-            return {gemm_spv_bytes, gemm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{gemm_f16_spv_bytes, gemm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{gemm_spv_bytes, gemm_spv_bytes_len, "main"};
         case OpKind::Softmax:
-            return {softmax_spv_bytes, softmax_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{softmax_f16_spv_bytes, softmax_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{softmax_spv_bytes, softmax_spv_bytes_len, "main"};
         case OpKind::Conv2d:
-            return {conv2d_spv_bytes, conv2d_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{conv2d_f16_spv_bytes, conv2d_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{conv2d_spv_bytes, conv2d_spv_bytes_len, "main"};
         case OpKind::MaxPool2d:
         case OpKind::AvgPool2d:
-            return {pool2d_spv_bytes, pool2d_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{pool2d_f16_spv_bytes, pool2d_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{pool2d_spv_bytes, pool2d_spv_bytes_len, "main"};
         case OpKind::Resize:
-            return {resize_spv_bytes, resize_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{resize_f16_spv_bytes, resize_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{resize_spv_bytes, resize_spv_bytes_len, "main"};
         case OpKind::BatchNorm:
-            return {batchnorm_spv_bytes, batchnorm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{batchnorm_f16_spv_bytes, batchnorm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{batchnorm_spv_bytes, batchnorm_spv_bytes_len, "main"};
         case OpKind::InstanceNorm:
-            return {instancenorm_spv_bytes, instancenorm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{instancenorm_f16_spv_bytes, instancenorm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{instancenorm_spv_bytes, instancenorm_spv_bytes_len, "main"};
         case OpKind::QuantizeLinear:
-            return {quantize_linear_spv_bytes, quantize_linear_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{quantize_linear_f16_spv_bytes, quantize_linear_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{quantize_linear_spv_bytes, quantize_linear_spv_bytes_len, "main"};
         case OpKind::DequantizeLinear:
-            return {dequantize_linear_spv_bytes, dequantize_linear_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{dequantize_linear_f16_spv_bytes, dequantize_linear_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{dequantize_linear_spv_bytes, dequantize_linear_spv_bytes_len, "main"};
         default:
             throw std::runtime_error("campello_nn: GpuBackend: unsupported OpKind");
         }
@@ -464,22 +594,28 @@ namespace
         ConvFusedBn,
     };
 
-    ShaderBytes shaderBytesForInternal(GpuInternalOp op)
+    ShaderBytes shaderBytesForInternal(GpuInternalOp op, DataType dt)
     {
+        const bool f16 = (dt == DataType::Float16);
 #if defined(__APPLE__)
         switch (op)
         {
         case GpuInternalOp::Im2Col:
-            return {im2col_metallib_bytes, im2col_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{im2col_f16_metallib_bytes, im2col_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{im2col_metallib_bytes, im2col_metallib_bytes_len, "computeMain"};
         case GpuInternalOp::ConvGemm:
-            return {conv_gemm_metallib_bytes, conv_gemm_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{conv_gemm_f16_metallib_bytes, conv_gemm_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{conv_gemm_metallib_bytes, conv_gemm_metallib_bytes_len, "computeMain"};
         case GpuInternalOp::ConvFused:
-            return {conv_fused_metallib_bytes, conv_fused_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{conv_fused_f16_metallib_bytes, conv_fused_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{conv_fused_metallib_bytes, conv_fused_metallib_bytes_len, "computeMain"};
         case GpuInternalOp::ConvFusedBn:
-            return {conv_fused_bn_metallib_bytes, conv_fused_bn_metallib_bytes_len, "computeMain"};
+            return f16 ? ShaderBytes{conv_fused_bn_f16_metallib_bytes, conv_fused_bn_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{conv_fused_bn_metallib_bytes, conv_fused_bn_metallib_bytes_len, "computeMain"};
         }
 #elif defined(_WIN32)
         (void)op;
+        (void)f16;
         throw std::runtime_error(
             "campello_nn: GpuBackend: no precompiled DirectX12 shader bytecode shipped yet "
             "(src/gpu/shaders/*.hlsl are written but unverified — see TODO.md)");
@@ -487,13 +623,17 @@ namespace
         switch (op)
         {
         case GpuInternalOp::Im2Col:
-            return {im2col_spv_bytes, im2col_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{im2col_f16_spv_bytes, im2col_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{im2col_spv_bytes, im2col_spv_bytes_len, "main"};
         case GpuInternalOp::ConvGemm:
-            return {conv_gemm_spv_bytes, conv_gemm_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{conv_gemm_f16_spv_bytes, conv_gemm_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{conv_gemm_spv_bytes, conv_gemm_spv_bytes_len, "main"};
         case GpuInternalOp::ConvFused:
-            return {conv_fused_spv_bytes, conv_fused_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{conv_fused_f16_spv_bytes, conv_fused_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{conv_fused_spv_bytes, conv_fused_spv_bytes_len, "main"};
         case GpuInternalOp::ConvFusedBn:
-            return {conv_fused_bn_spv_bytes, conv_fused_bn_spv_bytes_len, "main"};
+            return f16 ? ShaderBytes{conv_fused_bn_f16_spv_bytes, conv_fused_bn_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{conv_fused_bn_spv_bytes, conv_fused_bn_spv_bytes_len, "main"};
         }
 #endif
         throw std::runtime_error("campello_nn: GpuBackend: unsupported GpuInternalOp");
@@ -615,6 +755,7 @@ namespace
     struct CompiledNode
     {
         OpKind kind;
+        DataType dataType;
         bool usesBroadcastBinary = false; // true for Add/Mul that need broadcasting
         bool usesIm2Col = false;          // true for Conv2d using the im2col+GEMM path
         bool fusedWithBiasRelu = false;   // true for Conv2d fused with Add[bias] + ReLU
@@ -686,13 +827,14 @@ namespace
 struct GpuBackend::Impl
 {
     std::shared_ptr<cgpu::Device> device;
-    std::unordered_map<OpKind, OpResources> opResources;
-    std::unordered_map<GpuInternalOp, OpResources> internalOpResources;
-    std::optional<OpResources> broadcastBinaryResources;
+    std::unordered_map<OpKindDataTypeKey, OpResources, OpKindDataTypeKeyHash> opResources;
+    std::unordered_map<OpKindDataTypeKey, OpResources, OpKindDataTypeKeyHash> internalOpResources;
+    std::unordered_map<DataType, OpResources> broadcastBinaryResources;
 
-    OpResources &resourcesFor(OpKind kind)
+    OpResources &resourcesFor(OpKind kind, DataType dt)
     {
-        auto it = opResources.find(kind);
+        OpKindDataTypeKey key{kind, dt};
+        auto it = opResources.find(key);
         if (it != opResources.end())
             return it->second;
 
@@ -706,7 +848,7 @@ struct GpuBackend::Impl
         if (!res.pipelineLayout)
             throw std::runtime_error("campello_nn: GpuBackend: createPipelineLayout failed");
 
-        ShaderBytes sb = shaderBytesFor(kind);
+        ShaderBytes sb = shaderBytesFor(kind, dt);
         auto module = device->createShaderModule(sb.data, sb.size);
         if (!module)
             throw std::runtime_error("campello_nn: GpuBackend: createShaderModule failed");
@@ -719,14 +861,15 @@ struct GpuBackend::Impl
         if (!res.pipeline)
             throw std::runtime_error("campello_nn: GpuBackend: createComputePipeline failed");
 
-        auto [it2, ok] = opResources.emplace(kind, std::move(res));
+        auto [it2, ok] = opResources.emplace(key, std::move(res));
         (void)ok;
         return it2->second;
     }
 
-    OpResources &resourcesForInternal(GpuInternalOp op)
+    OpResources &resourcesForInternal(GpuInternalOp op, DataType dt)
     {
-        auto it = internalOpResources.find(op);
+        OpKindDataTypeKey key{static_cast<OpKind>(op), dt};
+        auto it = internalOpResources.find(key);
         if (it != internalOpResources.end())
             return it->second;
 
@@ -746,7 +889,7 @@ struct GpuBackend::Impl
         if (!res.pipelineLayout)
             throw std::runtime_error("campello_nn: GpuBackend: createPipelineLayout failed (internal)");
 
-        ShaderBytes sb = shaderBytesForInternal(op);
+        ShaderBytes sb = shaderBytesForInternal(op, dt);
         auto module = device->createShaderModule(sb.data, sb.size);
         if (!module)
             throw std::runtime_error("campello_nn: GpuBackend: createShaderModule failed (internal)");
@@ -759,15 +902,16 @@ struct GpuBackend::Impl
         if (!res.pipeline)
             throw std::runtime_error("campello_nn: GpuBackend: createComputePipeline failed (internal)");
 
-        auto [it2, ok] = internalOpResources.emplace(op, std::move(res));
+        auto [it2, ok] = internalOpResources.emplace(key, std::move(res));
         (void)ok;
         return it2->second;
     }
 
-    OpResources &broadcastBinaryResourcesFor()
+    OpResources &broadcastBinaryResourcesFor(DataType dt)
     {
-        if (broadcastBinaryResources)
-            return *broadcastBinaryResources;
+        auto it = broadcastBinaryResources.find(dt);
+        if (it != broadcastBinaryResources.end())
+            return it->second;
 
         OpResources res;
         uint32_t numInputs = 2;
@@ -779,10 +923,13 @@ struct GpuBackend::Impl
         if (!res.pipelineLayout)
             throw std::runtime_error("campello_nn: GpuBackend: createPipelineLayout failed (broadcast)");
 
+        const bool f16 = (dt == DataType::Float16);
 #if defined(__APPLE__)
-        ShaderBytes sb{broadcast_binary_metallib_bytes, broadcast_binary_metallib_bytes_len, "computeMain"};
+        ShaderBytes sb = f16 ? ShaderBytes{broadcast_binary_f16_metallib_bytes, broadcast_binary_f16_metallib_bytes_len, "computeMain"}
+                             : ShaderBytes{broadcast_binary_metallib_bytes, broadcast_binary_metallib_bytes_len, "computeMain"};
 #else
-        ShaderBytes sb{broadcast_binary_spv_bytes, broadcast_binary_spv_bytes_len, "main"};
+        ShaderBytes sb = f16 ? ShaderBytes{broadcast_binary_f16_spv_bytes, broadcast_binary_f16_spv_bytes_len, "main"}
+                             : ShaderBytes{broadcast_binary_spv_bytes, broadcast_binary_spv_bytes_len, "main"};
 #endif
         auto module = device->createShaderModule(sb.data, sb.size);
         if (!module)
@@ -796,8 +943,9 @@ struct GpuBackend::Impl
         if (!res.pipeline)
             throw std::runtime_error("campello_nn: GpuBackend: createComputePipeline failed (broadcast)");
 
-        broadcastBinaryResources = std::move(res);
-        return *broadcastBinaryResources;
+        auto [it2, ok] = broadcastBinaryResources.emplace(dt, std::move(res));
+        (void)ok;
+        return it2->second;
     }
 };
 
@@ -976,11 +1124,34 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
         compiled->nodes[i].fusedBatchNormReluIdx = reluIdx;
     }
 
+    // Enforce a single compute dtype per graph for this round (no mixed FP32/FP16).
+    // Quantize/Dequantize are exempt because they are intentionally cross-dtype.
+    std::optional<DataType> graphComputeDataType;
+    for (size_t i = 0; i < n; i++)
+    {
+        const Node &node = ir.nodes[i];
+        if (node.kind == OpKind::Input || node.kind == OpKind::Constant ||
+            node.kind == OpKind::Reshape || node.kind == OpKind::QuantizeLinear ||
+            node.kind == OpKind::DequantizeLinear)
+            continue;
+        if (!graphComputeDataType)
+            graphComputeDataType = node.dataType;
+        else if (*graphComputeDataType != node.dataType)
+            throw std::runtime_error(
+                "campello_nn: GpuBackend: mixed-precision graphs (Float32 + Float16) "
+                "are not supported in this round");
+    }
+
     for (size_t i = 0; i < n; i++)
     {
         const Node &node = ir.nodes[i];
         CompiledNode &cn = compiled->nodes[i];
         cn.kind = node.kind;
+        // The dtype used to select a shader variant. For QuantizeLinear the shader
+        // reads a Float32/Float16 input, so the variant follows the input dtype.
+        cn.dataType = node.dataType;
+        if (node.kind == OpKind::QuantizeLinear)
+            cn.dataType = ir.nodes[node.inputs[0]].dataType;
 
         switch (node.kind)
         {
@@ -1015,11 +1186,8 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
         case OpKind::Relu:
         case OpKind::Sigmoid:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error(std::string("campello_nn: GpuBackend: ") +
-                    (node.kind == OpKind::Relu ? "relu()" : "sigmoid()") +
-                    " only supports Float32 in this round");
-            impl->resourcesFor(node.kind);
+            requireFloat32Or16(node.dataType, node.kind == OpKind::Relu ? "relu()" : "sigmoid()");
+            impl->resourcesFor(node.kind, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
             if (cn.inPlaceOutput)
             {
@@ -1029,7 +1197,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             }
             else
             {
-                cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+                cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
                 if (!cn.output)
                     throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu/sigmoid output) failed");
             }
@@ -1037,18 +1205,14 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (relu/sigmoid params) failed");
-            cn.dispatchX = count;
+            cn.dispatchX = (count + 3) / 4;
             continue;
         }
 
         case OpKind::Add:
         case OpKind::Mul:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error(
-                    std::string("campello_nn: GpuBackend: ") +
-                    (node.kind == OpKind::Add ? "add()" : "mul()") +
-                    " only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, node.kind == OpKind::Add ? "add()" : "mul()");
 
             const std::vector<int64_t> &aShape = ir.nodes[node.inputs[0]].shape;
             const std::vector<int64_t> &bShape = ir.nodes[node.inputs[1]].shape;
@@ -1064,7 +1228,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             }
             else
             {
-                cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+                cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
                 if (!cn.output)
                     throw std::runtime_error(
                         std::string("campello_nn: GpuBackend: createBuffer (") +
@@ -1074,7 +1238,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             if (broadcast)
             {
                 cn.usesBroadcastBinary = true;
-                impl->broadcastBinaryResourcesFor();
+                impl->broadcastBinaryResourcesFor(node.dataType);
 
                 size_t rank = node.shape.size();
                 if (rank > 8)
@@ -1132,22 +1296,21 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             }
             else
             {
-                impl->resourcesFor(node.kind);
+                impl->resourcesFor(node.kind, node.dataType);
                 ParamsElementwise p{(uint32_t)count, 0, 0, 0};
                 cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
                 if (!cn.paramsBuffer)
                     throw std::runtime_error(
                         std::string("campello_nn: GpuBackend: createBuffer (") +
                         (node.kind == OpKind::Add ? "add" : "mul") + " params) failed");
-                cn.dispatchX = count;
+                cn.dispatchX = (count + 3) / 4;
             }
             continue;
         }
 
         case OpKind::MatMul:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: matmul() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "matmul()");
             const std::vector<int64_t> &aShape = ir.nodes[node.inputs[0]].shape;
             const std::vector<int64_t> &bShape = ir.nodes[node.inputs[1]].shape;
             if (aShape.size() < 2 || bShape.size() < 2)
@@ -1162,7 +1325,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                     throw std::runtime_error(
                         "campello_nn: GpuBackend: matmul() batch dimensions must match");
 
-            auto &res = impl->resourcesFor(OpKind::MatMul);
+            auto &res = impl->resourcesFor(OpKind::MatMul, node.dataType);
             uint64_t m = (uint64_t)aShape[rank - 2];
             uint64_t k = (uint64_t)aShape[rank - 1];
             uint64_t outN = (uint64_t)bShape[rank - 1];
@@ -1171,7 +1334,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                 batchCount *= (uint64_t)aShape[i];
 
             uint64_t outElems = batchCount * m * outN;
-            cn.output = impl->device->createBuffer(outElems * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(outElems * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (matmul output) failed");
             uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
@@ -1196,31 +1359,27 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Gelu:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error(
-                    std::string("campello_nn: GpuBackend: ") + toString(node.kind) +
-                    "() only supports Float32 in this round");
-            impl->resourcesFor(node.kind);
+            requireFloat32Or16(node.dataType, "gelu()");
+            impl->resourcesFor(node.kind, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (output) failed");
             ParamsElementwise p{(uint32_t)count, 0, 0, 0};
             cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
             if (!cn.paramsBuffer)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (params) failed");
-            cn.dispatchX = count;
+            cn.dispatchX = (count + 3) / 4;
             continue;
         }
 
         case OpKind::LayerNorm:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: layerNorm() only supports Float32 in this round");
-            impl->resourcesFor(OpKind::LayerNorm);
+            requireFloat32Or16(node.dataType, "layerNorm()");
+            impl->resourcesFor(OpKind::LayerNorm, node.dataType);
             int64_t lastDim = node.shape.back();
             int64_t outerTotal = numElements(node.shape) / lastDim;
-            cn.output = impl->device->createBuffer((uint64_t)numElements(node.shape) * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer((uint64_t)numElements(node.shape) * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (layerNorm output) failed");
             ParamsNorm p{(uint32_t)lastDim, node.floatAttr0, 0, 0};
@@ -1233,12 +1392,11 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::RmsNorm:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: rmsNorm() only supports Float32 in this round");
-            impl->resourcesFor(OpKind::RmsNorm);
+            requireFloat32Or16(node.dataType, "rmsNorm()");
+            impl->resourcesFor(OpKind::RmsNorm, node.dataType);
             int64_t lastDim = node.shape.back();
             int64_t outerTotal = numElements(node.shape) / lastDim;
-            cn.output = impl->device->createBuffer((uint64_t)numElements(node.shape) * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer((uint64_t)numElements(node.shape) * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (rmsNorm output) failed");
             ParamsNorm p{(uint32_t)lastDim, node.floatAttr0, 0, 0};
@@ -1251,8 +1409,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Transpose:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: transpose() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "transpose()");
             size_t rank = node.shape.size();
             if (rank > kMaxRank)
                 throw std::runtime_error("campello_nn: GpuBackend: transpose() rank > 8 is not implemented in this round");
@@ -1260,9 +1417,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             std::vector<int64_t> inStrides = rowMajorStrides(inShape);
             std::vector<int64_t> outStrides = rowMajorStrides(node.shape);
             const auto &perm = node.intAttr0;
-            impl->resourcesFor(OpKind::Transpose);
+            impl->resourcesFor(OpKind::Transpose, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (transpose output) failed");
             uint32_t divisor[kMaxRank] = {0}, gather[kMaxRank] = {0};
@@ -1283,8 +1440,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Slice:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: slice() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "slice()");
             size_t rank = node.shape.size();
             if (rank > kMaxRank)
                 throw std::runtime_error("campello_nn: GpuBackend: slice() rank > 8 is not implemented in this round");
@@ -1295,9 +1451,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             int64_t baseOffset = 0;
             for (size_t d = 0; d < rank; d++)
                 baseOffset += starts[d] * inStrides[d];
-            impl->resourcesFor(OpKind::Slice);
+            impl->resourcesFor(OpKind::Slice, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (slice output) failed");
             uint32_t divisor[kMaxRank] = {0}, mult[kMaxRank] = {0};
@@ -1318,8 +1474,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Concat:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: concat() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "concat()");
             // node.axis is already resolved to a non-negative index by
             // GraphBuilder::concat() (graph_builder.cpp), so no further
             // normalization is needed here.
@@ -1328,9 +1483,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             int64_t innerSize = 1;
             for (size_t d = axis + 1; d < node.shape.size(); d++)
                 innerSize *= node.shape[d];
-            impl->resourcesFor(OpKind::Concat);
+            impl->resourcesFor(OpKind::Concat, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (concat output) failed");
             int64_t axisOffset = 0;
@@ -1352,8 +1507,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Gather:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: gather() only supports Float32 data in this round");
+            requireFloat32Or16(node.dataType, "gather()");
             const std::vector<int64_t> &dataShape = ir.nodes[node.inputs[0]].shape;
             const std::vector<int64_t> &indicesShape = ir.nodes[node.inputs[1]].shape;
             // node.axis is already resolved to a non-negative index by
@@ -1367,9 +1521,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             for (size_t d = axis + 1; d < dataShape.size(); d++)
                 innerSize *= dataShape[d];
             int64_t numIndices = numElements(indicesShape);
-            impl->resourcesFor(OpKind::Gather);
+            impl->resourcesFor(OpKind::Gather, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (gather output) failed");
             ParamsGather p{(uint32_t)outerSize, (uint32_t)axisSize, (uint32_t)innerSize, (uint32_t)numIndices};
@@ -1382,8 +1536,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Gemm:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: gemm() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "gemm()");
             // GraphBuilder::gemm() (graph_builder.cpp) already requires a/b
             // to be rank-2 with no transA/transB — nothing further to
             // validate here.
@@ -1392,8 +1545,8 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             const std::vector<int64_t> &cShape = ir.nodes[node.inputs[2]].shape;
             uint64_t m = (uint64_t)aShape[0], k = (uint64_t)aShape[1], outN = (uint64_t)bShape[1];
             uint64_t cElems = (uint64_t)numElements(cShape);
-            impl->resourcesFor(OpKind::Gemm);
-            cn.output = impl->device->createBuffer(m * outN * sizeof(float), tensorBufferUsage());
+            impl->resourcesFor(OpKind::Gemm, node.dataType);
+            cn.output = impl->device->createBuffer(m * outN * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (gemm output) failed");
             ParamsGemm p{(uint32_t)m, (uint32_t)k, (uint32_t)outN, (uint32_t)cElems, node.floatAttr0, node.floatAttr1, 0, 0};
@@ -1407,8 +1560,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Softmax:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: softmax() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "softmax()");
             size_t rank = node.shape.size();
             if (rank > kMaxRank + 1) // outer (rank-1 dims) must itself fit kMaxRank
                 throw std::runtime_error("campello_nn: GpuBackend: softmax() rank too high for this round");
@@ -1429,9 +1581,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             }
             std::vector<int64_t> outerDivisor = rowMajorStrides(outerShape);
             uint64_t outerTotal = (uint64_t)numElements(outerShape);
-            impl->resourcesFor(OpKind::Softmax);
+            impl->resourcesFor(OpKind::Softmax, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (softmax output) failed");
             uint32_t divisor[kMaxRank] = {0}, origStride[kMaxRank] = {0};
@@ -1453,8 +1605,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Conv2d:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: conv2d() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "conv2d()");
             const std::vector<int64_t> &xShape = ir.nodes[node.inputs[0]].shape;
             const std::vector<int64_t> &wShape = ir.nodes[node.inputs[1]].shape;
             if (xShape.size() != 4 || wShape.size() != 4 || node.shape.size() != 4)
@@ -1474,7 +1625,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t inPerGroup = C / groups;
             uint32_t outPerGroup = O / groups;
             uint64_t outCount = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(outCount * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (conv2d output) failed");
 
@@ -1508,7 +1659,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                 if (!cn.fusedScaleBuffer || !cn.fusedFoldedBiasBuffer)
                     throw std::runtime_error("campello_nn: GpuBackend: createBuffer (folded BN params) failed");
 
-                auto &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn);
+                auto &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn, node.dataType);
                 uint32_t tileWidth = fusedBnRes.pipeline->getWorkgroupSize().x;
                 if (tileWidth < 1)
                     tileWidth = 1;
@@ -1563,7 +1714,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
             if (cn.fusedWithBiasRelu)
             {
-                auto &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused);
+                auto &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused, node.dataType);
                 uint32_t tileWidth = fusedRes.pipeline->getWorkgroupSize().x;
                 if (tileWidth < 1)
                     tileWidth = 1;
@@ -1596,7 +1747,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             // on those small-spatial-dim convolutions (e.g., YuNet), while the direct
             // shader remains faster for large feature-map convolutions (e.g., early
             // ResNet-50 layers) where thread utilization is already good.
-            auto &res = impl->resourcesFor(OpKind::Conv2d);
+            auto &res = impl->resourcesFor(OpKind::Conv2d, node.dataType);
             uint32_t convTileWidth = res.pipeline->getWorkgroupSize().x;
             if (convTileWidth < 1)
                 convTileWidth = 1;
@@ -1613,11 +1764,11 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             if (useIm2Col)
             {
                 cn.usesIm2Col = true;
-                auto &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col);
-                auto &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm);
+                auto &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col, node.dataType);
+                auto &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm, node.dataType);
 
                 uint64_t im2ColElems = (uint64_t)M * (uint64_t)K;
-                cn.im2ColOutput = impl->device->createBuffer(im2ColElems * sizeof(float), tensorBufferUsage());
+                cn.im2ColOutput = impl->device->createBuffer(im2ColElems * elementByteSize(node.dataType), tensorBufferUsage());
                 if (!cn.im2ColOutput)
                     throw std::runtime_error("campello_nn: GpuBackend: createBuffer (im2col output) failed");
 
@@ -1673,8 +1824,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
         case OpKind::MaxPool2d:
         case OpKind::AvgPool2d:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: pool2d() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "pool2d()");
             const std::vector<int64_t> &xShape = ir.nodes[node.inputs[0]].shape;
             if (xShape.size() != 4 || node.shape.size() != 4)
                 throw std::runtime_error("campello_nn: GpuBackend: pool2d() expects rank-4 tensors");
@@ -1686,9 +1836,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t N = (uint32_t)node.shape[0];
             uint32_t C = (uint32_t)node.shape[1];
             OpKind poolKind = node.kind;
-            impl->resourcesFor(poolKind);
+            impl->resourcesFor(poolKind, node.dataType);
             uint64_t outCount = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(outCount * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (pool2d output) failed");
             ParamsPool params{H, W, outH, outW,
@@ -1707,8 +1857,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::Resize:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: resize() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "resize()");
             const std::vector<int64_t> &xShape = ir.nodes[node.inputs[0]].shape;
             if (xShape.size() != 4 || node.shape.size() != 4)
                 throw std::runtime_error("campello_nn: GpuBackend: resize() expects rank-4 tensors");
@@ -1719,9 +1868,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t outW = (uint32_t)node.shape[3];
             uint32_t N = (uint32_t)node.shape[0];
             uint32_t C = (uint32_t)node.shape[1];
-            impl->resourcesFor(OpKind::Resize);
+            impl->resourcesFor(OpKind::Resize, node.dataType);
             uint64_t outCount = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(outCount * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(outCount * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (resize output) failed");
             ParamsResize params{H, W, outH, outW,
@@ -1740,8 +1889,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::BatchNorm:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: batchNorm() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "batchNorm()");
             if (node.shape.size() != 4)
                 throw std::runtime_error("campello_nn: GpuBackend: batchNorm() expects rank-4 tensors");
             uint32_t N = (uint32_t)node.shape[0];
@@ -1750,8 +1898,8 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t W = (uint32_t)node.shape[3];
             uint32_t spatial = H * W;
             uint64_t count = (uint64_t)numElements(node.shape);
-            impl->resourcesFor(OpKind::BatchNorm);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            impl->resourcesFor(OpKind::BatchNorm, node.dataType);
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (batchNorm output) failed");
             ParamsBatchNorm params{(uint32_t)count, C, spatial, node.floatAttr0};
@@ -1764,8 +1912,7 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::InstanceNorm:
         {
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: instanceNorm() only supports Float32 in this round");
+            requireFloat32Or16(node.dataType, "instanceNorm()");
             if (node.shape.size() != 4)
                 throw std::runtime_error("campello_nn: GpuBackend: instanceNorm() expects rank-4 tensors");
             uint32_t N = (uint32_t)node.shape[0];
@@ -1773,9 +1920,9 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             uint32_t H = (uint32_t)node.shape[2];
             uint32_t W = (uint32_t)node.shape[3];
             uint32_t spatial = H * W;
-            impl->resourcesFor(OpKind::InstanceNorm);
+            impl->resourcesFor(OpKind::InstanceNorm, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (instanceNorm output) failed");
             ParamsInstanceNorm params{spatial, C, node.floatAttr0, 0};
@@ -1788,13 +1935,13 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::QuantizeLinear:
         {
-            // Input is Float32; output is Int8. The IR node's dataType is Int8.
+            // Input is Float32/Float16; output is Int8. The IR node's dataType is Int8.
             if (node.dataType != DataType::Int8)
                 throw std::runtime_error("campello_nn: GpuBackend: quantizeLinear() output must be Int8");
             const Node &inputNode = ir.nodes[node.inputs[0]];
-            if (inputNode.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: quantizeLinear() input must be Float32");
-            impl->resourcesFor(OpKind::QuantizeLinear);
+            if (!isFloat32Or16(inputNode.dataType))
+                throw std::runtime_error("campello_nn: GpuBackend: quantizeLinear() input must be Float32 or Float16");
+            impl->resourcesFor(OpKind::QuantizeLinear, inputNode.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
             cn.output = impl->device->createBuffer(count * elementByteSize(DataType::Int8), tensorBufferUsage());
             if (!cn.output)
@@ -1809,15 +1956,15 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
         case OpKind::DequantizeLinear:
         {
-            // Input is Int8; output is Float32. The IR node's dataType is Float32.
-            if (node.dataType != DataType::Float32)
-                throw std::runtime_error("campello_nn: GpuBackend: dequantizeLinear() output must be Float32");
+            // Input is Int8; output is Float32/Float16. The IR node's dataType is the output dtype.
+            if (!isFloat32Or16(node.dataType))
+                throw std::runtime_error("campello_nn: GpuBackend: dequantizeLinear() output must be Float32 or Float16");
             const Node &inputNode = ir.nodes[node.inputs[0]];
             if (inputNode.dataType != DataType::Int8)
                 throw std::runtime_error("campello_nn: GpuBackend: dequantizeLinear() input must be Int8");
-            impl->resourcesFor(OpKind::DequantizeLinear);
+            impl->resourcesFor(OpKind::DequantizeLinear, node.dataType);
             uint64_t count = (uint64_t)numElements(node.shape);
-            cn.output = impl->device->createBuffer(count * sizeof(float), tensorBufferUsage());
+            cn.output = impl->device->createBuffer(count * elementByteSize(node.dataType), tensorBufferUsage());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (dequantizeLinear output) failed");
             ParamsQuantizeDequantize params{(uint32_t)count, node.floatAttr0, (int32_t)node.floatAttr1, 0};
@@ -1920,7 +2067,7 @@ void *GpuBackend::dispatch(
             // dispatches against the same OpResources (Concat's
             // numInputsFor() == 1) rather than one dispatch with N bound
             // inputs — see CompiledNode::concatPieces's comment.
-            OpResources &res = impl->resourcesFor(OpKind::Concat);
+            OpResources &res = impl->resourcesFor(OpKind::Concat, cn.dataType);
             pass->setPipeline(res.pipeline);
             for (auto &piece : cn.concatPieces)
             {
@@ -1942,7 +2089,7 @@ void *GpuBackend::dispatch(
         if (node.kind == OpKind::Conv2d && cn.fusedWithBatchNormRelu)
         {
             // Fused Conv2d + BatchNorm + ReLU path.
-            OpResources &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn);
+            OpResources &fusedBnRes = impl->resourcesForInternal(GpuInternalOp::ConvFusedBn, cn.dataType);
 
             auto &inputBuf = resolved[node.inputs[0]];
             auto &weightBuf = resolved[node.inputs[1]];
@@ -1973,7 +2120,7 @@ void *GpuBackend::dispatch(
         if (node.kind == OpKind::Conv2d && cn.fusedWithBiasRelu)
         {
             // Fused Conv2d + Add[bias] + ReLU path.
-            OpResources &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused);
+            OpResources &fusedRes = impl->resourcesForInternal(GpuInternalOp::ConvFused, cn.dataType);
 
             auto &inputBuf = resolved[node.inputs[0]];
             auto &weightBuf = resolved[node.inputs[1]];
@@ -2002,8 +2149,8 @@ void *GpuBackend::dispatch(
         if (node.kind == OpKind::Conv2d && cn.usesIm2Col)
         {
             // im2col + GEMM path (groups == 1).
-            OpResources &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col);
-            OpResources &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm);
+            OpResources &im2colRes = impl->resourcesForInternal(GpuInternalOp::Im2Col, cn.dataType);
+            OpResources &convGemmRes = impl->resourcesForInternal(GpuInternalOp::ConvGemm, cn.dataType);
 
             auto &inputBuf = resolved[node.inputs[0]];
             auto &weightBuf = resolved[node.inputs[1]];
@@ -2036,8 +2183,8 @@ void *GpuBackend::dispatch(
         }
 
         OpResources &res = cn.usesBroadcastBinary
-                              ? impl->broadcastBinaryResourcesFor()
-                              : impl->resourcesFor(cn.kind);
+                              ? impl->broadcastBinaryResourcesFor(cn.dataType)
+                              : impl->resourcesFor(cn.kind, cn.dataType);
 
         cgpu::BindGroupDescriptor bgDesc;
         bgDesc.layout = res.bindGroupLayout;

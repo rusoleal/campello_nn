@@ -1,15 +1,13 @@
-#version 450
-
 // Vulkan (GLSL). Fused Conv2d + BatchNorm + ReLU for NCHW float32 (inference mode).
 // Inputs:  x (NCHW), w (OIHW), scale_factor (1D [O]), folded_bias (1D [O])
 // Output:  relu(conv(x,w) * scale_factor[o] + folded_bias[o]) in NCHW
 layout(local_size_x = 1, local_size_y = 1) in;
 
-layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
-layout(std430, binding = 1) readonly buffer WBuf { float data[]; } wBuf;
-layout(std430, binding = 2) readonly buffer ScaleBuf { float data[]; } scaleBuf;
-layout(std430, binding = 3) readonly buffer BiasBuf { float data[]; } biasBuf;
-layout(std430, binding = 4) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer XBuf { T data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer WBuf { T data[]; } wBuf;
+layout(std430, binding = 2) readonly buffer ScaleBuf { T data[]; } scaleBuf;
+layout(std430, binding = 3) readonly buffer BiasBuf { T data[]; } biasBuf;
+layout(std430, binding = 4) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 5) uniform Params
 {
     uint N, O, C, H, W, Cg, KH, KW, outH, outW;
@@ -49,8 +47,8 @@ void main()
                     int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw * params.dilationX);
                     if (iw < 0 || iw >= int(params.W))
                         continue;
-                    float xv = xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
-                    float wv = wBuf.data[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw];
+                    float xv = TO_FLOAT(xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
+                    float wv = TO_FLOAT(wBuf.data[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw]);
                     sum += xv * wv;
                 }
             }
@@ -59,7 +57,7 @@ void main()
 
     if (isActive)
     {
-        sum = sum * scaleBuf.data[o] + biasBuf.data[o];
-        outputBuf.data[(no * params.outH + oh) * params.outW + ow] = max(0.0, sum);
+        sum = sum * TO_FLOAT(scaleBuf.data[o]) + TO_FLOAT(biasBuf.data[o]);
+        outputBuf.data[(no * params.outH + oh) * params.outW + ow] = TO_T(max(0.0, sum));
     }
 }

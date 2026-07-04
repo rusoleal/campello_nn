@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. im2col for NCHW float32 conv2d (groups == 1).
 // Output is a row-major [M, K] matrix where:
 //   M = N * outH * outW
@@ -18,8 +15,8 @@ struct Params
     uint tileWidth;
 };
 
-kernel void computeMain(const device float *xBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+kernel void computeMain(const device T *xBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
@@ -50,7 +47,7 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
     float val = 0.0f;
     if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W))
     {
-        val = xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
+        val = TO_FLOAT(xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
     }
-    outputBuf[m * K + k] = val;
+    outputBuf[m * K + k] = TO_T(val);
 }

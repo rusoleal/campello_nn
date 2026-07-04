@@ -12,7 +12,7 @@ struct Params
 };
 
 ByteAddressBuffer inBuf : register(t0);
-RWStructuredBuffer<float> outBuf : register(u0);
+RWStructuredBuffer<T> outBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

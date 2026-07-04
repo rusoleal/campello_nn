@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Same one-workgroup-per-element model and thread-0 gate as
 // relu.metal; same generic arbitrary-rank permute as transpose.comp — see
 // that file's comment for the divisor/gatherStride math and why Params uses
@@ -14,8 +11,8 @@ struct Params
     uint gather0, gather1, gather2, gather3, gather4, gather5, gather6, gather7;
 };
 
-kernel void computeMain(const device float *inputBuf [[buffer(0)]],
-                         device float *outputBuf [[buffer(1)]],
+kernel void computeMain(const device T *inputBuf [[buffer(0)]],
+                         device T *outputBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint groupId [[threadgroup_position_in_grid]],
                          uint localId [[thread_position_in_threadgroup]])

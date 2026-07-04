@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_nn VERSION 0.3.0)
+project(campello_nn VERSION 0.4.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -139,7 +139,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     FetchContent_Declare(
         campello_gpu
         GIT_REPOSITORY https://github.com/rusoleal/campello_gpu.git
-        GIT_TAG v0.14.0
+        GIT_TAG v0.18.0
     )
     FetchContent_MakeAvailable(campello_gpu)
     set(BUILD_TESTS ${_campello_nn_saved_build_tests2} CACHE BOOL "" FORCE)

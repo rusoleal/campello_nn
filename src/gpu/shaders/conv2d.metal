@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. NCHW/grouped/dilated conv2d with shared-memory spatial tiling.
 //
 // Each workgroup computes up to TILE_OW consecutive output columns in a single
@@ -30,9 +27,9 @@ struct Params
     uint tileWidth;
 };
 
-kernel void computeMain(const device float *xBuf [[buffer(0)]],
-                         const device float *wBuf [[buffer(1)]],
-                         device float *outputBuf [[buffer(2)]],
+kernel void computeMain(const device T *xBuf [[buffer(0)]],
+                         const device T *wBuf [[buffer(1)]],
+                         device T *outputBuf [[buffer(2)]],
                          constant Params &params [[buffer(3)]],
                          uint3 groupId [[threadgroup_position_in_grid]],
                          uint3 localId [[thread_position_in_threadgroup]])
@@ -82,7 +79,7 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                 float val = 0.0f;
                 if (ih >= 0 && ih < int(params.H) && iwReal >= 0 && iwReal < int(params.W))
                 {
-                    val = xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iwReal)];
+                    val = TO_FLOAT(xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iwReal)]);
                 }
                 sharedX[ci][kh][iw] = val;
             }
@@ -99,7 +96,7 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                 float val = 0.0f;
                 if (c < params.Cg)
                 {
-                    val = wBuf[((o * params.Cg + c) * params.KH + kh) * params.KW + kw];
+                    val = TO_FLOAT(wBuf[((o * params.Cg + c) * params.KH + kh) * params.KW + kw]);
                 }
                 sharedW[ci][kh][kw] = val;
             }
@@ -147,8 +144,8 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
                     int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw * params.dilationX);
                     if (iw < 0 || iw >= int(params.W))
                         continue;
-                    float xv = xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
-                    float wv = wBuf[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw];
+                    float xv = TO_FLOAT(xBuf[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
+                    float wv = TO_FLOAT(wBuf[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw]);
                     sum += xv * wv;
                 }
             }
@@ -157,6 +154,6 @@ kernel void computeMain(const device float *xBuf [[buffer(0)]],
 
     if (isActive)
     {
-        outputBuf[(no * params.outH + oh) * params.outW + ow] = sum;
+        outputBuf[(no * params.outH + oh) * params.outW + ow] = TO_T(sum);
     }
 }

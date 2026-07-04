@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). Same one-workgroup-per-element model and the same generic
 // per-dim decode as transpose.comp (see that file's comment for why Params
 // uses flat named fields instead of real arrays), but slice doesn't permute
@@ -12,8 +10,8 @@
 // offset.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint rank;

@@ -10,11 +10,11 @@ struct Params
     uint tileWidth;
 };
 
-StructuredBuffer<float> xBuf : register(t0);
-StructuredBuffer<float> wBuf : register(t1);
-StructuredBuffer<float> scaleBuf : register(t2);
-StructuredBuffer<float> biasBuf : register(t3);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> xBuf : register(t0);
+StructuredBuffer<T> wBuf : register(t1);
+StructuredBuffer<T> scaleBuf : register(t2);
+StructuredBuffer<T> biasBuf : register(t3);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

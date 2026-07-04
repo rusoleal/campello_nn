@@ -14,8 +14,8 @@ struct Params
     uint tileWidth;
 };
 
-StructuredBuffer<float> xBuf : register(t0);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> xBuf : register(t0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

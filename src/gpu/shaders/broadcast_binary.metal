@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Generic NumPy/ONNX-style broadcasting for elementwise binary ops.
 // `mode` selects add (0) or mul (1). Thread-0 gate for the same reason as
 // relu.metal.
@@ -16,9 +13,9 @@ struct Params
     uint strideB0, strideB1, strideB2, strideB3, strideB4, strideB5, strideB6, strideB7;
 };
 
-kernel void computeMain(const device float *aBuf [[buffer(0)]],
-                         const device float *bBuf [[buffer(1)]],
-                         device float *outputBuf [[buffer(2)]],
+kernel void computeMain(const device T *aBuf [[buffer(0)]],
+                         const device T *bBuf [[buffer(1)]],
+                         device T *outputBuf [[buffer(2)]],
                          constant Params &params [[buffer(3)]],
                          uint groupId [[threadgroup_position_in_grid]],
                          uint localId [[thread_position_in_threadgroup]])
@@ -90,7 +87,7 @@ kernel void computeMain(const device float *aBuf [[buffer(0)]],
         bIdx += coord * params.strideB0;
     }
 
-    float a = aBuf[aIdx];
-    float b = bBuf[bIdx];
+    T a = aBuf[aIdx];
+    T b = bBuf[bIdx];
     outputBuf[idx] = params.mode == 0u ? a + b : a * b;
 }

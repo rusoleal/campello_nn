@@ -7,8 +7,8 @@ struct Params
     uint mode, centerResult, alignCorners, nearestRoundsDown;
 };
 
-StructuredBuffer<float> inputBuf : register(t0);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> inputBuf : register(t0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 float resizeSrcCoord(uint dst, uint inSize, uint outSize)

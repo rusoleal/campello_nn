@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). One workgroup per *input* element (not per output element —
 // gpu_backend.cpp dispatches this kernel once per concat input, each
 // dispatch copying that one input's whole contents into its axis-offset
@@ -16,8 +14,8 @@
 // starts writing.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint count;

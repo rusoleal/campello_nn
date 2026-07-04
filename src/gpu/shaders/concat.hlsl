@@ -12,8 +12,8 @@ struct Params
     uint pad0, pad1, pad2;
 };
 
-StructuredBuffer<float> inputBuf : register(t0);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> inputBuf : register(t0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

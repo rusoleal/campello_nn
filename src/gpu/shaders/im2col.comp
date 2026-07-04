@@ -1,13 +1,11 @@
-#version 450
-
 // Vulkan (GLSL). im2col for NCHW float32 conv2d (groups == 1).
 // Output is a row-major [M, K] matrix where:
 //   M = N * outH * outW
 //   K = C * KH * KW
 layout(local_size_x = 1, local_size_y = 1) in;
 
-layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer XBuf { T data[]; } xBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint N, C, H, W;
@@ -47,7 +45,7 @@ void main()
     float val = 0.0;
     if (ih >= 0 && ih < int(params.H) && iw >= 0 && iw < int(params.W))
     {
-        val = xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
+        val = TO_FLOAT(xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
     }
-    outputBuf.data[m * K + k] = val;
+    outputBuf.data[m * K + k] = TO_T(val);
 }

@@ -9,12 +9,12 @@ struct Params
     float eps;
 };
 
-StructuredBuffer<float> xBuf : register(t0);
-StructuredBuffer<float> meanBuf : register(t1);
-StructuredBuffer<float> varBuf : register(t2);
-StructuredBuffer<float> scaleBuf : register(t3);
-StructuredBuffer<float> biasBuf : register(t4);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> xBuf : register(t0);
+StructuredBuffer<T> meanBuf : register(t1);
+StructuredBuffer<T> varBuf : register(t2);
+StructuredBuffer<T> scaleBuf : register(t3);
+StructuredBuffer<T> biasBuf : register(t4);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]

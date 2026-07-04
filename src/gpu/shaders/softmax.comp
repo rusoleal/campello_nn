@@ -1,29 +1,28 @@
-#version 450
-
-// Vulkan (GLSL). One workgroup per output *row* (dispatchX = outerTotal, the
-// element count of `x`'s shape with the softmax axis removed) — same
-// row-per-workgroup model as layernorm.comp/rmsnorm.comp, but unlike those
-// two, softmax's reduction axis isn't necessarily the *last* dimension, so
-// computing a row's flat base offset needs the same generic per-dim decode
-// transpose.comp/slice.comp use (see transpose.comp's comment for why
-// Params uses flat named fields instead of real arrays): `divisor[d]` is
-// the row-major stride of the *outer* shape (x's shape with the axis
-// dimension removed) used to unravel the workgroup's row index, and
-// `origStride[d]` is the corresponding original stride (from x's own full
-// shape) for that same dimension, skipping over the axis dimension
-// entirely. Three-pass body (max, exp+sum, normalize) matches the CPU
-// backend's evalSoftmax (src/cpu/ops.cpp) exactly, including the
-// numerically-stable max-subtraction.
+// Vulkan (GLSL). One workgroup per output *row* (dispatchX = outerTotal). The
+// axis elements are strided by `axisStride`, so the vectorized loops gather
+// four scalar loads per iteration. Max/sum accumulation remains float; a
+// scalar tail handles the remainder. See softmax.comp's original comment for
+// the per-dim decode details.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint outerRank, axisSize, axisStride, outerTotal;
     uint divisor0, divisor1, divisor2, divisor3, divisor4, divisor5, divisor6, divisor7;
     uint origStride0, origStride1, origStride2, origStride3, origStride4, origStride5, origStride6, origStride7;
 } params;
+
+vec4 toFloat4(T4 v)
+{
+    return vec4(TO_FLOAT(v.x), TO_FLOAT(v.y), TO_FLOAT(v.z), TO_FLOAT(v.w));
+}
+
+T4 toT4(vec4 v)
+{
+    return T4(TO_T(v.x), TO_T(v.y), TO_T(v.z), TO_T(v.w));
+}
 
 void main()
 {
@@ -45,18 +44,62 @@ void main()
         base += idx * origStride[d];
     }
 
-    float maxV = inputBuf.data[base];
-    for (uint k = 1u; k < params.axisSize; k++)
-        maxV = max(maxV, inputBuf.data[base + k * params.axisStride]);
+    uint axisStride = params.axisStride;
+
+    float maxV = TO_FLOAT(inputBuf.data[base]);
+    uint k = 1u;
+    for (; k + 3u < params.axisSize; k += 4u)
+    {
+        T4 v = T4(inputBuf.data[base + k * axisStride],
+                  inputBuf.data[base + (k + 1u) * axisStride],
+                  inputBuf.data[base + (k + 2u) * axisStride],
+                  inputBuf.data[base + (k + 3u) * axisStride]);
+        vec4 f = toFloat4(v);
+        maxV = max(maxV, max(max(f.x, f.y), max(f.z, f.w)));
+    }
+    for (; k < params.axisSize; ++k)
+        maxV = max(maxV, TO_FLOAT(inputBuf.data[base + k * axisStride]));
 
     float sum = 0.0;
-    for (uint k = 0u; k < params.axisSize; k++)
+    k = 0u;
+    for (; k + 3u < params.axisSize; k += 4u)
     {
-        float e = exp(inputBuf.data[base + k * params.axisStride] - maxV);
-        outputBuf.data[base + k * params.axisStride] = e;
+        T4 v = T4(inputBuf.data[base + k * axisStride],
+                  inputBuf.data[base + (k + 1u) * axisStride],
+                  inputBuf.data[base + (k + 2u) * axisStride],
+                  inputBuf.data[base + (k + 3u) * axisStride]);
+        vec4 e = exp(toFloat4(v) - maxV);
+        T4 res = toT4(e);
+        outputBuf.data[base + k * axisStride]             = res.x;
+        outputBuf.data[base + (k + 1u) * axisStride]      = res.y;
+        outputBuf.data[base + (k + 2u) * axisStride]      = res.z;
+        outputBuf.data[base + (k + 3u) * axisStride]      = res.w;
+        sum += e.x + e.y + e.z + e.w;
+    }
+    for (; k < params.axisSize; ++k)
+    {
+        float e = exp(TO_FLOAT(inputBuf.data[base + k * axisStride]) - maxV);
+        outputBuf.data[base + k * axisStride] = TO_T(e);
         sum += e;
     }
 
-    for (uint k = 0u; k < params.axisSize; k++)
-        outputBuf.data[base + k * params.axisStride] /= sum;
+    k = 0u;
+    for (; k + 3u < params.axisSize; k += 4u)
+    {
+        T4 v = T4(outputBuf.data[base + k * axisStride],
+                  outputBuf.data[base + (k + 1u) * axisStride],
+                  outputBuf.data[base + (k + 2u) * axisStride],
+                  outputBuf.data[base + (k + 3u) * axisStride]);
+        vec4 f = toFloat4(v) / sum;
+        T4 res = toT4(f);
+        outputBuf.data[base + k * axisStride]             = res.x;
+        outputBuf.data[base + (k + 1u) * axisStride]      = res.y;
+        outputBuf.data[base + (k + 2u) * axisStride]      = res.z;
+        outputBuf.data[base + (k + 3u) * axisStride]      = res.w;
+    }
+    for (; k < params.axisSize; ++k)
+    {
+        float v = TO_FLOAT(outputBuf.data[base + k * axisStride]);
+        outputBuf.data[base + k * axisStride] = TO_T(v / sum);
+    }
 }

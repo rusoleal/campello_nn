@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). One workgroup per output element (ow, oh, n*C+c) —
 // dispatchX=outW, dispatchY=outH, dispatchZ=N*C. `resizeSrcCoord()` mirrors
 // the CPU backend's own free function of the same name (src/cpu/ops.cpp)
@@ -12,8 +10,8 @@
 // for keeping these structs simple).
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params
 {
     uint H, W, outH, outW;
@@ -56,7 +54,7 @@ void main()
         }
         ih = clamp(ih, 0, int(params.H) - 1);
         iw = clamp(iw, 0, int(params.W) - 1);
-        value = inputBuf.data[nc * params.H * params.W + uint(ih) * params.W + uint(iw)];
+        value = TO_FLOAT(inputBuf.data[nc * params.H * params.W + uint(ih) * params.W + uint(iw)]);
     }
     else // Bilinear
     {
@@ -67,11 +65,11 @@ void main()
         float fh = srcH - float(h0);
         float fw = srcW - float(w0);
         uint base = nc * params.H * params.W;
-        float top = inputBuf.data[base + uint(h0) * params.W + uint(w0)] * (1.0 - fw) +
-                    inputBuf.data[base + uint(h0) * params.W + uint(w1)] * fw;
-        float bottom = inputBuf.data[base + uint(h1) * params.W + uint(w0)] * (1.0 - fw) +
-                       inputBuf.data[base + uint(h1) * params.W + uint(w1)] * fw;
+        float top = TO_FLOAT(inputBuf.data[base + uint(h0) * params.W + uint(w0)]) * (1.0 - fw) +
+                    TO_FLOAT(inputBuf.data[base + uint(h0) * params.W + uint(w1)]) * fw;
+        float bottom = TO_FLOAT(inputBuf.data[base + uint(h1) * params.W + uint(w0)]) * (1.0 - fw) +
+                       TO_FLOAT(inputBuf.data[base + uint(h1) * params.W + uint(w1)]) * fw;
         value = top * (1.0 - fh) + bottom * fh;
     }
-    outputBuf.data[(nc * params.outH + oh) * params.outW + ow] = value;
+    outputBuf.data[(nc * params.outH + oh) * params.outW + ow] = TO_T(value);
 }

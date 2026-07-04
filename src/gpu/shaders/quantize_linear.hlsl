@@ -13,7 +13,7 @@ struct Params
     uint pad0;
 };
 
-StructuredBuffer<float> inBuf : register(t0);
+StructuredBuffer<T> inBuf : register(t0);
 RWByteAddressBuffer outBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 

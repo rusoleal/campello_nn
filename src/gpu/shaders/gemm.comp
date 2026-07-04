@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). Same rank-2/unbatched/naive-K-loop scope and
 // one-workgroup-per-(m,n)-output-element model as matmul.comp, extended
 // with `alpha`/`beta`/bias-`C` exactly like the CPU backend's evalGemmImpl
@@ -8,18 +6,26 @@
 // (one row, broadcast over m), or the full `m*n` (no broadcast). No
 // transA/transB (GraphBuilder::gemm() never accepts them — see CLAUDE.md;
 // a caller wanting that composes an explicit transpose() first).
+//
+// The inner K-loop is vectorized with T4 loads from A (contiguous) and four
+// packed scalar loads from the corresponding B rows; accumulation stays float
+// with a scalar tail for the remainder.
 layout(local_size_x = 1, local_size_y = 1) in;
 
-layout(std430, binding = 0) readonly buffer ABuf { float data[]; } aBuf;
-layout(std430, binding = 1) readonly buffer BBuf { float data[]; } bBuf;
-layout(std430, binding = 2) readonly buffer CBuf { float data[]; } cBuf;
-layout(std430, binding = 3) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer ABuf { T data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { T data[]; } bBuf;
+layout(std430, binding = 2) readonly buffer CBuf { T data[]; } cBuf;
+layout(std430, binding = 3) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 4) uniform Params
 {
     uint m, k, n, cElems;
     float alpha, beta;
-    uint pad0, pad1;
 } params;
+
+vec4 toFloat4(T4 v)
+{
+    return vec4(TO_FLOAT(v.x), TO_FLOAT(v.y), TO_FLOAT(v.z), TO_FLOAT(v.w));
+}
 
 void main()
 {
@@ -27,11 +33,31 @@ void main()
     uint m = gl_WorkGroupID.y;
     if (m >= params.m || n >= params.n)
         return;
+
+    uint aRow = m * params.k;
+    uint nVal = n;
+    uint kDim = params.k;
+    uint nDim = params.n;
+
     float sum = 0.0;
-    for (uint i = 0u; i < params.k; i++)
-        sum += aBuf.data[m * params.k + i] * bBuf.data[i * params.n + n];
-    float cv = params.cElems == 1u ? cBuf.data[0]
-               : params.cElems == params.n ? cBuf.data[n]
-                                            : cBuf.data[m * params.n + n];
-    outputBuf.data[m * params.n + n] = params.alpha * sum + params.beta * cv;
+    uint i = 0u;
+    for (; i + 3u < kDim; i += 4u)
+    {
+        T4 a = T4(aBuf.data[aRow + i],
+                  aBuf.data[aRow + i + 1u],
+                  aBuf.data[aRow + i + 2u],
+                  aBuf.data[aRow + i + 3u]);
+        float b0 = TO_FLOAT(bBuf.data[(i + 0u) * nDim + nVal]);
+        float b1 = TO_FLOAT(bBuf.data[(i + 1u) * nDim + nVal]);
+        float b2 = TO_FLOAT(bBuf.data[(i + 2u) * nDim + nVal]);
+        float b3 = TO_FLOAT(bBuf.data[(i + 3u) * nDim + nVal]);
+        sum += dot(toFloat4(a), vec4(b0, b1, b2, b3));
+    }
+    for (; i < kDim; ++i)
+        sum += TO_FLOAT(aBuf.data[aRow + i]) * TO_FLOAT(bBuf.data[i * nDim + nVal]);
+
+    float cv = params.cElems == 1u ? TO_FLOAT(cBuf.data[0])
+               : params.cElems == params.n ? TO_FLOAT(cBuf.data[nVal])
+                                            : TO_FLOAT(cBuf.data[m * nDim + nVal]);
+    outputBuf.data[m * nDim + nVal] = TO_T(params.alpha * sum + params.beta * cv);
 }

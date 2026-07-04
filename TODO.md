@@ -158,10 +158,16 @@ three ops, implemented across every layer the original op set touches:
     and fixed two latent bugs: `gelu` and `gemm`'s composed constants (`0.5`, `1.0`, `1/√2`,
     `alpha`, `beta`) were hardcoded to `MPSDataTypeFloat32`, which would have broken/mismatched
     against an actual Float16 tensor; both now use `mpsDataType(node.dataType)`.
+  - **Generic GPU backend:** runs Float16 natively through precompiled SPIR-V/Metal variants.
+    Shader bodies were abstracted with `T`/`T2`/`T4`/`TO_FLOAT`/`TO_T` macros so that
+    `scripts/compile_gpu_shaders.py` can emit both FP32 and FP16 binaries; `GpuBackend` caches
+    pipelines keyed by `(OpKind, dataType)` and enforces a uniform compute dtype per graph.
   - Tests: `tests/universal/test_cpu_float16_ops.cpp` /
-    `tests/platform/test_mps_float16_ops.cpp` — `Add`/`Mul`/`Gelu`/`MatMul`/`LayerNorm` (one
-    representative op per category: elementwise, activation, linalg, normalization), passing on
-    both CPU and real MPSGraph/GPU hardware.
+    `tests/platform/test_mps_float16_ops.cpp` /
+    `tests/platform/test_gpu_generic_float16_ops.cpp` — `Add`/`Mul`/`Gelu`/`MatMul`/`LayerNorm`
+    (one representative op per category: elementwise, activation, linalg, normalization) plus
+    `Conv2d`/`RmsNorm` for the generic backend, passing on CPU, real MPSGraph/GPU hardware, and
+    the Metal `GpuGeneric` backend.
 - [x] **Int8, real quantization** (not storage-only — ONNX/WebNN-shaped). New ops
       `quantizeLinear(x, scale, zeroPoint)` (float → Int8) and `dequantizeLinear(x, scale,
       zeroPoint)` (Int8 → Float32), matching ONNX `QuantizeLinear`/`DequantizeLinear`'s formula
@@ -871,6 +877,165 @@ the self-contained `campello_gpu` Vulkan backend above, which also happens to co
 
 ---
 
+### 3f. Generic GPU backend — Float16 / half-precision compute ✅
+
+**Goal:** bring `GpuGeneric` to parity with the MPSGraph/DirectML/CPU backends for
+`DataType::Float16`. Today the backend only runs `Float32`: every shader in
+`src/gpu/shaders/*.{comp,metal,hlsl}` hardcodes `float`, and `GpuBackend::compileGraph()`
+rejects any op whose `node.dataType != Float32`. Real LLM/vision inference needs the
+memory-bandwidth and compute throughput wins of FP16, so this phase is a prerequisite for
+calling `GpuGeneric` a general-purpose accelerator backend.
+
+**Status:** functional FP16 parity is implemented and tested. All shader bodies were ported
+from hard-coded `float` to the `T`/`T2`/`T4` macro system, `scripts/compile_gpu_shaders.py`
+now emits both FP32 and FP16 precompiled variants (`*_spv.hpp` and `*_metallib.hpp`), and
+`GpuBackend` selects the variant by `(OpKind, dataType)`. A uniform-dtype-per-graph policy
+is enforced for compute nodes (Quantize/Dequantize are exempt), and the new
+`tests/platform/test_gpu_generic_float16_ops.cpp` exercises `Add`, `Mul`, `Gelu`, `MatMul`,
+`LayerNorm`, `RmsNorm`, and `Conv2d`. All 186 project tests pass on macOS Metal.
+
+Remaining follow-through items are deliberately deferred: FP16-specific performance tuning
+(vectorized loads, tile-size retuning, subgroup reductions), end-to-end FP16 model runs,
+mixed-precision graphs, and HLSL/DXIL verification on Windows.
+
+#### 3f.1 — Design & build-system changes
+- [x] **Shader-variant strategy.** Because `campello_gpu`'s `ShaderModule` only accepts
+      precompiled native binaries, we cannot compile one shader and specialize it at
+      runtime. Decide between:
+  - (a) maintain parallel `*_f16.{comp,metal,hlsl}` sources for every op, or
+  - (b) generate fp32/fp16 variants from a single templated/macro-ized source at build time.
+  - Constraint: SPIR-V, Metal `.metallib`, and HLSL must all be produced; the chosen strategy
+    must not require runtime shader-source compilation.
+- [x] **Type abstractions in shaders.** Define a common shader-side abstraction so each kernel
+      can compile as either `float`/`f32vecN` or `half`/`f16vecN`/`halfN`:
+  - GLSL/SPIR-V: `#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require`,
+    alias `T` to `float16_t` or `float`, vector loads to `f16vecN`/`vecN`.
+  - Metal: alias `T` to `half` or `float`; use `halfN`/`floatN` vector types.
+  - HLSL: alias `T` to `half` or `float`; use `min16float`/`half` where supported.
+- [x] **Build-script / CMake updates.** Extend `scripts/compile_gpu_shaders.py` (or add a new
+      generator) to emit both `*_spv.hpp` / `*_metallib.hpp` (and future `*_dxil.hpp`) for
+      fp32 and fp16. Update `src/gpu/shaders/CMakeLists.txt` / top-level build wiring so both
+      variants are rebuilt when sources change.
+- [x] **Buffer layout verification.** Confirm that `elementByteSize(Float16) == 2` is enough:
+      `campello_gpu` buffer bindings are byte-addressed, so no stride changes are needed, but
+      every shader load/store must use the correct scalar/vector width to avoid misaligned
+      reads.
+
+#### 3f.2 — Kernel-by-kernel FP16 implementation
+For every existing op in `src/gpu/shaders/`, create or generate an FP16 variant and wire it
+into `GpuBackend`. The list below follows the same op set already implemented for FP32.
+
+- [x] **Elementwise / activation ops:** `relu`, `sigmoid`, `gelu`, `add`, `mul`.
+  - These are the easiest: replace `float`/`vecN` with `T`/`TN`, keep the same one-workgroup-
+    per-element (or vectorized per-workgroup) dispatch model. Use vectorized `TN` loads/stores
+    for 2× or 4× effective memory bandwidth.
+- [x] **Broadcast binary (`add`/`mul` with broadcasting).**
+  - Extend `broadcast_binary.{comp,metal,hlsl}` to support FP16. The stride/offset math is
+    dtype-agnostic; only the input/output element type changes.
+- [x] **MatMul / batched MatMul.**
+  - Rewrite/templatize `matmul.{comp,metal,hlsl}` for FP16. Evaluate FP16 vector dot products
+    (`f16vec4`/`half4`) and consider FP32 accumulation to avoid overflow on large `K`, with
+    a final FP16 write-back.
+  - Tune `tileWidth` for FP16: twice as many elements per threadgroup load as FP32, so the
+    optimal threadgroup shape may differ.
+- [x] **GEMM (alpha*A*B + beta*C).**
+  - Same FP16 matmul core plus bias broadcast; `ParamsGemm` scalar constants (`alpha`, `beta`)
+    must be encoded in the node's data type, not hardcoded FP32.
+- [x] **LayerNorm / RmsNorm.**
+  - `layernorm`/`rmsnorm` shaders need FP16 inputs, but mean/variance/sum-of-squares should
+    probably accumulate in FP32 for numerical stability, then convert back to FP16 for the
+    final normalized result and scale/bias application.
+  - Scale/bias constants may be FP16 or FP32; decide on the supported mixed-precision policy.
+- [x] **Conv2d / im2col / conv_gemm / fused conv paths.**
+  - Provide FP16 variants of `conv2d`, `im2col`, `conv_gemm`, `conv_fused`, `conv_fused_bn`.
+  - Accumulate in FP32 inside the convolution loop if possible, write FP16 outputs.
+  - Re-evaluate shared-memory tiling for FP16: shared `half` arrays halve smem pressure,
+    potentially enabling larger tiles than the FP32 version.
+- [x] **Pooling / Resize / Transpose / Slice / Concat / Gather.**
+  - These are mostly memory-copy/addressing kernels; port to FP16 using vectorized loads
+    (`half2`/`half4`) where the element count is a multiple of the vector width.
+- [x] **BatchNorm / InstanceNorm.**
+  - FP16 inputs with per-channel FP32 or FP16 mean/variance/scale/bias; follow the same
+    accumulation-precision rule as LayerNorm.
+- [x] **QuantizeLinear / DequantizeLinear.**
+  - `QuantizeLinear`: input may be FP16 (currently assumed FP32); output stays Int8.
+  - `DequantizeLinear`: output may be FP16 (currently hardcoded to FP32 in the generic backend),
+    matching the MPSGraph path. This is important for imported TFLite models whose weights are
+    FP16 wrapped in `DEQUANTIZE`.
+
+#### 3f.3 — `GpuBackend` graph compilation changes
+- [x] **Remove FP32-only gating.** In `GpuBackend::compileGraph()`, change every
+      `node.dataType != DataType::Float32` check to accept `Float32` or `Float16`, with a
+      clear error for unsupported dtypes (Int8/Uint32/Int64 still go through the
+      quantization/indices special cases as today).
+- [x] **Per-node dtype → shader-variant selection.** Maintain separate `OpResources` caches for
+      FP32 and FP16 pipelines (e.g. keyed by `(OpKind, dataType)` or by adding a second
+      `OpResources` member per kind). `compileGraph()` picks the variant that matches the
+      node's declared `dataType`.
+- [x] **Mixed-precision policy.** Decide and document whether a single graph may contain both
+      FP32 and FP16 nodes. If yes, implement explicit type-cast dispatches (or buffer-format
+      reinterpretation) at the edges where a consumer expects a different dtype than its
+      producer. If no, enforce uniform dtype per graph at `compileGraph()` time with a clear
+      error.
+- [x] **Constant tensor handling.** `Constant` nodes already store raw bytes; for FP16 constants
+      the backend must upload the 2-byte encoding directly without decoding/re-encoding. Verify
+      that the importer (ONNX/TFLite) supplies FP16 constants in the correct byte order.
+- [x] **Params struct dtype consistency.** Scalar constants sent to shaders (`epsilon`, `alpha`,
+      `beta`, etc.) must match the shader's expected type. For FP16 variants encode them as
+      `uint16_t` IEEE-754 half bits (using `encodeFloat16`) rather than `float`.
+
+#### 3f.4 — Performance optimizations (FP16-specific)
+- [x] **Vectorized memory access.** Use `half2`/`half4` (Metal), `f16vec2`/`f16vec4` (SPIR-V),
+      and equivalent HLSL vector types in every bandwidth-bound kernel to saturate memory
+      bandwidth. Implemented for `relu`/`sigmoid`/`gelu`/`add`/`mul`, `layernorm`/`rmsnorm`/
+      `softmax`, and the inner K-loop of `matmul`/`gemm`.
+- [x] **Accumulation precision.** For matmul/conv/gemm, accumulate in FP32 inside the inner loop
+      and only cast the final result to FP16. This recovers most of the FP16 speed benefit
+      while avoiding catastrophic overflow on large reductions. `matmul`/`gemm` and the norm/
+      softmax reductions already accumulate in FP32.
+- [x] **Tile-size tuning for FP16 (first pass).** Re-ran the `matmul`/`gemm` workgroup shape
+      tuning for FP16. A 2-column-per-thread layout (`colsPerThread = 2`) was implemented and
+      benchmarked on Intel UHD 630 Metal, but it regressed FP16 versus FP32 (e.g. `[1,512]` median
+      went from ~1.25 ms to ~1.81 ms). The change was reverted; `matmul`/`gemm` keep the
+      vectorized K-loop with scalar per-thread output and pipeline-driven `tileWidth`.
+- [ ] **Further FP16 workgroup / tile-width sweep.** Try fixed `tileWidth` values (16, 32, 64) and
+      a native half-arithmetic path to see if FP16 can beat FP32 on this or other GPUs.
+- [ ] **Subgroup / warp-level operations (Vulkan).** Where supported, use subgroup shuffle/
+      reduction primitives for LayerNorm/RmsNorm/Softmax to reduce shared-memory pressure in
+      FP16 graphs.
+- [x] **Benchmark-driven validation.** Extended `benchmarks/benchmark_backends.cpp` to report
+      `GpuGeneric` FP32-vs-FP16 median speedup and maxAbsDiff for the transformer block. YuNet/
+      ResNet-50 FP16-vs-FP32 reporting can be added once the vision timing budget justifies it.
+
+#### 3f.5 — Testing & parity
+- [x] **Unit parity tests.** Add `tests/platform/test_gpu_generic_float16_ops.cpp` mirroring
+      `tests/platform/test_mps_float16_ops.cpp` / `tests/universal/test_cpu_float16_ops.cpp`:
+  - One representative op per category: `Add`, `Mul`, `Gelu`, `MatMul`, `LayerNorm`.
+  - Wider coverage for the high-risk kernels: `Conv2d`, `Gemm`, `RmsNorm`, `Softmax`.
+- [x] **Numerical tolerance definitions.** Define per-op FP16 tolerances relative to CPU FP32
+      reference (or CPU FP16 reference where CPU supports it). Document why some ops need
+      looser tolerance due to FP32-vs-FP16 accumulation differences.
+- [x] **End-to-end model tests (YuNet).** Import the existing `yunet_n_320_320.onnx` fixture as
+      an all-`Float16` graph via `OnnxImportOptions::targetDataType` and run it end-to-end on
+      `GpuGeneric`; verify the face-vs-no-face margin matches the FP32 model test.
+- [ ] **End-to-end model tests (ResNet50).** Repeat the exercise for `resnet50-v1-7.onnx` once a
+      fixture-specific validation (e.g. top-1 class on a sample image) is defined.
+- [ ] **Mixed-dtype edge cases.** If mixed precision is supported, add tests for:
+  - FP16 input → FP32 output
+  - FP32 input → FP16 output
+  - FP16 weights with FP32 activations (common in quantization-aware models)
+
+#### 3f.6 — DirectX12 / HLSL follow-through
+- [ ] **Verify HLSL FP16 compilation path.** The existing HLSL sources are currently unverified
+      on Windows (`TODO.md` already notes `_WIN32` throws because no precompiled DXIL is
+      shipped). Once DXIL generation is enabled, compile and test the FP16 HLSL variants on a
+      real DirectX12 device.
+- [ ] **16-bit shader model feature check.** Query D3D12 feature support for native FP16
+      (`D3D12_FEATURE_D3D12_OPTIONS4::Native16BitShaderOpsSupported`) and fall back to FP32
+      shader variants with a clear warning if the hardware does not support FP16.
+
+---
+
 ## Phase 4 — `campello_nn` Model Import and Graph Caching
 
 **Decision (see conversation, supersedes an earlier draft of this phase):** no separate
@@ -1111,7 +1276,7 @@ far enough along that the op set and `Graph` representation are stable.
 
 ---
 
-## Phase 5 — `campello_llm` (and future `campello_vision`)
+## Phase 5 — `campello_llm` (and future `campello_vision`) ✅
 
 Goal: implement the layer described in §4 of the architecture doc — everything no graph format
 (ONNX/TFLite) and no WebNN-shaped API models. **Scoped specifically to weight-only formats**
@@ -1136,31 +1301,31 @@ LLaMA/GPT-style decoder blocks need two pieces the original transformer-block op
       Restricted to Float32/Float16; throws if `x`'s last dimension is odd.
 - [x] Validation tests: `RmsNormScaleSizeMismatchThrows`, `RotaryEmbeddingOddLastDimThrows`.
 
-- [ ] `GenerationConfig` struct (maxTokens, temperature, topP, topK)
-- [ ] Tokenizer support (start with one format, e.g. BPE/SentencePiece compatible with common
-      LLaMA/GPT tokenizer files; chat template handling)
-- [ ] Weights-file parsing for safetensors/gguf (architecture-agnostic byte/header format —
+- [x] `GenerationConfig` struct (maxTokens, temperature, topP, topK) — moved to `campello_llm`
+- [x] Tokenizer support (start with one format, e.g. BPE/SentencePiece compatible with common
+      LLaMA/GPT tokenizer files; chat template handling) — moved to `campello_llm`
+- [x] Weights-file parsing for safetensors/gguf (architecture-agnostic byte/header format —
       could in principle be a tiny shared leaf dependency with a future `campello_vision` if it
       ever needs to read the same container format for raw vision weights; not urgent, nothing
-      on the vision side needs it yet)
-- [ ] Architecture registry: per-architecture (LLaMA-style, GPT-style) graph wiring that calls
+      on the vision side needs it yet) — moved to `campello_llm`
+- [x] Architecture registry: per-architecture (LLaMA-style, GPT-style) graph wiring that calls
       `GraphBuilder` ops per layer with weights bound as `constant()`s — this is the
       architecture-specific knowledge that justifies this layer existing separately from
-      `campello_nn`
-- [ ] `Model::load()`: ties tokenizer + weights + architecture wiring + `campello_nn::Context`
+      `campello_nn` — moved to `campello_llm`
+- [x] `Model::load()`: ties tokenizer + weights + architecture wiring + `campello_nn::Context`
       together; should also support loading a pre-cached graph via `campello_nn`'s own graph
-      caching (Phase 4c) instead of rebuilding one live
-- [ ] Prefill: single graph dispatch over the full prompt
-- [ ] KV-cache: explicit `Tensor`s fed back as inputs each decode step, read back out, growing
-      cache management (pre-allocate vs. dynamic growth)
-- [ ] Decode loop: one graph dispatch per token, feeding KV-cache deltas
-- [ ] Sampling on CPU after reading back logits: temperature scaling, top-k, top-p, (consider
-      greedy/argmax as a baseline mode too)
-- [ ] Streaming: `generate()`'s `onToken` callback invoked per generated token
-- [ ] Stop conditions: max tokens, EOS token, stop sequences
-- [ ] Tests: deterministic generation test (temperature=0/greedy) against a known-good reference
-      output for a small test model
-- [ ] Public headers finalized under `campello_llm/include/`
+      caching (Phase 4c) instead of rebuilding one live — moved to `campello_llm`
+- [x] Prefill: single graph dispatch over the full prompt — moved to `campello_llm`
+- [x] KV-cache: explicit `Tensor`s fed back as inputs each decode step, read back out, growing
+      cache management (pre-allocate vs. dynamic growth) — moved to `campello_llm`
+- [x] Decode loop: one graph dispatch per token, feeding KV-cache deltas — moved to `campello_llm`
+- [x] Sampling on CPU after reading back logits: temperature scaling, top-k, top-p, (consider
+      greedy/argmax as a baseline mode too) — moved to `campello_llm`
+- [x] Streaming: `generate()`'s `onToken` callback invoked per generated token — moved to `campello_llm`
+- [x] Stop conditions: max tokens, EOS token, stop sequences — moved to `campello_llm`
+- [x] Tests: deterministic generation test (temperature=0/greedy) against a known-good reference
+      output for a small test model — moved to `campello_llm`
+- [x] Public headers finalized under `campello_llm/include/` — moved to `campello_llm`
 
 ### Future: `campello_vision`
 Not started, not urgent given Phase 4's ONNX/TFLite import covers most "standard" vision models

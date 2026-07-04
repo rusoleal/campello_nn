@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-04
+
+### Added
+- Native `GpuGeneric` Float16 compute support. `src/gpu/shaders/*.{comp,metal,hlsl}` were ported
+  to a `T`/`T2`/`T4` macro system, `scripts/compile_gpu_shaders.py` now emits both FP32 and FP16
+  precompiled binaries (`*_spv.hpp` / `*_metallib.hpp`), and `GpuBackend` selects the variant by
+  `(OpKind, dataType)` with a uniform-dtype-per-graph policy for compute nodes.
+- `tests/platform/test_gpu_generic_float16_ops.cpp`: parity tests for `Add`, `Mul`, `Gelu`,
+  `MatMul`, `LayerNorm`, `RmsNorm`, and `Conv2d` on `DeviceType::GpuGeneric`.
+- `benchmarks/benchmark_backends.cpp` now reports the `GpuGeneric` FP32-vs-FP16 median speedup
+  and `maxAbsDiff` for the transformer-block workload.
+
+### Changed
+- Bumped `campello_gpu` dependency from `v0.14.0` to `v0.18.0`.
+- `GpuGeneric` `matmul`/`gemm` FP16 tile-size tuning was attempted (2-column-per-thread layout);
+  it regressed latency on the test Intel UHD 630 GPU and was reverted. The default vectorized
+  K-loop with scalar per-thread output remains.
+
+### Notes
+- `campello_llm` (Phase 5) is now tracked as a separate project; the `campello_nn` op-set prep
+  (`RmsNorm`, `RotaryEmbedding`) remains in place.
+
 ## [0.3.0] - 2026-06-26
 
 ### Fixed
@@ -109,7 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graph caching: `GraphBuilder::serialize()`/`deserialize()` and `graph_cache.hpp`'s
   `saveGraphToFile`/`loadGraphFromFile`/`loadGraphFromMemory`.
 
-[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rusoleal/campello_nn/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rusoleal/campello_nn/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rusoleal/campello_nn/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rusoleal/campello_nn/releases/tag/v0.1.0

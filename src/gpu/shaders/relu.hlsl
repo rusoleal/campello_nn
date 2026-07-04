@@ -1,9 +1,6 @@
-// DirectX (HLSL). Written against real D3D12/HLSL semantics but unverified —
-// no Windows toolchain available to compile or run this from the machine
-// that wrote it. Same documented-but-unverified treatment already accepted
-// for the DirectML backend (see TODO.md). One workgroup per output element,
-// same model as relu.comp/relu.metal — numthreads(1,1,1) means genuinely one
-// thread per group here, so no thread-0 gate needed (unlike relu.metal).
+// DirectX (HLSL) body — compiled with a dtype preamble by compile_gpu_shaders.py.
+// Preamble supplies:
+//   T, T2, T4 aliases and dtype_common.hlsl.inc
 
 struct Params
 {
@@ -13,15 +10,31 @@ struct Params
     uint pad2;
 };
 
-StructuredBuffer<float> inputBuf : register(t0);
-RWStructuredBuffer<float> outputBuf : register(u0);
+StructuredBuffer<T> inputBuf : register(t0);
+RWStructuredBuffer<T> outputBuf : register(u0);
 cbuffer ParamsCB : register(b0) { Params params; };
 
 [numthreads(1, 1, 1)]
 void computeMain(uint3 groupId : SV_GroupID)
 {
-    uint idx = groupId.x;
-    if (idx >= params.count)
+    uint base = groupId.x * 4u;
+    if (base >= params.count)
         return;
-    outputBuf[idx] = max(inputBuf[idx], 0.0f);
+
+    uint end = min(base + 4u, params.count);
+    if (end - base == 4u)
+    {
+        T4 v = T4(inputBuf[base], inputBuf[base + 1u],
+                  inputBuf[base + 2u], inputBuf[base + 3u]);
+        v = max(v, T4(T(0.0)));
+        outputBuf[base]      = v.x;
+        outputBuf[base + 1u] = v.y;
+        outputBuf[base + 2u] = v.z;
+        outputBuf[base + 3u] = v.w;
+    }
+    else
+    {
+        for (uint i = base; i < end; ++i)
+            outputBuf[i] = max(inputBuf[i], T(0.0));
+    }
 }

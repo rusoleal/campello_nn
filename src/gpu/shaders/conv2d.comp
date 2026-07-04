@@ -1,5 +1,3 @@
-#version 450
-
 // Vulkan (GLSL). NCHW/grouped/dilated conv2d with shared-memory spatial tiling.
 // See conv2d.metal for the full description.
 #define MAX_TILE_OW 32
@@ -13,9 +11,9 @@
 
 layout(local_size_x = 1, local_size_y = 1) in;
 
-layout(std430, binding = 0) readonly buffer XBuf { float data[]; } xBuf;
-layout(std430, binding = 1) readonly buffer WBuf { float data[]; } wBuf;
-layout(std430, binding = 2) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer XBuf { T data[]; } xBuf;
+layout(std430, binding = 1) readonly buffer WBuf { T data[]; } wBuf;
+layout(std430, binding = 2) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 3) uniform Params
 {
     uint N, O, C, H, W, Cg, KH, KW, outH, outW;
@@ -70,7 +68,7 @@ void main()
                 float val = 0.0;
                 if (ih >= 0 && ih < int(params.H) && iwReal >= 0 && iwReal < int(params.W))
                 {
-                    val = xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iwReal)];
+                    val = TO_FLOAT(xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iwReal)]);
                 }
                 sharedX[ci][kh][iw] = val;
             }
@@ -86,7 +84,7 @@ void main()
                 float val = 0.0;
                 if (c < params.Cg)
                 {
-                    val = wBuf.data[((o * params.Cg + c) * params.KH + kh) * params.KW + kw];
+                    val = TO_FLOAT(wBuf.data[((o * params.Cg + c) * params.KH + kh) * params.KW + kw]);
                 }
                 sharedW[ci][kh][kw] = val;
             }
@@ -132,8 +130,8 @@ void main()
                     int iw = int(ow * params.strideX) - int(params.paddingLeft) + int(kw * params.dilationX);
                     if (iw < 0 || iw >= int(params.W))
                         continue;
-                    float xv = xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)];
-                    float wv = wBuf.data[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw];
+                    float xv = TO_FLOAT(xBuf.data[((n * params.C + c) * params.H + uint(ih)) * params.W + uint(iw)]);
+                    float wv = TO_FLOAT(wBuf.data[((o * params.Cg + ci) * params.KH + kh) * params.KW + kw]);
                     sum += xv * wv;
                 }
             }
@@ -142,6 +140,6 @@ void main()
 
     if (isActive)
     {
-        outputBuf.data[(no * params.outH + oh) * params.outW + ow] = sum;
+        outputBuf.data[(no * params.outH + oh) * params.outW + ow] = TO_T(sum);
     }
 }

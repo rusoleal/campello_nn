@@ -1,23 +1,35 @@
-#version 450
+// Vulkan (GLSL) body — compiled with a dtype preamble by compile_gpu_shaders.py.
+// See relu.comp (historical) for the full comment. Preamble supplies:
+//   #version 450
+//   #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require  (f16 only)
+//   T, T2, T4 aliases and dtype_common.glsl.inc
 
-// Vulkan (GLSL). One workgroup per output element (local_size_x=1, so there's
-// genuinely exactly one thread per group on this backend) — same model as
-// relu.metal, kept consistent across all three shading languages even though
-// only Metal's campello_gpu wrapper actually forces this (it derives the
-// per-group thread count from the pipeline's threadExecutionWidth(), not from
-// this shader, with no public accessor to query that value — see
-// gpu_backend.cpp). Trades GPU utilization for being correct regardless of
-// that unqueryable value; revisit once doing real perf tuning.
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer InBuf { float data[]; } inputBuf;
-layout(std430, binding = 1) buffer OutBuf { float data[]; } outputBuf;
+layout(std430, binding = 0) readonly buffer InBuf { T data[]; } inputBuf;
+layout(std430, binding = 1) buffer OutBuf { T data[]; } outputBuf;
 layout(binding = 2) uniform Params { uint count; uint pad0; uint pad1; uint pad2; } params;
 
 void main()
 {
-    uint idx = gl_WorkGroupID.x;
-    if (idx >= params.count)
+    uint base = gl_WorkGroupID.x * 4u;
+    if (base >= params.count)
         return;
-    outputBuf.data[idx] = max(inputBuf.data[idx], 0.0);
+
+    uint end = min(base + 4u, params.count);
+    if (end - base == 4u)
+    {
+        T4 v = T4(inputBuf.data[base], inputBuf.data[base + 1u],
+                  inputBuf.data[base + 2u], inputBuf.data[base + 3u]);
+        v = max(v, T4(T(0.0)));
+        outputBuf.data[base]     = v.x;
+        outputBuf.data[base + 1u] = v.y;
+        outputBuf.data[base + 2u] = v.z;
+        outputBuf.data[base + 3u] = v.w;
+    }
+    else
+    {
+        for (uint i = base; i < end; ++i)
+            outputBuf.data[i] = max(inputBuf.data[i], T(0.0));
+    }
 }

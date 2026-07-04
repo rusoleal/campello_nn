@@ -1,6 +1,3 @@
-#include <metal_stdlib>
-using namespace metal;
-
 // Metal. Float32 → Int8 per-tensor quantization. `device char*` gives
 // byte-addressed output storage. Thread-0 gate for the same reason as
 // relu.metal (campello_gpu's dispatchWorkgroups() uses the pipeline's
@@ -14,7 +11,7 @@ struct Params
     uint pad0;
 };
 
-kernel void computeMain(const device float *inBuf [[buffer(0)]],
+kernel void computeMain(const device T *inBuf [[buffer(0)]],
                          device char *outBuf [[buffer(1)]],
                          constant Params &params [[buffer(2)]],
                          uint groupId [[threadgroup_position_in_grid]],
