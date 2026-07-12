@@ -1,5 +1,6 @@
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 #include <campello_nn/float16.hpp>
 #include "cpu_backend.hpp"
 #include "cpu_tensor.hpp"
@@ -100,10 +101,16 @@ void CpuBackend::readTensor(void *native, void *data, size_t size)
     std::memcpy(data, t->bytes.data(), size);
 }
 
-void *CpuBackend::compileGraph(const GraphIR &ir)
+void *CpuBackend::compileGraph(GraphIR ir)
 {
     auto g = new CpuGraph();
-    g->ir = ir;
+    // Moved, not copied -- dispatch() re-decodes node.constantBytes fresh every
+    // call (Float16/quantized -> Float32), so unlike the GPU backends the CPU
+    // backend can't drop these bytes after compile; the win here is just
+    // avoiding yet another full deep copy on top of the ones already made
+    // building `ir` (GraphBuilderData::ir -> GraphBuilder::build()'s local
+    // copy -> this parameter, now passed by value/moved end to end).
+    g->ir = std::move(ir);
     return g;
 }
 

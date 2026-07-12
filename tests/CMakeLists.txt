@@ -108,6 +108,7 @@ if(BUILD_GPU_GENERIC_TESTS)
     set(GPU_GENERIC_TEST_SOURCES
         platform/test_gpu_generic_ops.cpp
         platform/test_gpu_generic_float16_ops.cpp
+        platform/test_gpu_generic_quantization_ops.cpp
     )
     set(GPU_GENERIC_TEST_LIBS campello_nn GTest::gtest_main)
 

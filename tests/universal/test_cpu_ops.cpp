@@ -422,6 +422,116 @@ TEST(CpuOps, MatMul)
     EXPECT_FLOAT_EQ(result[3], 154);
 }
 
+TEST(CpuOps, GqaMatMulNonTransposed)
+{
+    // batchA=4, batchB=2, groupSize=2, M=1, K=2, N=2. Heads 0,1 share kv head 0
+    // (identity matrix); heads 2,3 share kv head 1 (2x scale matrix).
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto a = builder.input("a", {cnn::DataType::Float32, {4, 1, 2}});
+    auto b = builder.input("b", {cnn::DataType::Float32, {2, 2, 2}});
+    auto graph = builder.build({{"out", builder.gqaMatMul(a, b, false)}});
+
+    auto ta = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, false, true});
+    auto tb = context->createTensor({cnn::DataType::Float32, {2, 2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, true, false});
+
+    float av[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float bv[8] = {1, 0, 0, 1, 2, 0, 0, 2}; // kv0 = identity, kv1 = 2x scale
+    ta->write(av, sizeof(av));
+    tb->write(bv, sizeof(bv));
+
+    auto fence = context->dispatch(*graph, {{"a", ta}, {"b", tb}}, {{"out", tout}});
+    fence->wait();
+
+    float result[8];
+    tout->read(result, sizeof(result));
+    float expected[8] = {1, 2, 3, 4, 10, 12, 14, 16};
+    for (int i = 0; i < 8; i++)
+        EXPECT_FLOAT_EQ(result[i], expected[i]);
+}
+
+TEST(CpuOps, GqaMatMulTransposed)
+{
+    // Same batching as above but b is [batchB, N, K] and out = a @ b^T -- the
+    // shape GQA attention scores (q @ kCompact^T) actually needs.
+    auto context = makeCpuContext();
+    cnn::GraphBuilder builder(context);
+    auto a = builder.input("a", {cnn::DataType::Float32, {4, 1, 2}});
+    auto b = builder.input("b", {cnn::DataType::Float32, {2, 2, 2}});
+    auto graph = builder.build({{"out", builder.gqaMatMul(a, b, true)}});
+
+    auto ta = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, false, true});
+    auto tb = context->createTensor({cnn::DataType::Float32, {2, 2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, true, false});
+
+    float av[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float bv[8] = {1, 2, 3, 4, 5, 6, 7, 8}; // kv0 rows=[1,2],[3,4]; kv1 rows=[5,6],[7,8]
+    ta->write(av, sizeof(av));
+    tb->write(bv, sizeof(bv));
+
+    auto fence = context->dispatch(*graph, {{"a", ta}, {"b", tb}}, {{"out", tout}});
+    fence->wait();
+
+    float result[8];
+    tout->read(result, sizeof(result));
+    float expected[8] = {5, 11, 11, 25, 61, 83, 83, 113};
+    for (int i = 0; i < 8; i++)
+        EXPECT_FLOAT_EQ(result[i], expected[i]);
+}
+
+TEST(CpuOps, GqaMatMulMatchesRepeatKvHeadsThenMatMul)
+{
+    // Equivalence check against the pattern gqaMatMul() replaces: physically
+    // repeating each kv head groupSize times via slice()+concat(), transposing,
+    // then a regular matmul() -- must produce identical results to gqaMatMul()
+    // reading the compact (unrepeated) tensor directly.
+    auto context = makeCpuContext();
+    constexpr int64_t batchA = 6, batchB = 2, groupSize = batchA / batchB, M = 1, K = 3, N = 4;
+
+    cnn::GraphBuilder builder(context);
+    auto q = builder.input("q", {cnn::DataType::Float32, {batchA, M, K}});
+    auto kCompact = builder.input("kCompact", {cnn::DataType::Float32, {batchB, N, K}});
+
+    // Reference path: slice+concat each kv head groupSize times, then transpose+matmul.
+    std::vector<cnn::Operand> repeated;
+    for (int64_t kv = 0; kv < batchB; kv++)
+    {
+        cnn::Operand head = builder.slice(kCompact, {kv, 0, 0}, {1, N, K});
+        for (int64_t g = 0; g < groupSize; g++)
+            repeated.push_back(head);
+    }
+    cnn::Operand kFull = builder.concat(repeated, 0); // [batchA, N, K]
+    cnn::Operand kFullT = builder.transpose(kFull, {0, 2, 1}); // [batchA, K, N]
+    cnn::Operand referenceOut = builder.matmul(q, kFullT);
+
+    cnn::Operand fusedOut = builder.gqaMatMul(q, kCompact, true);
+
+    auto graph = builder.build({{"reference", referenceOut}, {"fused", fusedOut}});
+
+    auto tq = context->createTensor({cnn::DataType::Float32, {batchA, M, K}, false, true});
+    auto tk = context->createTensor({cnn::DataType::Float32, {batchB, N, K}, false, true});
+    auto tref = context->createTensor({cnn::DataType::Float32, {batchA, M, N}, true, false});
+    auto tfused = context->createTensor({cnn::DataType::Float32, {batchA, M, N}, true, false});
+
+    std::vector<float> qv(batchA * M * K), kv(batchB * N * K);
+    for (size_t i = 0; i < qv.size(); i++)
+        qv[i] = static_cast<float>(i + 1);
+    for (size_t i = 0; i < kv.size(); i++)
+        kv[i] = static_cast<float>(2 * i - 5);
+    tq->write(qv.data(), qv.size() * sizeof(float));
+    tk->write(kv.data(), kv.size() * sizeof(float));
+
+    auto fence = context->dispatch(*graph, {{"q", tq}, {"kCompact", tk}}, {{"reference", tref}, {"fused", tfused}});
+    fence->wait();
+
+    std::vector<float> refResult(batchA * M * N), fusedResult(batchA * M * N);
+    tref->read(refResult.data(), refResult.size() * sizeof(float));
+    tfused->read(fusedResult.data(), fusedResult.size() * sizeof(float));
+    for (size_t i = 0; i < refResult.size(); i++)
+        EXPECT_FLOAT_EQ(refResult[i], fusedResult[i]) << "mismatch at index " << i;
+}
+
 TEST(CpuOps, Gemm)
 {
     auto context = makeCpuContext();

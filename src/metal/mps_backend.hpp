@@ -24,7 +24,7 @@ namespace systems::leal::campello_nn
         void writeTensor(void *native, const void *data, size_t size) override;
         void readTensor(void *native, void *data, size_t size) override;
 
-        void *compileGraph(const GraphIR &ir) override;
+        void *compileGraph(GraphIR ir) override;
         void destroyGraph(void *native) override;
 
         void *dispatch(

@@ -89,6 +89,31 @@ namespace systems::leal::campello_nn
         // this is the realistic deployment pattern (int8 storage, float32 compute).
         Operand quantizedMatmul(Operand activation, Operand weightInt8, float weightScale, int32_t weightZeroPoint);
 
+        // GGML block-quantized matmul. `weightRaw` must be a constant Operand created
+        // from the raw GGUF tensor bytes with DataType::Int8 and shape {byteLength}.
+        // `ggmlType` is the GGML quantization type enum value (e.g. 2 for Q4_0, 8 for
+        // Q8_0, 12 for Q4_K). `weightShape` is the logical unquantized weight shape
+        // [inFeatures, outFeatures]. The activation's last two dimensions must be
+        // [..., M, inFeatures]; output is [..., M, outFeatures] in Float32.
+        Operand ggmlQuantizedMatmul(Operand activation, Operand weightRaw, int32_t ggmlType,
+                                    const std::vector<int64_t> &weightShape);
+
+        // Grouped-query batched matmul: `a` is [batchA, M, K]; `bCompact` is
+        // [batchB, N, K] if transposeB (computes a[h] @ bCompact[h/groupSize]^T) or
+        // [batchB, K, N] otherwise (computes a[h] @ bCompact[h/groupSize]), where
+        // groupSize = batchA / batchB (batchA must be an exact multiple of batchB).
+        // Output is [batchA, M, N].
+        //
+        // This exists specifically so GQA attention (Llama-family models: fewer KV
+        // heads than query heads) never has to physically replicate K/V up to the
+        // full query head count via slice()+concat() before the batched attention
+        // matmul — every attention head reads directly from its shared KV head's
+        // buffer instead of a per-head copy, matching how llama.cpp's attention
+        // kernels handle GQA. Only implemented on the Cpu and GpuGeneric backends —
+        // MPSGraph/DirectML graphs must keep using slice()+concat()+matmul(); check
+        // `Context::deviceType()` before choosing which shape to build.
+        Operand gqaMatMul(Operand a, Operand bCompact, bool transposeB);
+
         std::shared_ptr<Graph> build(const std::unordered_map<std::string, Operand> &outputs);
 
         // Serializes the same backend-agnostic IR `build()` would otherwise compile,

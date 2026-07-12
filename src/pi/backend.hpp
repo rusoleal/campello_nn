@@ -25,7 +25,13 @@ namespace systems::leal::campello_nn
         virtual void writeTensor(void *native, const void *data, size_t size) = 0;
         virtual void readTensor(void *native, void *data, size_t size) = 0;
 
-        virtual void *compileGraph(const GraphIR &ir) = 0;
+        // By value, not const&: implementations move `ir` into their compiled
+        // graph's stored copy instead of deep-copying it (a real cost for
+        // weight-heavy models — every Constant node's raw bytes would otherwise
+        // be copied again on top of the copies already made building `ir` in the
+        // first place). Callers (GraphBuilder::build()/deserialize()) pass via
+        // std::move() for the same reason.
+        virtual void *compileGraph(GraphIR ir) = 0;
         virtual void destroyGraph(void *native) = 0;
 
         // Executes a compiled graph, binding tensor natives by name. Returns a

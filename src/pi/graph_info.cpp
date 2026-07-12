@@ -52,10 +52,14 @@ const char *systems::leal::campello_nn::toString(OpKind kind)
         return "QuantizeLinear";
     case OpKind::DequantizeLinear:
         return "DequantizeLinear";
+    case OpKind::GgmlQuantizedMatmul:
+        return "GgmlQuantizedMatmul";
     case OpKind::Relu:
         return "Relu";
     case OpKind::Sigmoid:
         return "Sigmoid";
+    case OpKind::GqaMatMul:
+        return "GqaMatMul";
     }
     return "Unknown";
 }

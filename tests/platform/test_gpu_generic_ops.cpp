@@ -143,6 +143,66 @@ TEST(GpuGenericOps, MatMulBatched)
     EXPECT_FLOAT_EQ(result[15], 14);
 }
 
+TEST(GpuGenericOps, GqaMatMulNonTransposed)
+{
+    // Same case as CpuOps.GqaMatMulNonTransposed: batchA=4, batchB=2,
+    // groupSize=2. Heads 0,1 share kv head 0 (identity); heads 2,3 share kv
+    // head 1 (2x scale) -- verifies `b` is read via groupSize indexing, not
+    // physically replicated.
+    auto context = makeGpuGenericContext();
+    cnn::GraphBuilder builder(context);
+    auto a = builder.input("a", {cnn::DataType::Float32, {4, 1, 2}});
+    auto b = builder.input("b", {cnn::DataType::Float32, {2, 2, 2}});
+    auto graph = builder.build({{"out", builder.gqaMatMul(a, b, false)}});
+
+    auto ta = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, false, true});
+    auto tb = context->createTensor({cnn::DataType::Float32, {2, 2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, true, false});
+
+    float av[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float bv[8] = {1, 0, 0, 1, 2, 0, 0, 2};
+    ta->write(av, sizeof(av));
+    tb->write(bv, sizeof(bv));
+
+    auto fence = context->dispatch(*graph, {{"a", ta}, {"b", tb}}, {{"out", tout}});
+    fence->wait();
+
+    float result[8];
+    tout->read(result, sizeof(result));
+    float expected[8] = {1, 2, 3, 4, 10, 12, 14, 16};
+    for (int i = 0; i < 8; i++)
+        EXPECT_FLOAT_EQ(result[i], expected[i]);
+}
+
+TEST(GpuGenericOps, GqaMatMulTransposed)
+{
+    // Same case as CpuOps.GqaMatMulTransposed -- the shape GQA attention
+    // scores (q @ kCompact^T) actually needs.
+    auto context = makeGpuGenericContext();
+    cnn::GraphBuilder builder(context);
+    auto a = builder.input("a", {cnn::DataType::Float32, {4, 1, 2}});
+    auto b = builder.input("b", {cnn::DataType::Float32, {2, 2, 2}});
+    auto graph = builder.build({{"out", builder.gqaMatMul(a, b, true)}});
+
+    auto ta = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, false, true});
+    auto tb = context->createTensor({cnn::DataType::Float32, {2, 2, 2}, false, true});
+    auto tout = context->createTensor({cnn::DataType::Float32, {4, 1, 2}, true, false});
+
+    float av[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    float bv[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ta->write(av, sizeof(av));
+    tb->write(bv, sizeof(bv));
+
+    auto fence = context->dispatch(*graph, {{"a", ta}, {"b", tb}}, {{"out", tout}});
+    fence->wait();
+
+    float result[8];
+    tout->read(result, sizeof(result));
+    float expected[8] = {5, 11, 11, 25, 61, 83, 83, 113};
+    for (int i = 0; i < 8; i++)
+        EXPECT_FLOAT_EQ(result[i], expected[i]);
+}
+
 TEST(GpuGenericOps, MulExactShape)
 {
     auto context = makeGpuGenericContext();

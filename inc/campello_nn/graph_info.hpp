@@ -41,8 +41,10 @@ namespace systems::leal::campello_nn
         InstanceNorm,
         QuantizeLinear,
         DequantizeLinear,
+        GgmlQuantizedMatmul,
         Relu,
-        Sigmoid
+        Sigmoid,
+        GqaMatMul
     };
 
     /** @brief Human-readable name for `kind`, e.g. `"Conv2d"`. Stable across releases. */

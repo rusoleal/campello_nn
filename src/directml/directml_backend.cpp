@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "directml_backend.hpp"
@@ -639,10 +640,10 @@ namespace
     }
 } // namespace
 
-void *DirectMlBackend::compileGraph(const GraphIR &irIn)
+void *DirectMlBackend::compileGraph(GraphIR irIn)
 {
     auto compiled = new DmlCompiledGraph();
-    compiled->ir = irIn;
+    compiled->ir = std::move(irIn); // moved, not copied -- see Backend::compileGraph()'s doc comment
     const GraphIR &g = compiled->ir;
     size_t n = g.nodes.size();
     compiled->nodeOutput.resize(n);

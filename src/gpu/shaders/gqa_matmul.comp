@@ -1,0 +1,59 @@
+// Vulkan (GLSL). Grouped-query batched matmul: `a` is [batchA, m, k]; `b` is
+// [batchB, n, k] if transposeB (out = a @ b^T) or [batchB, k, n] otherwise
+// (out = a @ b). batchA must be an exact multiple of batchB; groupSize =
+// batchA / batchB, and output batch `h` reads shared input batch `h / groupSize`
+// from `b` — the whole point of this op is that `b` is never physically
+// replicated up to batchA rows/batches (see GraphBuilder::gqaMatMul()'s doc
+// comment: this exists so GQA attention never has to slice()+concat() K/V up
+// to the full query head count before the batched attention matmul).
+//
+// 1D column tiling, same convention as matmul.comp: each workgroup computes
+// tileWidth consecutive output columns of one output row.
+layout(local_size_x = 1, local_size_y = 1) in;
+
+layout(std430, binding = 0) readonly buffer ABuf { T data[]; } aBuf;
+layout(std430, binding = 1) readonly buffer BBuf { T data[]; } bBuf;
+layout(std430, binding = 2) buffer OutBuf { T data[]; } outputBuf;
+layout(binding = 3) uniform Params
+{
+    uint m;
+    uint k;
+    uint n;
+    uint batchA;
+    uint groupSize;
+    uint transposeB;
+    uint tileWidth;
+} params;
+
+void main()
+{
+    if (gl_LocalInvocationID.x >= params.tileWidth)
+        return;
+    uint n = gl_WorkGroupID.x * params.tileWidth + gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    if (m >= params.m || n >= params.n || batch >= params.batchA)
+        return;
+
+    uint kDim = params.k;
+    uint nDim = params.n;
+    uint kv = batch / params.groupSize;
+
+    uint aRow = batch * params.m * kDim + m * kDim;
+    uint bBase = kv * kDim * nDim;
+
+    float sum = 0.0;
+    if (params.transposeB != 0u)
+    {
+        uint bRow = bBase + n * kDim;
+        for (uint i = 0u; i < kDim; ++i)
+            sum += TO_FLOAT(aBuf.data[aRow + i]) * TO_FLOAT(bBuf.data[bRow + i]);
+    }
+    else
+    {
+        for (uint i = 0u; i < kDim; ++i)
+            sum += TO_FLOAT(aBuf.data[aRow + i]) * TO_FLOAT(bBuf.data[bBase + i * nDim + n]);
+    }
+
+    outputBuf.data[batch * params.m * nDim + m * nDim + n] = TO_T(sum);
+}

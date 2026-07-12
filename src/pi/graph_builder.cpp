@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <campello_nn/graph_builder.hpp>
 #include <campello_nn/float16.hpp>
 #include "graph_builder_data.hpp"
@@ -366,6 +367,46 @@ Operand GraphBuilder::quantizedMatmul(Operand activation, Operand weightInt8, fl
     return matmul(activation, dequantizedWeight);
 }
 
+Operand GraphBuilder::ggmlQuantizedMatmul(Operand activation, Operand weightRaw, int32_t ggmlType,
+                                          const std::vector<int64_t> &weightShape)
+{
+    requireSameBuilder(activation.builder, native);
+    requireSameBuilder(weightRaw.builder, native);
+    auto data = (GraphBuilderData *)native;
+    const Node &nActivation = nodeOf(data->ir, activation.nodeId);
+    const Node &nWeight = nodeOf(data->ir, weightRaw.nodeId);
+
+    if (nActivation.dataType != DataType::Float32 && nActivation.dataType != DataType::Float16)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() activation must be Float32/Float16");
+    if (nWeight.kind != OpKind::Constant)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() weightRaw must be a constant");
+    if (nWeight.dataType != DataType::Int8)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() weightRaw constant must have DataType::Int8");
+    if (weightShape.size() != 2)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() weightShape must be [inFeatures, outFeatures]");
+    if (nActivation.shape.size() < 2)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() activation must have rank >= 2");
+
+    int64_t inFeatures = weightShape[0];
+    int64_t outFeatures = weightShape[1];
+    int64_t actK = nActivation.shape[nActivation.shape.size() - 1];
+    if (actK != inFeatures)
+        throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() activation last dim must match weight inFeatures");
+
+    std::vector<int64_t> outShape(nActivation.shape.begin(), nActivation.shape.end() - 1);
+    outShape.push_back(outFeatures);
+
+    Node node;
+    node.kind = OpKind::GgmlQuantizedMatmul;
+    node.inputs = {activation.nodeId, weightRaw.nodeId};
+    node.dataType = DataType::Float32;
+    node.shape = std::move(outShape);
+    node.axis = ggmlType;
+    node.intAttr0 = weightShape;
+    data->ir.nodes.push_back(std::move(node));
+    return Operand(native, data->ir.nodes.size() - 1);
+}
+
 Operand GraphBuilder::matmul(Operand a, Operand b)
 {
     requireSameBuilder(a.builder, native);
@@ -395,6 +436,42 @@ Operand GraphBuilder::matmul(Operand a, Operand b)
     node.inputs = {a.nodeId, b.nodeId};
     node.dataType = na.dataType;
     node.shape = shape;
+    data->ir.nodes.push_back(std::move(node));
+    return Operand(native, data->ir.nodes.size() - 1);
+}
+
+Operand GraphBuilder::gqaMatMul(Operand a, Operand bCompact, bool transposeB)
+{
+    requireSameBuilder(a.builder, native);
+    requireSameBuilder(bCompact.builder, native);
+    auto data = (GraphBuilderData *)native;
+    const Node &na = nodeOf(data->ir, a.nodeId);
+    const Node &nb = nodeOf(data->ir, bCompact.nodeId);
+    if (na.shape.size() != 3 || nb.shape.size() != 3)
+        throw std::runtime_error("campello_nn: gqaMatMul() operands must be rank 3 ([batch, rows, cols])");
+    if (na.dataType != nb.dataType)
+        throw std::runtime_error("campello_nn: gqaMatMul() operands must have the same dtype");
+
+    int64_t batchA = na.shape[0];
+    int64_t batchB = nb.shape[0];
+    if (batchB <= 0 || batchA <= 0 || batchA % batchB != 0)
+        throw std::runtime_error("campello_nn: gqaMatMul() batchA must be a positive multiple of batchB");
+
+    int64_t M = na.shape[1];
+    int64_t K = na.shape[2];
+    int64_t bRows = nb.shape[1];
+    int64_t bCols = nb.shape[2];
+    int64_t N = transposeB ? bRows : bCols;
+    int64_t K2 = transposeB ? bCols : bRows;
+    if (K != K2)
+        throw std::runtime_error("campello_nn: gqaMatMul() inner dimensions must match");
+
+    Node node;
+    node.kind = OpKind::GqaMatMul;
+    node.inputs = {a.nodeId, bCompact.nodeId};
+    node.dataType = na.dataType;
+    node.shape = {batchA, M, N};
+    node.axis = transposeB ? 1 : 0;
     data->ir.nodes.push_back(std::move(node));
     return Operand(native, data->ir.nodes.size() - 1);
 }
@@ -661,7 +738,14 @@ GraphInfo systems::leal::campello_nn::internal::graphInfoForImport(
 std::shared_ptr<Graph> GraphBuilder::build(const std::unordered_map<std::string, Operand> &outputs)
 {
     auto data = (GraphBuilderData *)native;
-    GraphIR ir = data->ir;
+    // Moved, not copied: build() is the terminal, graph-finalizing operation on
+    // this builder (nothing reads data->ir afterward — every caller that also
+    // wants graphInfoForImport()/serialize() calls them *before* build(), since
+    // both need the still-intact IR). For a weight-heavy model this avoids one
+    // more full deep copy of every Constant's raw bytes on top of the ones
+    // already made incrementally while the builder was being populated — see
+    // Backend::compileGraph()'s doc comment for the rest of this copy chain.
+    GraphIR ir = std::move(data->ir);
     for (auto &[name, op] : outputs)
     {
         requireSameBuilder(op.builder, native);
@@ -669,7 +753,7 @@ std::shared_ptr<Graph> GraphBuilder::build(const std::unordered_map<std::string,
     }
 
     auto ctxData = (ContextData *)data->context->native;
-    void *compiled = ctxData->backend->compileGraph(ir);
+    void *compiled = ctxData->backend->compileGraph(std::move(ir));
     auto gd = new GraphData{ctxData->backend.get(), compiled};
     return std::shared_ptr<Graph>(new Graph((void *)gd));
 }
@@ -690,7 +774,7 @@ std::shared_ptr<Graph> GraphBuilder::deserialize(std::shared_ptr<Context> contex
 {
     GraphIR ir = deserializeGraphIR(data, size);
     auto ctxData = (ContextData *)context->native;
-    void *compiled = ctxData->backend->compileGraph(ir);
+    void *compiled = ctxData->backend->compileGraph(std::move(ir));
     auto gd = new GraphData{ctxData->backend.get(), compiled};
     return std::shared_ptr<Graph>(new Graph((void *)gd));
 }

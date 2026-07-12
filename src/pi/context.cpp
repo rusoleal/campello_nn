@@ -71,6 +71,12 @@ std::shared_ptr<Context> Context::create(const ContextDescriptor &desc)
     return std::shared_ptr<Context>(new Context((void *)data));
 }
 
+DeviceType Context::deviceType() const
+{
+    auto data = (ContextData *)native;
+    return data->deviceType;
+}
+
 std::shared_ptr<Tensor> Context::createTensor(const TensorDescriptor &desc)
 {
     auto data = (ContextData *)native;

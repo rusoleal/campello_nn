@@ -1300,6 +1300,28 @@ LLaMA/GPT-style decoder blocks need two pieces the original transformer-block op
       on CPU + real MPSGraph/GPU hardware (`CpuOps.RotaryEmbedding`/`MpsOps.RotaryEmbedding`).
       Restricted to Float32/Float16; throws if `x`'s last dimension is odd.
 - [x] Validation tests: `RmsNormScaleSizeMismatchThrows`, `RotaryEmbeddingOddLastDimThrows`.
+- [x] `GraphBuilder::ggmlQuantizedMatmul(activation, weightRaw, ggmlType, weightShape)` — new
+      `OpKind::GgmlQuantizedMatmul`, matmul directly against a raw GGUF block-quantized weight
+      (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K) instead of requiring a
+      pre-dequantized Float32 constant. Implemented on Cpu, GpuGeneric (Metal + Vulkan/SPV), and
+      MPSGraph (custom kernel segment); not DirectML.
+- [x] `GraphBuilder::gqaMatMul(a, bCompact, transposeB)` — new `OpKind::GqaMatMul`, grouped-query
+      batched matmul so GQA attention (fewer KV heads than query heads) never has to physically
+      replicate K/V up to the full query head count via `slice()`+`concat()` before the attention
+      matmul — found to be the dominant cost behind `GpuGeneric`'s memory usage on real LLM
+      inference. Implemented on Cpu and GpuGeneric only; MPSGraph/DirectML throw. Verified
+      equivalent to the old `slice()`+`concat()`+`matmul()` composition via a dedicated CPU test.
+- [x] `Context::deviceType()` — exposes which `DeviceType` a `Context` was created with, so a
+      caller building a graph ahead of dispatch time (e.g. choosing `gqaMatMul()` vs. the portable
+      composition above) can tell which backend-specific op set is actually safe to use.
+- [x] `Backend::compileGraph()` changed from `const GraphIR&` to by-value `GraphIR`, moved (not
+      copied) through `GraphBuilder::build()`/`deserialize()` and each of the 5 backend
+      implementations — a weight-heavy model's `Constant` bytes were previously copied by value
+      3-4x on the way from `GraphBuilder` to a compiled graph, found while chasing `GpuGeneric`'s
+      memory usage on real `llama3.1_8b` inference. `GpuGeneric`/MPSGraph now also clear each
+      `Constant`'s raw bytes right after its one-time GPU upload. **Caller impact:** `build()` now
+      consumes the builder's IR — anything needing it intact (`serialize()`,
+      `graphInfoForImport()`) must run before `build()`, not after.
 
 - [x] `GenerationConfig` struct (maxTokens, temperature, topP, topK) — moved to `campello_llm`
 - [x] Tokenizer support (start with one format, e.g. BPE/SentencePiece compatible with common

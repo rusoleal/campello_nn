@@ -61,6 +61,10 @@
 #include "shaders/dequantize_linear_f16_metallib.hpp"
 #include "shaders/broadcast_binary_metallib.hpp"
 #include "shaders/broadcast_binary_f16_metallib.hpp"
+#include "shaders/ggml_quantized_matmul_metallib.hpp"
+#include "shaders/ggml_quantized_matmul_f16_metallib.hpp"
+#include "shaders/gqa_matmul_metallib.hpp"
+#include "shaders/gqa_matmul_f16_metallib.hpp"
 #elif !defined(_WIN32)
 #include "shaders/relu_spv.hpp"
 #include "shaders/relu_f16_spv.hpp"
@@ -114,6 +118,8 @@
 #include "shaders/dequantize_linear_f16_spv.hpp"
 #include "shaders/broadcast_binary_spv.hpp"
 #include "shaders/broadcast_binary_f16_spv.hpp"
+#include "shaders/gqa_matmul_spv.hpp"
+#include "shaders/gqa_matmul_f16_spv.hpp"
 #endif
 // _WIN32 (DirectX12): no precompiled bytecode shipped yet — src/gpu/shaders/
 // *.hlsl are written against real D3D12/HLSL semantics but unverified (no
@@ -250,6 +256,26 @@ namespace
         uint32_t m, k, n, batchCount;
         uint32_t tileWidth;
         uint32_t pad0, pad1, pad2;
+    };
+    // GgmlQuantizedMatmul: same column-tiling dispatch as ParamsMatMul, but
+    // `rows` already folds batchCount*M (the weight matrix has no batch
+    // dimension — see ggml_quantized_matmul.metal's comment) and `ggmlType`
+    // selects which GGML block format to dequantize.
+    struct ParamsGgmlQuantizedMatmul
+    {
+        uint32_t rows, k, n, ggmlType;
+        uint32_t tileWidth;
+        uint32_t pad0, pad1, pad2;
+    };
+    // GqaMatMul: same column-tiling dispatch as ParamsMatMul, but `b` has only
+    // `batchA / groupSize` batches (never physically replicated up to batchA —
+    // see GraphBuilder::gqaMatMul()'s doc comment) and `transposeB` selects
+    // which of `b`'s two possible layouts gqa_matmul.metal/.comp read.
+    struct ParamsGqaMatMul
+    {
+        uint32_t m, k, n, batchA;
+        uint32_t groupSize, transposeB, tileWidth;
+        uint32_t pad0;
     };
     // For LayerNorm/RmsNorm's row-per-workgroup dispatch (see those shaders'
     // comments). Mixed uint32/float is fine here — a flat sequence of 4-byte
@@ -503,6 +529,13 @@ namespace
         case OpKind::DequantizeLinear:
             return f16 ? ShaderBytes{dequantize_linear_f16_metallib_bytes, dequantize_linear_f16_metallib_bytes_len, "computeMain"}
                        : ShaderBytes{dequantize_linear_metallib_bytes, dequantize_linear_metallib_bytes_len, "computeMain"};
+        case OpKind::GgmlQuantizedMatmul:
+            // Activation/output are always Float32 (mirrors MpsBackend's equivalent
+            // custom kernel) — ignore `f16` and always return the FP32 variant.
+            return ShaderBytes{ggml_quantized_matmul_metallib_bytes, ggml_quantized_matmul_metallib_bytes_len, "computeMain"};
+        case OpKind::GqaMatMul:
+            return f16 ? ShaderBytes{gqa_matmul_f16_metallib_bytes, gqa_matmul_f16_metallib_bytes_len, "computeMain"}
+                       : ShaderBytes{gqa_matmul_metallib_bytes, gqa_matmul_metallib_bytes_len, "computeMain"};
         default:
             throw std::runtime_error("campello_nn: GpuBackend: unsupported OpKind");
         }
@@ -579,6 +612,9 @@ namespace
         case OpKind::DequantizeLinear:
             return f16 ? ShaderBytes{dequantize_linear_f16_spv_bytes, dequantize_linear_f16_spv_bytes_len, "main"}
                        : ShaderBytes{dequantize_linear_spv_bytes, dequantize_linear_spv_bytes_len, "main"};
+        case OpKind::GqaMatMul:
+            return f16 ? ShaderBytes{gqa_matmul_f16_spv_bytes, gqa_matmul_f16_spv_bytes_len, "main"}
+                       : ShaderBytes{gqa_matmul_spv_bytes, gqa_matmul_spv_bytes_len, "main"};
         default:
             throw std::runtime_error("campello_nn: GpuBackend: unsupported OpKind");
         }
@@ -705,6 +741,8 @@ namespace
         case OpKind::MatMul:
         case OpKind::RmsNorm: // x, scale
         case OpKind::Gather:  // data, indices
+        case OpKind::GgmlQuantizedMatmul: // activation, raw quantized weight
+        case OpKind::GqaMatMul: // a, bCompact
             return 2;
         case OpKind::LayerNorm: // x, scale, bias
         case OpKind::Gemm:      // a, b, c
@@ -990,10 +1028,16 @@ void GpuBackend::readTensor(void *native, void *data, size_t size)
         throw std::runtime_error("campello_nn: GpuBackend: Buffer::download failed");
 }
 
-void *GpuBackend::compileGraph(const GraphIR &ir)
+void *GpuBackend::compileGraph(GraphIR ir)
 {
     auto compiled = new CompiledGraph();
-    compiled->ir = ir;
+    // compiled->ir is populated by moving `ir` at the very end of this function
+    // (see the matching comment there) rather than copying it here up front —
+    // every Constant node's raw bytes get cleared out of `ir` as they're
+    // uploaded to their GPU buffer below, so what actually gets moved in is
+    // already stripped of the (multi-gigabyte, for a real LLM's weights) dead
+    // weight a naive copy-at-the-top would have carried for this whole
+    // function's duration.
     size_t n = ir.nodes.size();
     compiled->nodes.resize(n);
 
@@ -1144,7 +1188,10 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
 
     for (size_t i = 0; i < n; i++)
     {
-        const Node &node = ir.nodes[i];
+        // Mutable: the Constant case below clears node.constantBytes right
+        // after uploading it, once it's no longer needed (see that case's
+        // comment). Every other case only reads `node`, same as before.
+        Node &node = ir.nodes[i];
         CompiledNode &cn = compiled->nodes[i];
         cn.kind = node.kind;
         // The dtype used to select a shader variant. For QuantizeLinear the shader
@@ -1174,6 +1221,22 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
                 : impl->device->createBuffer(allocSize, tensorBufferUsage(), (void *)node.constantBytes.data());
             if (!cn.output)
                 throw std::runtime_error("campello_nn: GpuBackend: createBuffer (constant) failed");
+            // The bytes are now uploaded into cn.output and never read again --
+            // dispatch()'s Constant case resolves straight to cn.output, not
+            // back through node.constantBytes (the one exception, the Conv2d+
+            // BatchNorm fusion folding below, only ever reads a *later*-index
+            // constant's bytes from an *earlier*-index node's own case, i.e.
+            // before this loop reaches and clears that later node, since a
+            // node's inputs always have smaller indices than any node that
+            // isn't itself an input -- constants a BatchNorm folds are built
+            // right before it, after the Conv2d they fuse into). Clearing here
+            // avoids every weight's raw bytes staying resident twice (once
+            // here, once in the GPU buffer) for the compiled graph's whole
+            // lifetime -- for llama3.1_8b's ~4.6GB of quantized weights that's
+            // ~4.6GB of pure waste, found while chasing GpuGeneric's memory
+            // usage far above what the same weights need.
+            node.constantBytes.clear();
+            node.constantBytes.shrink_to_fit();
             continue;
         }
 
@@ -1355,7 +1418,87 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
             continue;
         }
 
+        case OpKind::GqaMatMul:
+        {
+            requireFloat32Or16(node.dataType, "gqaMatMul()");
+            const std::vector<int64_t> &aShape = ir.nodes[node.inputs[0]].shape;
+            const std::vector<int64_t> &bShape = ir.nodes[node.inputs[1]].shape;
+            if (aShape.size() != 3 || bShape.size() != 3)
+                throw std::runtime_error("campello_nn: GpuBackend: gqaMatMul() operands must be rank 3");
 
+            bool transposeB = node.axis != 0;
+            uint64_t m = (uint64_t)aShape[1];
+            uint64_t k = (uint64_t)aShape[2];
+            uint64_t batchA = (uint64_t)aShape[0];
+            uint64_t batchB = (uint64_t)bShape[0];
+            uint64_t outN = (uint64_t)(transposeB ? bShape[1] : bShape[2]);
+            if (batchB == 0 || batchA % batchB != 0)
+                throw std::runtime_error("campello_nn: GpuBackend: gqaMatMul() batchA must be a multiple of batchB");
+            uint64_t groupSize = batchA / batchB;
+
+            auto &res = impl->resourcesFor(OpKind::GqaMatMul, node.dataType);
+            uint64_t outElems = batchA * m * outN;
+            cn.output = impl->device->createBuffer(outElems * elementByteSize(node.dataType), tensorBufferUsage());
+            if (!cn.output)
+                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (gqaMatMul output) failed");
+            uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
+            if (tileWidth < 1)
+                tileWidth = 1;
+            constexpr uint32_t kMaxTileWidth = 64;
+            if (tileWidth > kMaxTileWidth)
+                tileWidth = kMaxTileWidth;
+            ParamsGqaMatMul p{(uint32_t)m, (uint32_t)k, (uint32_t)outN, (uint32_t)batchA,
+                              (uint32_t)groupSize, transposeB ? 1u : 0u, tileWidth, 0};
+            cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
+            if (!cn.paramsBuffer)
+                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (gqaMatMul params) failed");
+            cn.dispatchX = (outN + tileWidth - 1) / tileWidth;
+            cn.dispatchY = m;
+            cn.dispatchZ = batchA;
+            continue;
+        }
+
+        case OpKind::GgmlQuantizedMatmul:
+        {
+            if (node.dataType != DataType::Float32)
+                throw std::runtime_error(
+                    "campello_nn: GpuBackend: ggmlQuantizedMatmul() requires Float32 activation");
+            if (node.intAttr0.size() != 2)
+                throw std::runtime_error(
+                    "campello_nn: GpuBackend: ggmlQuantizedMatmul() weightShape (intAttr0) missing");
+            if (node.shape.size() < 2)
+                throw std::runtime_error(
+                    "campello_nn: GpuBackend: ggmlQuantizedMatmul() output rank must be >= 2");
+
+            int64_t inFeatures = node.intAttr0[0];
+            int64_t outFeatures = node.intAttr0[1];
+            int64_t M = node.shape[node.shape.size() - 2];
+            int64_t batchCount = 1;
+            for (size_t d = 0; d + 2 < node.shape.size(); ++d)
+                batchCount *= node.shape[d];
+            uint64_t rows = (uint64_t)(batchCount * M);
+
+            auto &res = impl->resourcesFor(OpKind::GgmlQuantizedMatmul, node.dataType);
+            uint64_t outElems = rows * (uint64_t)outFeatures;
+            cn.output = impl->device->createBuffer(outElems * elementByteSize(node.dataType), tensorBufferUsage());
+            if (!cn.output)
+                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (ggmlQuantizedMatmul output) failed");
+            uint32_t tileWidth = res.pipeline->getWorkgroupSize().x;
+            if (tileWidth < 1)
+                tileWidth = 1;
+            constexpr uint32_t kMaxTileWidth = 64;
+            if (tileWidth > kMaxTileWidth)
+                tileWidth = kMaxTileWidth;
+            ParamsGgmlQuantizedMatmul p{(uint32_t)rows, (uint32_t)inFeatures, (uint32_t)outFeatures,
+                                        (uint32_t)node.axis, tileWidth, 0, 0, 0};
+            cn.paramsBuffer = impl->device->createBuffer(sizeof(p), cgpu::BufferUsage::uniform, &p);
+            if (!cn.paramsBuffer)
+                throw std::runtime_error("campello_nn: GpuBackend: createBuffer (ggmlQuantizedMatmul params) failed");
+            cn.dispatchX = (outFeatures + tileWidth - 1) / tileWidth;
+            cn.dispatchY = rows;
+            cn.dispatchZ = 1;
+            continue;
+        }
 
         case OpKind::Gelu:
         {
@@ -1985,6 +2128,10 @@ void *GpuBackend::compileGraph(const GraphIR &ir)
         }
     }
 
+    // Move, not copy: `ir`'s Constant nodes already had their bytes cleared
+    // above right after each one's GPU upload, so this transfers whatever's
+    // left (shapes/kinds/attrs — cheap) without duplicating any weight data.
+    compiled->ir = std::move(ir);
     return compiled;
 }
 

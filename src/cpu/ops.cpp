@@ -6,6 +6,7 @@
 #include "strides.hpp"
 #include "thread_pool.hpp"
 #include "simd_kernels.hpp"
+#include "ggml_dequant.hpp"
 
 namespace
 {
@@ -204,6 +205,58 @@ namespace
             evalMatMulImpl<xsimd::default_arch>(node, values, out);
     }
 
+    // GQA batched matmul: `a` is [batchA, M, K]; `b` is [batchB, N, K] if
+    // transposeB (computes a[h] @ b[h/groupSize]^T) or [batchB, K, N] otherwise
+    // (computes a[h] @ b[h/groupSize]), groupSize = batchA/batchB. See
+    // GraphBuilder::gqaMatMul()'s doc comment for why this exists (avoids
+    // physically replicating K/V up to the full query head count for GQA models).
+    void evalGqaMatMul(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
+    {
+        requireFloat32(node, "gqaMatMul");
+        const CpuValue &a = values[node.inputs[0]];
+        const CpuValue &b = values[node.inputs[1]];
+        bool transposeB = node.axis != 0;
+
+        int64_t batchA = a.shape[0];
+        int64_t M = a.shape[1];
+        int64_t K = a.shape[2];
+        int64_t batchB = b.shape[0];
+        int64_t N = node.shape[2];
+        int64_t groupSize = batchA / batchB;
+
+        out = makeFloatValue(node.shape);
+
+        parallelFor(0, batchA * M, kMatmulRowGrain, [&](int64_t begin, int64_t end)
+                    {
+            for (int64_t job = begin; job < end; ++job)
+            {
+                int64_t h = job / M;
+                int64_t m = job % M;
+                int64_t kv = h / groupSize;
+                const float *aRow = a.f() + h * M * K + m * K;
+                float *outRow = out.f() + h * M * N + m * N;
+                const float *bBase = b.f() + kv * K * N; // [K, N] layout when !transposeB
+                const float *bBaseT = b.f() + kv * N * K; // [N, K] layout when transposeB
+
+                for (int64_t n = 0; n < N; ++n)
+                {
+                    float sum = 0.f;
+                    if (transposeB)
+                    {
+                        const float *bRow = bBaseT + n * K;
+                        for (int64_t k = 0; k < K; ++k)
+                            sum += aRow[k] * bRow[k];
+                    }
+                    else
+                    {
+                        for (int64_t k = 0; k < K; ++k)
+                            sum += aRow[k] * bBase[k * N + n];
+                    }
+                    outRow[n] = sum;
+                }
+            } });
+    }
+
     void evalGemm(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
     {
         requireFloat32(node, "gemm");
@@ -213,6 +266,64 @@ namespace
         else
 #endif
             evalGemmImpl<xsimd::default_arch>(node, values, out);
+    }
+
+    void evalGgmlQuantizedMatmul(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
+    {
+        requireFloat32(node, "ggmlQuantizedMatmul");
+        const CpuValue &activation = values[node.inputs[0]];
+        const CpuValue &weightRaw = values[node.inputs[1]];
+
+        if (weightRaw.dataType != DataType::Int8)
+            throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() weightRaw must be Int8 raw bytes");
+        if (node.intAttr0.size() != 2)
+            throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() weightShape must be [inFeatures, outFeatures]");
+
+        int64_t inFeatures = node.intAttr0[0];
+        int64_t outFeatures = node.intAttr0[1];
+        int32_t ggmlType = node.axis;
+
+        // activation shape: [..., M, inFeatures]
+        if (activation.shape.size() < 2)
+            throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() activation must have rank >= 2");
+        if (activation.shape.back() != inFeatures)
+            throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() activation last dim must match inFeatures");
+
+        int64_t M = activation.shape[activation.shape.size() - 2];
+        int64_t batchCount = 1;
+        for (size_t d = 0; d + 2 < activation.shape.size(); ++d)
+            batchCount *= activation.shape[d];
+
+        // Dequantize the GGUF tensor of original shape [outFeatures, inFeatures]
+        // into a Float32 buffer of shape [inFeatures, outFeatures] (transposed).
+        std::vector<float> weightDequant = dequantizeGgmlWeightTransposed(
+            weightRaw.bytes.data(), weightRaw.bytes.size(), ggmlType, outFeatures, inFeatures);
+        if (static_cast<int64_t>(weightDequant.size()) != inFeatures * outFeatures)
+            throw std::runtime_error("campello_nn: ggmlQuantizedMatmul() dequantized weight size mismatch");
+
+        out = makeFloatValue(node.shape);
+        int64_t activationOuterStride = M * inFeatures;
+        int64_t outputOuterStride = M * outFeatures;
+
+        parallelFor(0, batchCount * M, kMatmulRowGrain, [&](int64_t begin, int64_t end)
+                    {
+            for (int64_t job = begin; job < end; ++job)
+            {
+                int64_t b = job / M;
+                int64_t m = job % M;
+                const float *aRow = activation.f() + b * activationOuterStride + m * inFeatures;
+                float *outRow = out.f() + b * outputOuterStride + m * outFeatures;
+                for (int64_t n = 0; n < outFeatures; ++n)
+                {
+                    float sum = 0.f;
+                    const float *wCol = weightDequant.data() + n;
+                    for (int64_t k = 0; k < inFeatures; ++k)
+                    {
+                        sum += aRow[k] * wCol[k * outFeatures];
+                    }
+                    outRow[n] = sum;
+                }
+            } });
     }
 
     void evalReshape(const Node &node, std::vector<CpuValue> &values, CpuValue &out)
@@ -531,6 +642,8 @@ void systems::leal::campello_nn::evalNode(const Node &node, size_t selfIndex, st
     case OpKind::InstanceNorm: evalInstanceNorm(node, values, out); break;
     case OpKind::MatMul: evalMatMul(node, values, out); break;
     case OpKind::Gemm: evalGemm(node, values, out); break;
+    case OpKind::GgmlQuantizedMatmul: evalGgmlQuantizedMatmul(node, values, out); break;
+    case OpKind::GqaMatMul: evalGqaMatMul(node, values, out); break;
     case OpKind::Reshape: evalReshape(node, values, out); break;
     case OpKind::Transpose: evalTranspose(node, values, out); break;
     case OpKind::Concat: evalConcat(node, values, out); break;

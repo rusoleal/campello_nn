@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-12
+
+### Added
+- `OpKind::GgmlQuantizedMatmul` / `GraphBuilder::ggmlQuantizedMatmul(activation, weightRaw,
+  ggmlType, weightShape)`: weight-only matmul against a raw GGUF block-quantized tensor (Q4_0,
+  Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K), dequantizing on the fly
+  instead of requiring a pre-decoded Float32 constant — the weight stays in its on-disk quantized
+  footprint until the matmul kernel touches it. Implemented on Cpu, GpuGeneric (Metal + Vulkan/SPV
+  shaders, `src/gpu/shaders/ggml_quantized_matmul.*`), and MPSGraph (custom Metal kernel segment,
+  `src/metal/ggml_quant_metal.hpp`) — not DirectML.
+- `OpKind::GqaMatMul` / `GraphBuilder::gqaMatMul(a, bCompact, transposeB)`: grouped-query batched
+  matmul for GQA attention (Llama-family models with fewer KV heads than query heads). Reads `b`
+  at its compact `[batchB, ...]` shape and has each of `a`'s `batchA` rows/heads index its shared
+  KV head (`h / groupSize`) directly inside the kernel, so K/V never need to be physically
+  replicated up to the full query head count via `slice()`+`concat()` before the attention matmul
+  — the memory cost that pattern carries scales with context length and layer count and was found
+  to dominate `GpuGeneric`'s resident memory for real LLM inference. Implemented on Cpu and
+  GpuGeneric (Metal + Vulkan/SPV) only; MPSGraph/DirectML throw if built for them, matching
+  `GgmlQuantizedMatmul`'s DirectML gap — callers should check `Context::deviceType()` before
+  choosing which graph shape to build.
+- `Context::deviceType()`: exposes the `DeviceType` a `Context` was created with, so callers
+  building a graph ahead of dispatch time (like the `GqaMatMul` case above) can tell which
+  backend-specific op set is actually safe to use.
+
+### Fixed
+- `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
+  `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
+  DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-
+  copying it. The `GraphBuilder::build()`/`deserialize()` callers were updated to move into the
+  call for the same reason. Previously, a weight-heavy model's `Constant` bytes were copied by
+  value at every handoff in the chain `GraphBuilderData::ir` → `build()`'s local copy →
+  `compileGraph()`'s stored copy — up to 3-4x a real model's weight footprint resident
+  simultaneously, independent of context length or batch size. `GpuGeneric`/MPSGraph additionally
+  now clear each `Constant` node's raw bytes right after its one-time GPU upload (MPSGraph already
+  did this for its quantized-kernel path; extended here to its plain-MPSGraph-embedding path and
+  to `GpuGeneric`, which had no such clearing at all). Verified on real `llama3.1_8b` (Q4_K_M
+  GGUF) inference via `GpuGeneric`: steady-state resident memory dropped from an unbounded climb
+  past 11.9GB (still rising when killed) to a flat 6.4GB through a full load-and-generate cycle.
+- **Caller impact:** any code calling `builder.serialize(outputs)` *after* `builder.build(outputs)`
+  on the same `GraphBuilder` will now serialize an empty graph, since `build()` consumes the
+  builder's IR — call `serialize()` first if both are needed (three call sites in `campello_llm`
+  needed this reordering).
+
 ## [0.4.0] - 2026-07-04
 
 ### Added
@@ -131,7 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graph caching: `GraphBuilder::serialize()`/`deserialize()` and `graph_cache.hpp`'s
   `saveGraphToFile`/`loadGraphFromFile`/`loadGraphFromMemory`.
 
-[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rusoleal/campello_nn/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rusoleal/campello_nn/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rusoleal/campello_nn/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rusoleal/campello_nn/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rusoleal/campello_nn/compare/v0.1.0...v0.2.0

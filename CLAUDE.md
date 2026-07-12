@@ -340,11 +340,15 @@ CPU backend's `Fence` is always pre-signaled since CPU dispatch is synchronous.
 ```
 Context::create(desc) → Context
 GraphBuilder(context) → builder.input()/constant()/add()/matmul()/... → Operand
-builder.build({{"name", operand}, ...}) → Graph        // compiled once
+builder.build({{"name", operand}, ...}) → Graph        // compiled once, consumes the builder's IR
 context->createTensor(desc) → Tensor                    // bind by name
 context->dispatch(graph, inputs, outputs) → Fence       // dispatched many times
 fence->wait(); output->read(...)
 ```
+
+`build()` **moves** the builder's internal IR into the compiled graph rather than copying it (see
+"`GraphIR` Ownership" below) — call `builder.serialize(outputs)` first if you need both, `build()`
+must run last.
 
 ### Key Types
 
@@ -408,6 +412,67 @@ existed in the original transformer-block op set) were added with two different 
   constant (`encodeFloat16()` for `Float16`, raw bytes for `Float32`) to negate the second half via
   `mul()`, since there's no dedicated negate/subtract op. Restricted to Float32/Float16 (rotary
   embeddings aren't meaningful for the other `DataType`s); `x`'s last dimension must be even.
+
+`ggmlQuantizedMatmul(activation, weightRaw, ggmlType, weightShape)` (`OpKind::GgmlQuantizedMatmul`,
+Phase 5 real-LLM-inference need) lets a graph matmul directly against a weight tensor still in its
+on-disk GGUF block-quantized form (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K,
+Q6_K, Q8_K — `weightRaw` is a `Constant` of raw `Int8` bytes, `weightDTypeToGgmlType()`-style enum
+selects the format) instead of requiring a full Float32 dequantization ahead of time. Dequantizing
+a real model's weights to Float32 up front costs roughly 4-8x their on-disk size (GGML quantized
+formats pack ~2-8 bits/weight; Float32 is 32); this op keeps that footprint at the file's actual
+size until the matmul kernel touches it, dequantizing on the fly per-block. Implemented on Cpu
+(`dequantizeGgmlWeightTransposed()`, `src/cpu/ggml_dequant.{hpp,cpp}`), GpuGeneric (Metal + Vulkan/
+SPV kernels reading raw blocks directly, `src/gpu/shaders/ggml_quantized_matmul.*`), and MPSGraph
+(a custom, non-MPSGraph Metal kernel segment spliced into the graph — MPSGraph itself has no
+block-quantized matmul primitive — see `src/metal/ggml_quant_metal.hpp`/`MpsCustomSegment` in
+`mps_backend.mm`). **Not implemented on DirectML** — no real Windows target needed it yet.
+
+`gqaMatMul(a, bCompact, transposeB)` (`OpKind::GqaMatMul`, added chasing `GpuGeneric`'s memory
+usage on real LLM inference far above a comparable llama.cpp/Ollama process for the same GGUF
+model) is a grouped-query batched matmul: `a` is `[batchA, M, K]`, `bCompact` is
+`[batchB, N, K]` (if `transposeB`, computing `a[h] @ bCompact[h/groupSize]^T`) or `[batchB, K, N]`
+otherwise, `groupSize = batchA / batchB`. It exists specifically so GQA attention (Llama-family
+models: fewer KV heads than query heads — e.g. Llama 3.1 8B's 8 KV heads vs. 32 query heads) never
+has to physically replicate K/V up to the full query head count via `slice()`+`concat()` before the
+batched attention matmul the way the naive composition does: every attention head reads its shared
+KV head directly via index math inside the kernel instead. That replication, done once per layer at
+whatever context length the KV-cache is sized for, was traced (via `campello_llm`'s
+`buildLlamaDecodeGraph()`) to be the dominant cost behind `GpuGeneric`'s resident memory for
+llama3.1_8b — it scales with `numAttentionHeads × contextLength × headDim` **summed across every
+layer simultaneously**, since `GpuGeneric` gives every intermediate tensor in the unrolled decode
+graph its own permanent buffer with no cross-layer reuse. Implemented on Cpu and GpuGeneric (Metal
++ Vulkan/SPV) only — MPSGraph and DirectML throw `"...GqaMatMul (Cpu/GpuGeneric only)"` if a graph
+containing it is ever built for them. Since `Context` doesn't otherwise expose which concrete
+backend it resolved to, `Context::deviceType()` was added so callers building a graph ahead of
+dispatch time (like `campello_llm`'s attention block) can pick the right shape: use `gqaMatMul()`
+under `Cpu`/`GpuGeneric`, fall back to the old `slice()`+`concat()`+`matmul()` composition
+everywhere else. Verified equivalent to that old composition via a dedicated CPU test
+(`CpuOps.GqaMatMulMatchesRepeatKvHeadsThenMatMul`) that builds both paths in the same graph and
+diffs their outputs, not just isolated correctness checks on `gqaMatMul()` alone.
+
+### `GraphIR` Ownership — Move, Not Copy
+
+`Node::constantBytes` (every `Constant`'s raw bytes — the bulk of a real model's memory) used to be
+copied by value at every handoff in the chain from graph construction to a compiled graph:
+`GraphBuilderData::ir` (built incrementally as the caller makes `constant()`/op calls) →
+`GraphBuilder::build()`'s local `GraphIR ir = data->ir` → `Backend::compileGraph(const GraphIR&)`'s
+`compiled->ir = ir`. For a weight-heavy model (an LLM's `Constant` nodes are its weights) that's
+3-4x the model's weight footprint resident simultaneously at peak, independent of context length or
+batch size — found while chasing `GpuGeneric`'s memory usage on real `llama3.1_8b` inference far
+above what the same weights should cost. Fixed by making the whole chain move instead of copy:
+`Backend::compileGraph()` now takes `GraphIR ir` **by value**, and `GraphBuilder::build()`/
+`deserialize()` `std::move()` into the call. `GpuBackend`/`MpsBackend`'s `compileGraph()` clear each
+`Constant` node's bytes right after its one-time GPU upload (dispatch-time buffer resolution never
+reads `node.constantBytes` again) before moving what's left into `compiled->ir` at the very end —
+so the final move carries over a `GraphIR` already stripped of the (potentially multi-gigabyte) dead
+weight a copy-at-the-top would have carried for the whole compile.
+
+**Caller-visible consequence:** `GraphBuilder::build()` now *consumes* (empties) the builder's own
+IR — it's the terminal operation on a `GraphBuilder`. Anything that still needs the builder's intact
+IR (`GraphBuilder::serialize()`, `internal::graphInfoForImport()`) must run **before** `build()`, not
+after — this bit `campello_llm`, which had three call sites doing `build()` then `serialize()` on
+the same builder; all three needed reordering. The ONNX/TFLite importers already called
+`graphInfoForImport()` before `build()`, so needed no changes.
 
 ## Roadmap
 

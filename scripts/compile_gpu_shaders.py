@@ -51,6 +51,8 @@ OPS = [
     "quantize_linear",
     "dequantize_linear",
     "broadcast_binary",
+    "ggml_quantized_matmul",
+    "gqa_matmul",
 ]
 
 
