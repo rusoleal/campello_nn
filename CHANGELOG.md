@@ -64,7 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     referenced `broadcast_binary*_spv_bytes` symbols that are never `#include`d there (SPV headers
     are gated to non-Windows), failing with `error C2065: '...spv_bytes': undeclared identifier`.
     Now throws the same "no precompiled DirectX12 shader bytecode shipped yet" error every other op
-    already does on Windows, instead of referencing nonexistent symbols.
+    already does on Windows, instead of referencing nonexistent symbols. **Follow-up fix to this
+    fix:** the first attempt just added a bare `throw` in a `#elif defined(_WIN32)` branch, leaving
+    the `ShaderBytes sb` variable undeclared on that path for the code below that unconditionally
+    reads `sb.data`/`sb.size`/`sb.entryPoint` (`error C2065: 'sb': undeclared identifier`, caught by
+    an actual Windows CI run of this exact fix) — wrapped the whole `#if`/`#elif`/`#else` selection
+    in an immediately-invoked lambda so `sb` is declared exactly once regardless of which branch
+    compiles, matching the shape the throw-on-Windows branches elsewhere in this file already use
+    without this problem (they return directly from a `switch` instead of assigning a shared local).
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-
