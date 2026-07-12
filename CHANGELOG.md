@@ -37,6 +37,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `src/gpu/gpu_backend.cpp` was missing `#include <cmath>`; the Conv2d+BatchNorm folding code's
   `sqrtf()` call built fine under Apple Clang (pulled in transitively) but failed on Linux/GCC
   (`'sqrtf' was not declared in this scope`), breaking the Linux universal-tests CI job.
+- **Pre-existing, unrelated to the above:** fixing the `sqrtf` error surfaced a second Linux CI
+  break underneath it — `gpu_backend.cpp` was unconditionally compiled and linked against
+  `campello_gpu::campello_gpu` on every non-Emscripten platform, but `campello_gpu`'s own
+  `linux.cmake` deliberately falls back to an empty `INTERFACE` library (no compiled symbols) when
+  the Vulkan SDK isn't found, so the link step failed with dozens of `undefined reference to
+  campello_gpu::Device::...` errors on the Vulkan-less Linux CI runner. The top-level
+  `CMakeLists.txt` now detects a real vs. `INTERFACE`-stub `campello_gpu` target (via
+  `get_target_property(... TYPE)`, since `Vulkan_FOUND` itself isn't visible outside that
+  subdirectory's scope) and only compiles `gpu_backend.cpp` / defines
+  `CAMPELLO_NN_GPU_GENERIC_AVAILABLE` when one exists; `Context::create()` falls back to `Cpu` with
+  a warning for `DeviceType::GpuGeneric` requests otherwise, mirroring the existing
+  no-accelerator-backend fallback further down the same function. Verified locally by forcing the
+  fallback path on macOS (`gpu_backend.cpp` correctly excluded, `context.cpp`'s fallback branch
+  compiles and links, all 77 universal tests pass) — an actual Vulkan-less Linux run wasn't
+  available to test directly.
+- **Two more pre-existing Windows/MSVC-only build breaks**, surfaced once the two fixes above let
+  CI reach that far:
+  - `src/cpu/ggml_dequant.cpp` used `std::to_string`/string concatenation without `#include
+    <string>` — MSVC's standard library doesn't pull it in transitively the way libc++/libstdc++
+    happened to (`error C2039: 'to_string': is not a member of 'std'`). Added the include (and to
+    `gpu_backend.cpp`, which had the same gap but happened to compile anyway).
+  - `GpuBackend::broadcastBinaryResourcesFor()` had its own inline `#if defined(__APPLE__) ...
+    #else ...#endif` (Metal vs. SPV) instead of the file's usual 3-way `__APPLE__`/`_WIN32`/other
+    split every other op's shader selection uses — on Windows this fell into the `#else` branch and
+    referenced `broadcast_binary*_spv_bytes` symbols that are never `#include`d there (SPV headers
+    are gated to non-Windows), failing with `error C2065: '...spv_bytes': undeclared identifier`.
+    Now throws the same "no precompiled DirectX12 shader bytecode shipped yet" error every other op
+    already does on Windows, instead of referencing nonexistent symbols.
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-

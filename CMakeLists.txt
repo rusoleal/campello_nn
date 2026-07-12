@@ -147,6 +147,27 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     set(BUILD_INTEGRATION_TESTS ${_campello_nn_saved_build_int_tests2} CACHE BOOL "" FORCE)
 endif()
 
+# campello_gpu's own linux.cmake falls back to a dummy INTERFACE library (no
+# compiled sources) when the Vulkan SDK isn't found, specifically so that
+# target_link_libraries(campello_gpu::campello_gpu) doesn't fail at configure
+# time for consumers that reference it unconditionally (see that file's own
+# comment) — but anything that actually *calls* campello_gpu symbols still
+# fails at link time in that case. Detect it here via the target's TYPE
+# (Vulkan_FOUND itself is a plain, non-cache variable set inside that
+# subdirectory's scope and isn't visible up here) so gpu_backend.cpp — the
+# only campello_nn source that calls into campello_gpu — is only compiled/
+# linked when a real backend exists.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    get_target_property(_campello_gpu_target_type campello_gpu TYPE)
+    if(_campello_gpu_target_type STREQUAL "INTERFACE_LIBRARY")
+        set(CAMPELLO_NN_HAS_REAL_CAMPELLO_GPU OFF)
+    else()
+        set(CAMPELLO_NN_HAS_REAL_CAMPELLO_GPU ON)
+    endif()
+else()
+    set(CAMPELLO_NN_HAS_REAL_CAMPELLO_GPU OFF)
+endif()
+
 # ---------------------------------------------------------------------------
 # Core sources — graph IR, GraphBuilder, Context/Tensor/Graph/Fence, and the
 # CPU reference backend. Cross-platform; no accelerator SDK required.
@@ -192,7 +213,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$" AND NOT CMAKE_SY
     endif()
 endif()
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+if(CAMPELLO_NN_HAS_REAL_CAMPELLO_GPU)
     list(APPEND CAMPELLO_NN_CORE_SOURCES src/gpu/gpu_backend.cpp)
 endif()
 
@@ -218,6 +239,10 @@ endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     target_link_libraries(${PROJECT_NAME} campello_gpu::campello_gpu)
+endif()
+
+if(CAMPELLO_NN_HAS_REAL_CAMPELLO_GPU)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE CAMPELLO_NN_GPU_GENERIC_AVAILABLE)
 endif()
 
 add_library(campello_nn::campello_nn ALIAS ${PROJECT_NAME})

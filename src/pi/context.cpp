@@ -3,7 +3,9 @@
 #include "context_data.hpp"
 #include "resource_data.hpp"
 #include "../cpu/cpu_backend.hpp"
+#ifdef CAMPELLO_NN_GPU_GENERIC_AVAILABLE
 #include "../gpu/gpu_backend.hpp"
+#endif
 #ifdef __APPLE__
 #include "../metal/mps_backend.hpp"
 #elif defined(_WIN32)
@@ -31,11 +33,28 @@ std::shared_ptr<Context> Context::create(const ContextDescriptor &desc)
     // which only ever apply to Cpu/Gpu/Npu/Default. See that enum value's doc
     // comment: this is an explicitly-selected addition for benchmarking
     // against the native backends, not a replacement for them.
+    //
+    // CAMPELLO_NN_GPU_GENERIC_AVAILABLE (set by the top-level CMakeLists.txt)
+    // is undefined when campello_gpu itself has no real backend for this
+    // platform build (e.g. Linux without the Vulkan SDK — campello_gpu falls
+    // back to a dummy INTERFACE library with no compiled symbols there, see
+    // that project's linux.cmake) — gpu_backend.cpp isn't even compiled into
+    // campello_nn in that case, so GpuBackend must never be referenced here.
+#ifdef CAMPELLO_NN_GPU_GENERIC_AVAILABLE
     if (desc.deviceType == DeviceType::GpuGeneric)
     {
         backend = std::make_unique<GpuBackend>();
     }
     else
+#else
+    if (desc.deviceType == DeviceType::GpuGeneric)
+    {
+        std::cerr << "campello_nn: DeviceType::GpuGeneric requested but campello_gpu has no real "
+                     "backend for this build (e.g. Vulkan SDK not found); falling back to Cpu.\n";
+        backend = std::make_unique<CpuBackend>();
+    }
+    else
+#endif
 #ifdef __APPLE__
     // MPSGraph's own placement pass (MPSGraphOptimizationLevel1, the framework
     // default) can already dispatch eligible ops to the GPU or ANE, so Gpu/Npu/

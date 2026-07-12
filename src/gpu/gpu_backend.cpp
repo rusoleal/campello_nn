@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -966,6 +967,11 @@ struct GpuBackend::Impl
 #if defined(__APPLE__)
         ShaderBytes sb = f16 ? ShaderBytes{broadcast_binary_f16_metallib_bytes, broadcast_binary_f16_metallib_bytes_len, "computeMain"}
                              : ShaderBytes{broadcast_binary_metallib_bytes, broadcast_binary_metallib_bytes_len, "computeMain"};
+#elif defined(_WIN32)
+        (void)f16;
+        throw std::runtime_error(
+            "campello_nn: GpuBackend: no precompiled DirectX12 shader bytecode shipped yet "
+            "(src/gpu/shaders/*.hlsl are written but unverified — see TODO.md)");
 #else
         ShaderBytes sb = f16 ? ShaderBytes{broadcast_binary_f16_spv_bytes, broadcast_binary_f16_spv_bytes_len, "main"}
                              : ShaderBytes{broadcast_binary_spv_bytes, broadcast_binary_spv_bytes_len, "main"};

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace systems::leal::campello_nn
 {
