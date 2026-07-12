@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend-specific op set is actually safe to use.
 
 ### Fixed
+- `src/gpu/gpu_backend.cpp` was missing `#include <cmath>`; the Conv2d+BatchNorm folding code's
+  `sqrtf()` call built fine under Apple Clang (pulled in transitively) but failed on Linux/GCC
+  (`'sqrtf' was not declared in this scope`), breaking the Linux universal-tests CI job.
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-
