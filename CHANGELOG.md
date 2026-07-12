@@ -83,6 +83,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required DLLs. Added a shared `campello_nn_copy_windows_runtime_dlls()` CMake function
   (`tests/CMakeLists.txt`) copying both, applied to all four test executables, replacing the
   ad-hoc per-target copy steps that each only handled part of the problem.
+- **A real, pre-existing dangling-reference bug**, finally surfaced once tests actually ran on
+  Windows: `GraphBuilder::rotaryEmbedding()` held a `const Node&` obtained from `nodeOf()` — a
+  reference into `data->ir.nodes` (a `std::vector<Node>`) — across calls to `slice()`/`constant()`/
+  `mul()`/`concat()`/`add()`, each of which can `push_back` into that same vector and reallocate
+  it. Reading `nx.dataType` after two such calls intermittently read back whatever garbage
+  happened to occupy the freed memory. This is genuine undefined behavior, not a Windows-specific
+  behavior difference — it silently "worked" on macOS/Linux because their allocators happened to
+  leave the old bytes intact, while MSVC's Debug CRT deliberately poisons freed heap memory
+  specifically to catch bugs like this, so it manifested as `CpuOps.RotaryEmbedding` throwing
+  `"rotaryEmbedding() only supports Float32/Float16 input"` for a genuinely Float32 input. Fixed by
+  copying `shape`/`dataType` out of the reference before any of the other builder calls, rather
+  than holding the reference across them. Audited every other `GraphBuilder` method for the same
+  pattern (a held `nodeOf()` reference plus an internal call to another method that can push
+  `data->ir.nodes`) — `rotaryEmbedding()` was the only one affected; every other method either
+  never calls another builder method internally, or (`quantizedMatmul()`) never holds a node
+  reference across the one it does call.
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-

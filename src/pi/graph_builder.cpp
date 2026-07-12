@@ -235,18 +235,34 @@ Operand GraphBuilder::rotaryEmbedding(Operand x, Operand cosOp, Operand sinOp)
     requireSameBuilder(cosOp.builder, native);
     requireSameBuilder(sinOp.builder, native);
     auto data = (GraphBuilderData *)native;
-    const Node &nx = nodeOf(data->ir, x.nodeId);
-    if (nx.shape.empty())
-        throw std::runtime_error("campello_nn: rotaryEmbedding() input must have rank >= 1");
-    int64_t lastDim = nx.shape.back();
+    // Copy out (not reference) `shape`/`dataType` up front: `nx` is a reference
+    // into data->ir.nodes (a std::vector<Node>), and every call below to
+    // another GraphBuilder method (slice()/constant()/mul()/concat()/add()) can
+    // push_back into that same vector and reallocate it, leaving `nx` dangling.
+    // Confirmed as a real bug, not just theoretical: reading `nx.dataType` after
+    // the two slice() calls below intermittently read back a garbage enum value
+    // on Windows/MSVC's Debug CRT (which poisons freed heap memory), throwing
+    // "only supports Float32/Float16 input" for a genuinely Float32 input — the
+    // same read on macOS/Linux allocators happened to still see the old bytes,
+    // so this went unnoticed until an actual Windows CI run caught it.
+    std::vector<int64_t> shape;
+    DataType dtype;
+    {
+        const Node &nx = nodeOf(data->ir, x.nodeId);
+        if (nx.shape.empty())
+            throw std::runtime_error("campello_nn: rotaryEmbedding() input must have rank >= 1");
+        shape = nx.shape;
+        dtype = nx.dataType;
+    }
+    int64_t lastDim = shape.back();
     if (lastDim % 2 != 0)
         throw std::runtime_error("campello_nn: rotaryEmbedding() input's last dimension must be even");
 
-    int32_t lastAxis = (int32_t)nx.shape.size() - 1;
+    int32_t lastAxis = (int32_t)shape.size() - 1;
     int64_t half = lastDim / 2;
 
-    std::vector<int64_t> starts(nx.shape.size(), 0);
-    std::vector<int64_t> sizes = nx.shape;
+    std::vector<int64_t> starts(shape.size(), 0);
+    std::vector<int64_t> sizes = shape;
     sizes[lastAxis] = half;
     Operand firstHalf = slice(x, starts, sizes);
 
@@ -254,12 +270,12 @@ Operand GraphBuilder::rotaryEmbedding(Operand x, Operand cosOp, Operand sinOp)
     Operand secondHalf = slice(x, starts, sizes);
 
     std::vector<uint8_t> negOneBytes;
-    if (nx.dataType == DataType::Float32)
+    if (dtype == DataType::Float32)
     {
         float v = -1.0f;
         negOneBytes.assign((const uint8_t *)&v, (const uint8_t *)&v + sizeof(v));
     }
-    else if (nx.dataType == DataType::Float16)
+    else if (dtype == DataType::Float16)
     {
         uint16_t v = encodeFloat16(-1.0f);
         negOneBytes.assign((const uint8_t *)&v, (const uint8_t *)&v + sizeof(v));
@@ -268,7 +284,7 @@ Operand GraphBuilder::rotaryEmbedding(Operand x, Operand cosOp, Operand sinOp)
     {
         throw std::runtime_error("campello_nn: rotaryEmbedding() only supports Float32/Float16 input");
     }
-    Operand negOne = constant({nx.dataType, {1}, false, false}, negOneBytes.data(), negOneBytes.size());
+    Operand negOne = constant({dtype, {1}, false, false}, negOneBytes.data(), negOneBytes.size());
 
     Operand negatedSecondHalf = mul(secondHalf, negOne);
     Operand rotatedHalf = concat({negatedSecondHalf, firstHalf}, lastAxis);
