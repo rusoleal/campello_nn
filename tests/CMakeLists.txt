@@ -9,6 +9,32 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# Windows has no rpath/install_name equivalent — any shared-library runtime
+# dependency of a target (directly or transitively) must be physically copied
+# next to that target's .exe, or the OS refuses to even launch it
+# (STATUS_DLL_NOT_FOUND / exit code 0xc0000135, which is exactly what
+# gtest_discover_tests()'s post-build "run the test binary to enumerate
+# tests" step hits if this is skipped). Every executable below links
+# campello_nn, which on Windows always links against both campello_gpu
+# (built SHARED there, see FetchContent_Declare(campello_gpu ...) in the
+# top-level CMakeLists.txt) and DirectML.dll (CAMPELLO_NN_DIRECTML_DLL, set
+# by cmake/windows.cmake — linked via a raw file path rather than a real
+# IMPORTED target, so $<TARGET_RUNTIME_DLLS:> can't discover it the way it
+# can campello_gpu's proper SHARED target). Centralized here instead of
+# duplicated per test executable so a missing copy step here doesn't have to
+# be rediscovered one CI run at a time.
+function(campello_nn_copy_windows_runtime_dlls target)
+    if(NOT WIN32)
+        return()
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CAMPELLO_NN_DIRECTML_DLL}"
+            "$<TARGET_FILE:campello_gpu>"
+            "$<TARGET_FILE_DIR:${target}>"
+    )
+endfunction()
+
 # ---------------------------------------------------------------------------
 # Universal tests — exercise the CPU reference backend. No accelerator SDK
 # required, so these run on every platform/CI runner.
@@ -38,6 +64,7 @@ target_link_libraries(campello_nn_universal_tests
 set_target_properties(campello_nn_universal_tests PROPERTIES
     CXX_STANDARD 20
 )
+campello_nn_copy_windows_runtime_dlls(campello_nn_universal_tests)
 
 # ---------------------------------------------------------------------------
 # Integration tests — accelerator backends (TODO.md Phase 3+). Currently just
@@ -81,13 +108,7 @@ if(BUILD_INTEGRATION_TESTS)
         set_target_properties(campello_nn_integration_tests PROPERTIES
             CXX_STANDARD 20
         )
-        # DirectML.dll (the redistributable NuGet version, see cmake/windows.cmake)
-        # must sit next to the test executable at runtime.
-        add_custom_command(TARGET campello_nn_integration_tests POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CAMPELLO_NN_DIRECTML_DLL}"
-                "$<TARGET_FILE_DIR:campello_nn_integration_tests>"
-        )
+        campello_nn_copy_windows_runtime_dlls(campello_nn_integration_tests)
         include(GoogleTest)
         gtest_discover_tests(campello_nn_integration_tests)
     else()
@@ -135,6 +156,17 @@ if(BUILD_GPU_GENERIC_TESTS)
     set_target_properties(campello_nn_gpu_generic_tests PROPERTIES
         CXX_STANDARD 20
     )
+    campello_nn_copy_windows_runtime_dlls(campello_nn_gpu_generic_tests)
+    if(WIN32 AND BUILD_MODEL_TESTS)
+        # campello_image (pulled in above for the real-model tests) is also a
+        # shared library on Windows — same reasoning as campello_nn_model_tests'
+        # copy step below.
+        add_custom_command(TARGET campello_nn_gpu_generic_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:campello_image>"
+                "$<TARGET_FILE_DIR:campello_nn_gpu_generic_tests>"
+        )
+    endif()
     include(GoogleTest)
     gtest_discover_tests(campello_nn_gpu_generic_tests)
 endif()
@@ -174,10 +206,11 @@ if(BUILD_MODEL_TESTS)
     set_target_properties(campello_nn_model_tests PROPERTIES
         CXX_STANDARD 20
     )
+    campello_nn_copy_windows_runtime_dlls(campello_nn_model_tests)
     if(WIN32)
         # campello_image is a shared library on Windows (no rpath/install_name
         # trick like macOS/Linux) — it must sit next to the test executable at
-        # runtime, same reasoning as DirectML.dll's copy step above.
+        # runtime, same reasoning as campello_gpu/DirectML.dll above.
         add_custom_command(TARGET campello_nn_model_tests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:campello_image>"

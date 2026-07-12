@@ -72,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in an immediately-invoked lambda so `sb` is declared exactly once regardless of which branch
     compiles, matching the shape the throw-on-Windows branches elsewhere in this file already use
     without this problem (they return directly from a `switch` instead of assigning a shared local).
+- **A fourth pre-existing Windows issue**, this one at runtime rather than compile/link time: once
+  the build actually succeeded, `campello_nn_universal_tests.exe` failed to even launch during
+  `gtest_discover_tests()`'s post-build test-enumeration step (`Exit code 0xc0000135` =
+  `STATUS_DLL_NOT_FOUND`). Windows has no rpath/install_name equivalent — `campello_gpu` (built
+  `SHARED` there) and `DirectML.dll` must be physically copied next to any executable that
+  (transitively) links `campello_nn`, and `campello_nn_universal_tests` had no such copy step at
+  all; `campello_nn_gpu_generic_tests` was in the same situation, and even
+  `campello_nn_model_tests`/`campello_nn_integration_tests` were each only copying *one* of the two
+  required DLLs. Added a shared `campello_nn_copy_windows_runtime_dlls()` CMake function
+  (`tests/CMakeLists.txt`) copying both, applied to all four test executables, replacing the
+  ad-hoc per-target copy steps that each only handled part of the problem.
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-
