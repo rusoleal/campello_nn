@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nested `add_subdirectory()` scope, where a plain `set()` here is invisible outside it. Needed so
   those consumers' own executables can copy `DirectML.dll`/`campello_gpu.dll` next to themselves on
   Windows (see the `campello_llm` changelog for the concrete case this was needed for).
+- `gtest_discover_tests()`'s default 5-second `DISCOVERY_TIMEOUT` was too tight on Windows CI
+  runners for every test executable (`Result: Process terminated due to timeout` enumerating
+  `campello_nn_universal_tests`, right after the DLL-copy fix above resolved the previous failure at
+  that exact step) — a freshly built `.exe`/`.dll` pair can get held up by antivirus/Defender
+  scanning on first execution. Raised to 60 seconds for every test executable.
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-

@@ -90,7 +90,7 @@ if(BUILD_INTEGRATION_TESTS)
             CXX_STANDARD 20
         )
         include(GoogleTest)
-        gtest_discover_tests(campello_nn_integration_tests)
+        gtest_discover_tests(campello_nn_integration_tests DISCOVERY_TIMEOUT 60)
     elseif(WIN32)
         add_executable(campello_nn_integration_tests
             platform/test_directml_ops.cpp
@@ -110,7 +110,7 @@ if(BUILD_INTEGRATION_TESTS)
         )
         campello_nn_copy_windows_runtime_dlls(campello_nn_integration_tests)
         include(GoogleTest)
-        gtest_discover_tests(campello_nn_integration_tests)
+        gtest_discover_tests(campello_nn_integration_tests DISCOVERY_TIMEOUT 60)
     else()
         message(STATUS "campello_nn: BUILD_INTEGRATION_TESTS requested, but no accelerator backend "
                         "is implemented yet for this platform (see TODO.md Phase 3).")
@@ -168,7 +168,7 @@ if(BUILD_GPU_GENERIC_TESTS)
         )
     endif()
     include(GoogleTest)
-    gtest_discover_tests(campello_nn_gpu_generic_tests)
+    gtest_discover_tests(campello_nn_gpu_generic_tests DISCOVERY_TIMEOUT 60)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -218,8 +218,8 @@ if(BUILD_MODEL_TESTS)
         )
     endif()
     include(GoogleTest)
-    gtest_discover_tests(campello_nn_model_tests)
+    gtest_discover_tests(campello_nn_model_tests DISCOVERY_TIMEOUT 60)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(campello_nn_universal_tests)
+gtest_discover_tests(campello_nn_universal_tests DISCOVERY_TIMEOUT 60)
