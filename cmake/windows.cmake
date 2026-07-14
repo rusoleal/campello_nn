@@ -47,3 +47,12 @@ target_link_libraries(${PROJECT_NAME}
 # executable that links this library — exposed here so tests/CMakeLists.txt
 # and examples/CMakeLists.txt can add a post-build copy step.
 set(CAMPELLO_NN_DIRECTML_DLL "${directml_SOURCE_DIR}/bin/${CAMPELLO_NN_DIRECTML_PLATFORM}/DirectML.dll")
+
+# Also exposed as a target property, not just a directory-scoped variable:
+# a downstream project that pulls this in via FetchContent (campello_llm,
+# campello_llm_app, ...) processes this file inside its own nested
+# add_subdirectory() scope, so a plain set() here is invisible outside it —
+# only target properties (and cache/PARENT_SCOPE variables, which this isn't)
+# cross that boundary. Consumers: get_target_property(<var> campello_nn
+# CAMPELLO_NN_DIRECTML_DLL).
+set_target_properties(${PROJECT_NAME} PROPERTIES CAMPELLO_NN_DIRECTML_DLL "${CAMPELLO_NN_DIRECTML_DLL}")

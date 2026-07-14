@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data->ir.nodes`) — `rotaryEmbedding()` was the only one affected; every other method either
   never calls another builder method internally, or (`quantizedMatmul()`) never holds a node
   reference across the one it does call.
+- `CAMPELLO_NN_DIRECTML_DLL` (`cmake/windows.cmake`) is now also exposed as a `campello_nn` target
+  property, not just a directory-scoped variable — a downstream project pulling this repo in via
+  `FetchContent` (`campello_llm`, `campello_llm_app`, ...) processes `windows.cmake` inside its own
+  nested `add_subdirectory()` scope, where a plain `set()` here is invisible outside it. Needed so
+  those consumers' own executables can copy `DirectML.dll`/`campello_gpu.dll` next to themselves on
+  Windows (see the `campello_llm` changelog for the concrete case this was needed for).
 - `Backend::compileGraph()` changed from `compileGraph(const GraphIR &ir)` to
   `compileGraph(GraphIR ir)` (by value) across all five backends (Cpu, GpuGeneric, MPSGraph,
   DirectML, Android), each now moving `ir` into its compiled graph's stored copy instead of deep-
